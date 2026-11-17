@@ -24,10 +24,14 @@ expected excess return into a weight with a fixed, auditable recipe:
 
 Cost controls yield to risk limits: if the band or the turnover cap would leave the book
 breaching a hard limit (position cap, sector cap, gross, cash floor, volatility target,
-long-only), buys are trimmed first; if that is not enough (the current book itself is out
-of bounds, e.g. after price drift), the book moves toward the ideal target just far enough
-to comply and the turnover cap is overridden with a note. When the current book is within
-limits, the turnover cap is always respected.
+long-only), the exposure-adding part of each trade is trimmed first; if that is not
+enough (the current book itself is out of bounds, e.g. after price drift), the book moves
+toward the ideal target just far enough to comply and the turnover cap is overridden with
+a note. The final book therefore always satisfies every hard limit. In a long-only book
+whose current weights are within limits, the turnover cap is also respected (strictly
+guaranteed when no pairwise correlation is negative, as in the fallback model; selling a
+negatively correlated hedge can raise volatility). In a long/short book, covering a short
+raises net exposure, so in rare cases a limit can still override the turnover cap.
 
 Every binding constraint is recorded per position (``constraints_hit``) or in the
 portfolio ``notes``, so a report can explain each weight.
@@ -55,7 +59,7 @@ FALLBACK_CORR = 0.30    # average pairwise correlation of US large caps, used wi
 COV_WINDOW = 126        # ~6 months of daily returns for the sample covariance
 MIN_COV_OBS = 60        # fewer complete rows than this and the sample covariance is too noisy
 PROB_CLIP = 0.01        # keeps Phi^-1(p) finite
-TOL = 1e-9              # numerical tolerance for limit checks
+TOL = 1e-12             # slack for limit checks: above float error, far below any meaningful weight
 DUST = 1e-12            # weights smaller than this are floating-point noise
 
 
@@ -181,6 +185,13 @@ class _Limits:
         return out
 
 
+def _toward_zero_part(current: float, delta: float) -> float:
+    """The part of trade ``delta`` that shrinks ``current`` toward zero (never past it)."""
+    if current * delta < 0:
+        return math.copysign(min(abs(delta), abs(current)), delta)
+    return 0.0
+
+
 def _largest_feasible(ok_at: Callable[[float], bool]) -> float:
     """Largest u in [0, 1] with ``ok_at(u)``, given ``ok_at(0)`` and a convex feasible set
     (every limit here is convex in the weights, so feasibility along a segment is an interval)."""
@@ -239,7 +250,8 @@ def _size_name(t: str, agg: AggregatedView, multiplier: object, fs: FactSheet | 
     rationale = (
         f"p={p:.3f} (equal-weight {agg.prob_equal_weight:.3f}, {agg.n_views} views, dispersion {agg.dispersion:.3f}); "
         f"E[excess]={agg.expected_excess_return_pct:+.2f}%; sigma_ann={sigma_ann:.1%} ({vol_src}); "
-        f"mu_prob={mu_prob:+.4f}, mu_exp={mu_exp:+.4f}, edge x{m:.2f}, dispersion x{disp_factor:.2f} -> mu={mu:+.4f}; {sizing}"
+        f"mu_prob={mu_prob:+.4f}, mu_exp={mu_exp:+.4f}, edge x{m:.2f}, dispersion x{disp_factor:.2f} "
+        f"-> mu={mu:+.4f}; {sizing}"
     )
     return _Sized(weight=weight, sigma_ann=sigma_ann, rationale=rationale)
 
@@ -257,7 +269,8 @@ def _apply_sector_caps(sleeve: dict[str, float], sector_of: Mapping[str, str], c
             for t in members[sector]:
                 sleeve[t] *= factor
                 hits[t].append("sector_cap")
-            notes.append(f"sector cap: {sector} {gross:.1%} -> {cap:.1%} ({', '.join(sorted(members[sector]))})")
+            names = ", ".join(sorted(members[sector]))
+            notes.append(f"sector cap: {sector} {gross:.1%} -> {cap:.1%} ({names})")
 
 
 def _apply_book_limits(active: dict[str, float], core: float, pc: PortfolioConfig,
@@ -306,16 +319,19 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
     if not problems:
         return book
 
-    sells_only = {t: current.get(t, 0.0) + min(delta[t], 0.0) for t in legs}
-    if not limits.violations(sells_only):
+    # Split each trade into the part that shrinks the existing position toward zero and the part
+    # that adds exposure. In a long-only book these are exactly the sells and the buys.
+    reduce = {t: _toward_zero_part(current.get(t, 0.0), delta[t]) for t in legs}
+    reduced = {t: current.get(t, 0.0) + reduce[t] for t in legs}
+    if not limits.violations(reduced):
         def trimmed(b: float) -> dict[str, float]:
-            return {t: sells_only[t] + b * max(delta[t], 0.0) for t in legs}
+            return {t: reduced[t] + b * (delta[t] - reduce[t]) for t in legs}
 
         b = _largest_feasible(lambda u: not limits.violations(trimmed(u)))
         for t in legs:
-            if delta[t] > 0:
+            if delta[t] != reduce[t]:
                 hits[t].append("limit_trim")
-        notes.append(f"band/turnover path breached {', '.join(problems)}: buys trimmed to {b:.1%}")
+        notes.append(f"band/turnover path breached {', '.join(problems)}: exposure-adding trades trimmed to {b:.1%}")
         return trimmed(b)
 
     def mixed(u: float) -> dict[str, float]:   # u=0 -> ideal target (compliant), u=1 -> banded path

@@ -1,0 +1,101 @@
+# aifirm example configuration. Every value below is the built-in default, so this file
+# documents what the firm does when you change nothing. Load it with
+#   aifirm run --config examples/firm.toml --offline        (no API key, deterministic rules)
+#   aifirm run --config examples/firm.toml                  (Claude; needs credentials)
+#   aifirm backtest --config examples/firm.toml --start 2023-01-01 --end 2025-12-31 --mode quant
+# The reasoning behind each default is in docs/ARCHITECTURE.md (principles P1-P10).
+
+name = "AI Investment Firm"
+# Where the live book (ledger, forecasts, lessons, paper-broker state, reports) and
+# backtest runs are stored. Creating the file <runs_dir>/KILL stops all orders (kill switch).
+runs_dir = "runs"
+
+[universe]
+# The stocks the committee may hold. Keep the benchmark out of this list: it is the
+# passive core and the yardstick every forecast is scored against.
+tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "JPM", "XOM", "JNJ", "PG"]
+benchmark = "SPY"
+
+# Optional manual sector labels for the sector cap. Without them the SEC SIC description
+# is used (for example "SERVICES-PREPACKAGED SOFTWARE"), which can split one economic
+# sector into several labels. Uncomment and edit to group names yourself.
+[universe.sectors]
+# AAPL = "Technology"
+# MSFT = "Technology"
+# NVDA = "Technology"
+# GOOGL = "Communication"
+# META = "Communication"
+# AMZN = "Consumer"
+# JPM = "Financials"
+# XOM = "Energy"
+# JNJ = "Health care"
+# PG = "Consumer staples"
+
+[models]
+# Analyst models. With several models listed, repeated samples rotate through them
+# (model diversity reduces correlated errors, P5).
+analyst_models = ["claude-opus-5-5"]
+samples_per_analyst = 1          # >1 measures instability; disagreement then shrinks position size
+analyst_effort = "medium"
+committee_model = "claude-opus-5-5"   # the chair (IC memo) and the lesson writer
+committee_effort = "high"
+risk_model = "claude-opus-5-5"        # the LLM risk reviewer (can only scale positions down)
+risk_effort = "medium"
+use_server_fallbacks = true      # retry a refused request on a fallback model server-side
+max_tokens = 16000
+max_parallel_calls = 4           # concurrent analyst calls per ticker
+
+[analysts]
+# Who sits on the committee. Each LLM analyst reads a different slice of the fact sheet
+# (information diversity, not personas, P5). "quant" is a deterministic factor model.
+# Use enabled = ["quant"] (and disable memo and risk review below) for a no-LLM firm.
+enabled = ["fundamental", "technical", "macro", "events", "quant"]
+max_lessons_in_prompt = 5        # past process lessons shown to each analyst (point-in-time)
+
+[process]
+horizon_days = 21                # forecast horizon in trading days (~1 month)
+rebalance_every_days = 21        # backtest decision cadence in trading days
+challenge_enabled = true         # a red-team round runs only when analysts disagree (P4, P6)
+challenge_dispersion_threshold = 0.12
+trim_fraction = 0.2              # trimmed log-odds pooling: drop this share of weight from each tail
+memo_enabled = true              # the chair writes an IC memo and may only shrink the edge (P1)
+memo_min_edge = 0.03             # memo when |pooled P - 0.5| >= this, or the name is held
+risk_review_enabled = true
+blind_mode = false               # hide ticker, name and dates from LLMs (historical research)
+news_enabled = true              # live headlines (never used in backtests: not point-in-time)
+max_llm_cost_usd_per_run = 10.0  # hard budget per `aifirm run`; exhausted budget holds the book
+
+[portfolio]
+core_weight = 0.0                # passive benchmark core (core-satellite); e.g. 0.5 = half passive
+long_only = true
+max_position = 0.10
+max_sector = 0.35
+min_cash = 0.02
+max_gross = 1.0
+min_prob_to_hold = 0.52          # minimum pooled P(beat benchmark) to hold a long
+kelly_fraction = 0.25            # quarter Kelly: full Kelly is ruinous with estimated edges (P8)
+target_vol = 0.18                # annualized volatility target for the active sleeve
+no_trade_band = 0.01             # skip weight changes smaller than this (costs beat noise)
+max_turnover = 0.5               # max one-way turnover per rebalance
+dispersion_shrink = 2.0          # edge x max(0, 1 - 2 x analyst disagreement)
+
+[risk]
+# The invariant risk core (P9). Nothing an LLM says can override these.
+drawdown_derisk = 0.10           # halve the active sleeve at a 10% drawdown from peak NAV
+drawdown_freeze = 0.15           # move the active sleeve to cash at 15%; only a human unfreezes
+daily_loss_halt = 0.05           # after a 5% one-day loss, no position may grow this cycle
+max_adv_participation = 0.02     # an order may be at most 2% of 20-day dollar volume
+restricted = []                  # tickers that must never be held
+kill_switch_file = "KILL"        # <runs_dir>/KILL exists -> no orders at all
+min_price = 2.0
+
+[costs]
+# Simulated costs for the paper broker and backtests (P10).
+commission_bps = 0.5
+slippage_bps = 5.0
+impact_coefficient = 0.1         # square-root impact: bps += 0.1 x 1e4 x daily_vol x sqrt(order / ADV)
+
+[execution]
+broker = "paper"                 # "paper" (simulated) or "alpaca" (Alpaca paper API; live needs code changes)
+require_approval = true          # a human approves every order sent to a real broker
+initial_cash = 100000.0

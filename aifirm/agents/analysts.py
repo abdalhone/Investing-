@@ -293,7 +293,7 @@ def run_analyst(llm: LLM, role_name: str, fs: FactSheet, cfg: FirmConfig, model:
     view = sanitize_view(view)
     for item in view.evidence:
         item.fact_ids = [normalize_fact_id(i) for i in item.fact_ids if normalize_fact_id(i)]
-    report = check_view(view, shown)
+    report = check_view(view, shown, prompt_numbers=(float(horizon),))
     issues = report.issues() + consistency_notes(view)
     if blind:
         for item in view.evidence:

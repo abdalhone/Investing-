@@ -178,12 +178,15 @@ def normalize_fact_id(fid: str) -> str:
     return fid.strip().strip("[]`'\"").strip()
 
 
-def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03) -> GroundingReport:
+def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03,
+               prompt_numbers: tuple[float, ...] = ()) -> GroundingReport:
     """Audit ``view`` against ``fs``.
 
     ``fs`` should be the fact sheet the analyst was actually shown (its slice), so that a
-    cited ID the analyst could not have seen counts as unknown. ``ok`` is False if any
-    cited fact ID is unknown or more than two distinct numbers are unsupported.
+    cited ID the analyst could not have seen counts as unknown. ``prompt_numbers`` are
+    numbers the prompt itself states (e.g. the horizon in trading days), which the analyst
+    may repeat. ``ok`` is False if any cited fact ID is unknown or more than two distinct
+    numbers are unsupported.
     """
     known = fs.ids()
     unknown: list[str] = []
@@ -194,7 +197,7 @@ def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03) -> Groun
                 unknown.append(nid)
 
     variants, absolute = _fact_variants(fs)
-    text_numbers = _sheet_text_numbers(fs)
+    text_numbers = _sheet_text_numbers(fs) + [float(n) for n in prompt_numbers]
     own = _own_values(view)
     unsupported: list[str] = []
     checked = 0
