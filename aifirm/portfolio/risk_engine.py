@@ -1,0 +1,299 @@
+"""The invariant risk core (P9): deterministic rules nothing upstream can override.
+
+Everything before this module (analysts, chair, LLM risk reviewer, even the portfolio
+constructor) proposes. This module disposes, with rules modelled on multi-manager "pod"
+risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Capital):
+
+* **Kill switch**: if ``<runs_dir>/<kill_switch_file>`` exists, the target becomes the
+  current book, so no orders are generated. A human creates or removes the file.
+* **Drawdown freeze**: at ``drawdown_freeze`` below peak NAV the active sleeve goes to 0
+  and ``state.frozen`` is set. It stays set until a human resets it, even if NAV
+  recovers (section 4 of ARCHITECTURE.md: resetting a frozen book is a human decision).
+  The passive core is kept, because the core is not the thing that failed.
+* **Drawdown de-risk**: at ``drawdown_derisk`` active weights are halved.
+* **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
+  may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
+* **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more, no weight
+  may increase this cycle (sells and reductions still go through).
+* **Backstops**: non-finite weights -> 0, shorts in a long-only book -> 0, position cap,
+  max gross and cash floor. Construction already enforces these; repeating them here
+  means a bug upstream cannot reach the broker.
+
+Invariant: apart from the kill switch (which returns the current book unchanged), every
+rule only moves a weight toward zero, so ``|out_w| <= |target_w|`` for every name and the
+engine can never raise gross exposure above the proposed target.
+
+``orders_from_target`` turns weights into share orders with the same fail-closed stance:
+no price, no ADV or no valid NAV means no order for that name, with a message.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from ..config import FirmConfig
+from ..data.factsheet import FactSheet
+from ..schemas import Order, TargetPortfolio, TargetPosition
+
+DUST = 1e-12
+
+
+@dataclass
+class RiskState:
+    """Book-level risk memory carried between cycles. ``frozen`` is only ever cleared by a human."""
+
+    peak_nav: float
+    frozen: bool = False
+    last_nav: float | None = None
+
+
+def _valid_positive(x: object) -> bool:
+    try:
+        v = float(x)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0
+
+
+def update_risk_state(state: RiskState, nav: float) -> RiskState:
+    """Record a new NAV mark: raise the peak if exceeded and remember ``last_nav``.
+
+    Returns a new state (the input is not modified). A non-finite or non-positive NAV means
+    the accounting is broken, so the book is frozen (fail closed). A corrupt peak is reset
+    to ``nav`` and the book frozen, so drawdown math works again once a human unfreezes it.
+    """
+    if not _valid_positive(nav):
+        return replace(state, frozen=True)
+    nav = float(nav)
+    if not _valid_positive(state.peak_nav):
+        return replace(state, peak_nav=nav, last_nav=nav, frozen=True)
+    return replace(state, peak_nav=max(float(state.peak_nav), nav), last_nav=nav)
+
+
+def _no_increase(target: float, current: float) -> float:
+    """The largest-magnitude weight that does not add exposure relative to ``current``:
+    same side as ``current`` and no larger; opening or flipping a position gives 0."""
+    if target * current > 0:
+        return math.copysign(min(abs(target), abs(current)), current)
+    return 0.0
+
+
+def _hold_current(target: TargetPortfolio, current_weights: dict[str, float], bench: str,
+                  message: str) -> TargetPortfolio:
+    """A target equal to the current book, so that no orders follow."""
+    by_ticker = {p.ticker: p for p in target.positions}
+    positions = []
+    for t in sorted(t for t in current_weights if t != bench):
+        prior = by_ticker.get(t)
+        positions.append(TargetPosition(
+            ticker=t, weight=float(current_weights[t]),
+            prob_outperform=prior.prob_outperform if prior else 0.5,
+            expected_excess_return_pct=prior.expected_excess_return_pct if prior else 0.0,
+            rationale=message, constraints_hit=["risk:hold_current"],
+        ))
+    core = float(current_weights.get(bench, 0.0))
+    return TargetPortfolio(as_of=target.as_of, positions=positions, core_weight=core,
+                           cash_weight=1.0 - core - sum(p.weight for p in positions),
+                           notes=[*target.notes, message])
+
+
+def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, prev_nav: float | None,
+                      current_weights: dict[str, float], cfg: FirmConfig, factsheets: dict[str, FactSheet],
+                      runs_dir: str) -> tuple[TargetPortfolio, list[str]]:
+    """Apply the invariant rules (module docstring) and return ``(target, messages)``.
+
+    ``state.frozen`` is set in place when the freeze triggers. Drawdown is measured from
+    ``max(state.peak_nav, nav)`` so a caller that has not yet called
+    :func:`update_risk_state` cannot under-state it. ``current_weights`` includes the
+    benchmark (core) leg. Messages are also appended to the returned target's notes.
+    """
+    rc, pc = cfg.risk, cfg.portfolio
+    bench = cfg.universe.benchmark
+    for t, w in current_weights.items():
+        if not math.isfinite(float(w)):
+            raise ValueError(f"current weight for {t} is not finite: {w!r}")
+
+    kill = Path(runs_dir) / rc.kill_switch_file
+    if kill.exists():
+        msg = f"KILL SWITCH: {kill} exists, no trades this cycle (target = current book)"
+        return _hold_current(target, current_weights, bench, msg), [msg]
+    if not _valid_positive(nav) or not _valid_positive(state.peak_nav):
+        msg = f"invalid NAV ({nav!r}) or peak NAV ({state.peak_nav!r}): no trades this cycle"
+        return _hold_current(target, current_weights, bench, msg), [msg]
+
+    msgs: list[str] = []
+    hits: dict[str, list[str]] = defaultdict(list)
+    weights: dict[str, float] = {}
+    for p in target.positions:
+        w = float(p.weight)
+        if not math.isfinite(w):
+            msgs.append(f"{p.ticker}: non-finite target weight -> 0")
+            hits[p.ticker].append("risk:invalid_weight")
+            w = 0.0
+        if pc.long_only and w < 0:
+            msgs.append(f"{p.ticker}: short target {w:.2%} in a long-only book -> 0")
+            hits[p.ticker].append("risk:long_only")
+            w = 0.0
+        if abs(w) > pc.max_position:
+            msgs.append(f"{p.ticker}: {w:.2%} exceeds the position cap -> {pc.max_position:.2%}")
+            hits[p.ticker].append("risk:max_position")
+            w = math.copysign(pc.max_position, w)
+        weights[p.ticker] = w
+    core = float(target.core_weight) if math.isfinite(float(target.core_weight)) else 0.0
+    core_limit = min(pc.max_gross, 1.0 - pc.min_cash)
+    if not 0.0 <= core <= core_limit:
+        msgs.append(f"core weight {core:.2%} outside [0, {core_limit:.2%}] -> clipped")
+        core = min(max(core, 0.0), core_limit)
+
+    # Drawdown: freeze (sticky) or de-risk.
+    peak = max(float(state.peak_nav), float(nav))
+    drawdown = 1.0 - float(nav) / peak
+    if state.frozen or drawdown >= rc.drawdown_freeze:
+        if not state.frozen:
+            state.frozen = True
+            msgs.append(f"DRAWDOWN FREEZE: {drawdown:.1%} from peak >= {rc.drawdown_freeze:.0%}; "
+                        f"active sleeve to 0 until a human resets the book")
+        else:
+            msgs.append(f"book is frozen (drawdown {drawdown:.1%}); active sleeve stays at 0 until a human resets it")
+        for t in weights:
+            if weights[t] != 0.0:
+                hits[t].append("risk:drawdown_freeze")
+            weights[t] = 0.0
+    elif drawdown >= rc.drawdown_derisk:
+        msgs.append(f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights halved")
+        for t in weights:
+            if weights[t] != 0.0:
+                weights[t] *= 0.5
+                hits[t].append("risk:drawdown_derisk")
+
+    # Restricted list and minimum price.
+    restricted = {x.upper() for x in rc.restricted}
+    for t in sorted(weights):
+        if weights[t] == 0.0:
+            continue
+        if t.upper() in restricted:
+            msgs.append(f"{t}: restricted -> 0")
+            hits[t].append("risk:restricted")
+            weights[t] = 0.0
+            continue
+        fs = factsheets.get(t)
+        fact = fs.get(f"{t}.price") if fs is not None else None
+        price = float(fact.value) if fact is not None and isinstance(fact.value, (int, float)) else math.nan
+        if not math.isfinite(price):
+            capped = _no_increase(weights[t], float(current_weights.get(t, 0.0)))
+            if capped != weights[t]:
+                msgs.append(f"{t}: price unavailable, position may not grow ({weights[t]:.2%} -> {capped:.2%})")
+                hits[t].append("risk:no_price")
+                weights[t] = capped
+        elif price < rc.min_price:
+            msgs.append(f"{t}: price {price:.2f} below minimum {rc.min_price:.2f} -> 0")
+            hits[t].append("risk:min_price")
+            weights[t] = 0.0
+    if core > 0 and bench.upper() in restricted:
+        msgs.append(f"{bench} (core) is restricted -> core 0")
+        core = 0.0
+
+    # Daily-loss halt: nothing may grow this cycle.
+    if prev_nav is not None:
+        day = float(nav) / float(prev_nav) - 1.0 if _valid_positive(prev_nav) else -math.inf
+        if day <= -rc.daily_loss_halt:
+            reason = f"one-day NAV change {day:.1%}" if math.isfinite(day) else f"invalid previous NAV {prev_nav!r}"
+            msgs.append(f"DAILY-LOSS HALT: {reason}; no weight may increase this cycle")
+            for t in weights:
+                capped = _no_increase(weights[t], float(current_weights.get(t, 0.0)))
+                if capped != weights[t]:
+                    hits[t].append("risk:daily_loss_halt")
+                    weights[t] = capped
+            core = max(0.0, _no_increase(core, float(current_weights.get(bench, 0.0))))
+
+    # Backstop: gross and cash floor on the whole book (only scales active weights down).
+    gross = sum(abs(w) for w in weights.values())
+    net = sum(weights.values())
+    factor = 1.0
+    if gross > pc.max_gross - core + 1e-12:
+        factor = min(factor, (pc.max_gross - core) / gross)
+    if net > 1.0 - pc.min_cash - core + 1e-12:
+        factor = min(factor, (1.0 - pc.min_cash - core) / net)
+    if factor < 1.0:
+        msgs.append(f"backstop: active weights scaled by {factor:.3f} to respect max gross / cash floor")
+        for t in weights:
+            if weights[t] != 0.0:
+                weights[t] *= factor
+                hits[t].append("risk:book_limits")
+
+    positions = [p.model_copy(update={
+        "weight": 0.0 if abs(weights[p.ticker]) < DUST else weights[p.ticker],
+        "constraints_hit": list(dict.fromkeys([*p.constraints_hit, *hits.get(p.ticker, [])])),
+    }) for p in target.positions]
+    out = TargetPortfolio(as_of=target.as_of, positions=positions, core_weight=core,
+                          cash_weight=1.0 - core - sum(p.weight for p in positions),
+                          notes=[*target.notes, *msgs])
+    return out, msgs
+
+
+def orders_from_target(target: TargetPortfolio, positions: dict[str, float], prices: dict[str, float], nav: float,
+                       adv: dict[str, float], cfg: FirmConfig, benchmark: str) -> tuple[list[Order], list[str]]:
+    """Share orders that move the book from ``positions`` (shares) to ``target`` (weights).
+
+    * The benchmark's target is ``core_weight`` (plus any active weight on it). Held
+      tickers absent from the target are sold: a target is the complete desired book.
+    * Trades with ``|delta notional| < no_trade_band * nav`` are skipped (not worth the cost).
+    * Each order's notional is capped at ``max_adv_participation * ADV`` (``adv`` is the
+      average daily *dollar* volume) so we never are the market; a message says so.
+    * A missing or invalid price or ADV blocks that ticker's order with a message (fail
+      closed); this includes the benchmark, so callers must pass its ADV too.
+    * In a long-only book sells never exceed the shares held, so rounding cannot create a short.
+    * Sells come before buys (they fund them), each group sorted by ticker for determinism.
+    """
+    if not _valid_positive(nav):
+        return [], [f"invalid NAV {nav!r}: no orders"]
+    rc, pc = cfg.risk, cfg.portfolio
+    msgs: list[str] = []
+    weights = dict(target.weights())
+    weights[benchmark] = weights.get(benchmark, 0.0) + target.core_weight
+    tickers = sorted(set(weights) | {t for t, q in positions.items() if q != 0})
+    band = pc.no_trade_band * nav
+    sells: list[Order] = []
+    buys: list[Order] = []
+    for t in tickers:
+        w = float(weights.get(t, 0.0))
+        if not math.isfinite(w):
+            msgs.append(f"{t}: non-finite target weight, order blocked")
+            continue
+        if pc.long_only and w < 0:
+            msgs.append(f"{t}: short target {w:.2%} in a long-only book treated as 0")
+            w = 0.0
+        held = float(positions.get(t, 0.0))
+        if not math.isfinite(held):
+            msgs.append(f"{t}: non-finite share count {held!r}, order blocked")
+            continue
+        price = prices.get(t)
+        if not _valid_positive(price):
+            msgs.append(f"{t}: no valid price ({price!r}), order blocked")
+            continue
+        price = float(price)
+        delta = w * nav - held * price
+        if delta == 0.0 or abs(delta) < band:
+            continue
+        a = adv.get(t)
+        if not _valid_positive(a):
+            msgs.append(f"{t}: no valid ADV ({a!r}), order of {delta:+,.0f} blocked (liquidity unknown)")
+            continue
+        cap = rc.max_adv_participation * float(a)
+        reason = f"target {w:.2%} of NAV (now {held * price / nav:.2%})"
+        if abs(delta) > cap:
+            msgs.append(f"{t}: order {delta:+,.0f} capped at {rc.max_adv_participation:.1%} of ADV ({cap:,.0f})")
+            reason += f"; capped at {rc.max_adv_participation:.1%} of ADV"
+            delta = math.copysign(cap, delta)
+        qty = abs(delta) / price
+        if delta < 0 and pc.long_only:
+            qty = min(qty, max(held, 0.0))
+        if qty <= 0:
+            continue
+        order = Order(ticker=t, side="buy" if delta > 0 else "sell", quantity=qty, reference_price=price,
+                      notional=qty * price, reason=reason)
+        (buys if delta > 0 else sells).append(order)
+    return sells + buys, msgs
