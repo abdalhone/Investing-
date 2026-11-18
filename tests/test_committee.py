@@ -232,12 +232,18 @@ def test_failed_revision_keeps_sealed_view_and_failed_challenge_skips_round():
 
 # --------------------------------------------------------------------------- memo
 
-@pytest.mark.parametrize("rec, mult, long_only, expected", [
-    ("buy", 0.8, True, 0.8), ("buy", 1.7, True, 1.0), ("hold", -0.3, True, 0.0),
-    ("review", 0.9, True, 0.0), ("avoid", 0.9, True, 0.0), ("sell", 0.6, True, 0.0), ("avoid", 0.6, False, 0.6),
+@pytest.mark.parametrize("rec, mult, long_only, held, expected", [
+    ("buy", 0.8, True, False, 0.8), ("buy", 1.7, True, False, 1.0), ("hold", -0.3, True, True, 0.0),
+    ("review", 0.9, True, True, 0.0), ("avoid", 0.9, True, True, 0.0), ("sell", 0.6, True, True, 0.0),
+    ("avoid", 0.6, False, False, 0.6),
+    ("hold", 0.8, True, True, 0.8),      # keep an existing position (the chair may still shrink it)
+    ("hold", 1.0, True, False, 0.0),     # "hold" on a name the book does not own: do not buy
+    ("hold", 1.0, False, False, 0.0),
 ])
-def test_edge_multiplier_rules(rec, mult, long_only, expected):
-    assert edge_multiplier_for(memo_obj(rec, mult), long_only) == pytest.approx(expected)
+def test_edge_multiplier_rules(rec, mult, long_only, held, expected):
+    assert edge_multiplier_for(memo_obj(rec, mult), long_only, held=held) == pytest.approx(expected)
+    if not held:
+        assert edge_multiplier_for(memo_obj(rec, mult), long_only) == pytest.approx(expected)   # default: not held
 
 
 def test_no_memo_means_multiplier_one():
@@ -245,10 +251,14 @@ def test_no_memo_means_multiplier_one():
 
 
 def test_memo_only_with_enough_edge_or_when_held():
-    flat = {n: 0.51 for n in NAMES}
+    flat = {n: 0.51 for n in NAMES}               # below min_prob_to_hold and memo_min_edge: no memo needed
     llm = ScriptedLLM(flat)
     res = committee(llm)
-    assert res.memo is None and res.edge_multiplier == 1.0 and "memo" not in llm.roles()
+    # not reviewed and not held: the edge multiplier is 0, so an unreviewed edge can never open a position
+    assert res.memo is None and res.edge_multiplier == 0.0 and "memo" not in llm.roles()
+    cfg = FirmConfig()
+    cfg.process.memo_enabled = False              # chair switched off (e.g. quant mode): the pooled view is sized as is
+    assert committee(ScriptedLLM(flat), cfg).edge_multiplier == 1.0
     llm = ScriptedLLM(flat)
     res = committee(llm, held=True)
     assert res.memo is not None and res.edge_multiplier == pytest.approx(0.8)
@@ -259,7 +269,7 @@ def test_memo_only_with_enough_edge_or_when_held():
 def test_memo_review_forces_zero_and_failure_fails_closed():
     assert committee(ScriptedLLM(AGREE, memo=memo_obj("review", 1.0))).edge_multiplier == 0.0
     res = committee(ScriptedLLM(AGREE, fail=("memo",)))
-    assert res.memo is None and res.edge_multiplier == 0.0
+    assert res.memo is None and res.edge_multiplier == 0.0 and not res.hold_current
 
 
 def test_memo_prompt_is_anonymized_and_deterministic():
@@ -344,8 +354,8 @@ def test_apply_risk_review_portfolio_level_and_halt():
         RiskConcern(ticker="AAA", concern="x", multiplier=-3.0)])
     out = apply_risk_review(target(), review)
     assert out.weights() == {"BBB": pytest.approx(0.10)}
-    halted = apply_risk_review(target(), review.model_copy(update={"halt_trading": True}))
-    assert halted.weights() == {} and halted.cash_weight == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="current_weights"):    # never a guessed book (zeroing would liquidate)
+        apply_risk_review(target(), review.model_copy(update={"halt_trading": True}))
     assert apply_risk_review(target(), None) == target()
 
 
@@ -406,3 +416,252 @@ def test_write_lesson_blind_prompt_hides_ticker_and_dates():
     lesson = write_lesson(OfflineLLM({"lesson": responder}), forecast(), "Cited AAA.mom_12_1.", cfg)
     assert "AAA" not in seen["user"] and "2025-01-02" not in seen["user"]
     assert lesson.ticker == "AAA"
+
+
+# --------------------------------------------------------------------------- memo policy with the shipped defaults
+
+def _construct(res, current=None, cfg=None):
+    from aifirm.portfolio.construct import construct_portfolio
+    fs = make_factsheet()
+    return construct_portfolio({"AAA": res.aggregate}, {"AAA": res.edge_multiplier}, {"AAA": fs}, current or {},
+                               cfg or FirmConfig(), fs.as_of, {"AAA": fs.sector})
+
+
+def test_default_config_reviews_every_name_that_could_be_held():
+    """FirmConfig() defaults: min_prob_to_hold 0.52 sits below 0.5 + memo_min_edge (0.53). A name pooled at
+    0.525 can be sized, so the chair must review it, and its veto must be able to stop the trade."""
+    cfg = FirmConfig()
+    assert 0.5 + cfg.process.memo_min_edge > 0.525 >= cfg.portfolio.min_prob_to_hold   # the gap being tested
+    band = {n: 0.525 for n in NAMES}
+    llm = ScriptedLLM(band, memo=memo_obj("avoid", 0.9))
+    res = committee(llm, cfg)
+    assert res.aggregate.prob_outperform == pytest.approx(0.525)
+    assert "memo" in llm.roles() and res.memo is not None and res.edge_multiplier == 0.0
+    assert _construct(res).weights().get("AAA", 0.0) == 0.0          # the veto stops the new position
+    approved = committee(ScriptedLLM(band, memo=memo_obj("buy", 1.0)), cfg)
+    assert approved.edge_multiplier == 1.0 and _construct(approved).weights().get("AAA", 0.0) > 0.0
+
+
+def test_short_side_names_that_could_be_held_are_reviewed_too():
+    cfg = FirmConfig()
+    cfg.portfolio.long_only = False
+    llm = ScriptedLLM({n: 0.475 for n in NAMES})
+    committee(llm, cfg)
+    assert "memo" in llm.roles()
+
+
+def test_unreviewed_names_get_no_edge_whatever_the_thresholds():
+    cfg = FirmConfig()
+    cfg.process.memo_min_edge = 0.2                 # a lax memo threshold cannot let an edge through unreviewed
+    cfg.portfolio.min_prob_to_hold = 0.6
+    res = committee(ScriptedLLM({n: 0.58 for n in NAMES}), cfg)
+    assert res.memo is None and res.edge_multiplier == 0.0
+    assert _construct(res, cfg=cfg).weights().get("AAA", 0.0) == 0.0
+
+
+def test_failed_memo_on_a_held_name_holds_the_position_instead_of_selling():
+    events = []
+    res = committee(ScriptedLLM(AGREE, fail=("memo",)), held=True, log=lambda e, p: events.append((e, p)))
+    assert res.memo is None and res.hold_current
+    assert res.edge_multiplier == 1.0                # never 0: an LLM failure must not size the position to zero
+    memo_event = next(p for e, p in events if e == "memo")
+    assert "error" in memo_event and memo_event["hold_current"] is True    # still counted as a failed memo
+    # Ignoring the flag would not sell the name; honouring it (as the pipeline does) keeps its weight.
+    assert _construct(res, current={"AAA": 0.08}).weights().get("AAA", 0.0) > 0.0
+    from aifirm.portfolio.construct import construct_portfolio
+    fs = make_factsheet()
+    pinned = construct_portfolio({"AAA": res.aggregate}, {"AAA": res.edge_multiplier}, {"AAA": fs}, {"AAA": 0.08},
+                                 FirmConfig(), fs.as_of, {"AAA": fs.sector}, keep_current=["AAA"])
+    assert pinned.weights()["AAA"] == pytest.approx(0.08)
+
+
+def test_chair_hold_on_an_unheld_name_opens_nothing():
+    res = committee(ScriptedLLM(AGREE, memo=memo_obj("hold", 1.0)))
+    assert res.memo is not None and res.edge_multiplier == 0.0
+    assert _construct(res).weights().get("AAA", 0.0) == 0.0
+    held = committee(ScriptedLLM(AGREE, memo=memo_obj("hold", 1.0)), held=True)
+    assert held.edge_multiplier == 1.0
+
+
+# --------------------------------------------------------------------------- anonymity
+
+ROLE_LEAKS = re.compile(r"(?i)\b(?:analyst|revision)\.[a-z]+|\b(?:fundamental|technical|macro|events?|quant)"
+                        r"(?:\s+and\s+(?:market-regime|filings))?\s+(?:analyst|desk)s?\b")
+
+
+class LeakyLLM(ScriptedLLM):
+    """Analysts and the challenger describe themselves; the technical analyst's call fails with the
+    LLM client's role-prefixed error message."""
+
+    def __init__(self):
+        super().__init__(SPLIT, fail=("analyst.technical",))
+
+        def leaky_view(role, s, u, schema):
+            name = role.split(".")[1]
+            v = view(name, SPLIT[name])
+            v.private_insight = f"As the {name} analyst, my desk sees what others miss."
+            v.key_risks = [f"The {ROLES_TITLES[name]} may be wrong."]
+            v.evidence[0].point = f"Speaking for the {name} desk: the signal is clear."
+            return v
+
+        def leaky_challenge(role, s, u, schema):
+            c = challenge_obj()
+            c.strongest_counterargument = "As the events analyst, I think analyst.events data is decisive."
+            return c
+
+        self.register("analyst.", leaky_view)
+        self.register("challenge", leaky_challenge)
+
+    def structured(self, **kw):
+        if kw["role"] == "analyst.technical":
+            with self._lock:
+                self.calls.append(kw)
+            raise LLMCallFailed("analyst.technical: model refused")
+        return super().structured(**kw)
+
+
+ROLES_TITLES = {"fundamental": "Fundamental analyst", "technical": "Technical analyst",
+                "macro": "Macro and market-regime analyst", "events": "Events and filings analyst"}
+
+
+def test_anonymised_memo_and_revision_prompts_do_not_leak_identities():
+    llm = LeakyLLM()
+    res = committee(llm)
+    assert res.challenger == "events" and res.memo is not None
+    memo = llm.user("memo")
+    block = memo.split("ANALYST VIEWS")[1].split("FULL FACT SHEET")[0]       # views, challenge and lessons
+    assert not ROLE_LEAKS.search(block), ROLE_LEAKS.search(block)
+    assert "Abstained: LLM call failed: model refused" in block
+    assert "a committee member" in block                                       # self-descriptions replaced
+    for role in ("revision.fundamental", "revision.macro"):
+        challenge_part = llm.user(role).split("THE CHALLENGE")[1]
+        assert not ROLE_LEAKS.search(challenge_part)
+        assert "decisive" in challenge_part
+    consensus = llm.user("challenge").split("THE COMMITTEE'S POOLED VIEW")[1].split("THE FULL FACT SHEET")[0]
+    assert not ROLE_LEAKS.search(consensus)
+    from aifirm.agents.committee import CHALLENGE_SYSTEM
+    assert "Do not state your role" in CHALLENGE_SYSTEM
+
+
+# --------------------------------------------------------------------------- blind mode, every prompt
+
+def _leaky_sheet(ticker: str = "CCC") -> FactSheet:
+    fs = make_factsheet(ticker)
+    fs.name = "Gamma Holdings Inc"
+    fs.data_gaps = [
+        f"SEC fundamentals could not be loaded (KeyError: 'Ticker {ticker} not found in SEC company_tickers.json')",
+        "SEC filing events could not be loaded (HTTPError: 404 for https://data.sec.gov/submissions/CIK0001045810.json)",
+        f"SEC data for {ticker} on 2025-01-02 comes from predecessor filer GAMMA HOLDINGS INC (CIK 1045810)",
+    ]
+    fs.events = fs.events + ["2025-02-28: 8-K - Gamma Holdings announces a material agreement"]
+    return fs
+
+
+BLIND_LEAKS = (re.compile(r"(?i)(?<![A-Za-z0-9])CCC(?![A-Za-z0-9])"), re.compile(r"(?i)gamma"),
+               re.compile("1045810"), re.compile(r"(?i)https?://|sec\.gov"), re.compile(r"\d{4}-\d{2}-\d{2}"))
+
+
+def _assert_blind(text: str, where: str) -> None:
+    for pat in BLIND_LEAKS:
+        assert not pat.search(text), (where, pat.pattern, pat.search(text))
+
+
+def test_every_prompt_in_blind_mode_hides_the_ticker_and_name():
+    from aifirm.agents import analyst_system_prompt, analyst_user_prompt
+    from aifirm.agents.reflection import LESSON_SYSTEM
+    from aifirm.agents.risk_review import RISK_REVIEW_SYSTEM
+    from aifirm.agents.roles import ROLES
+    cfg = FirmConfig()
+    cfg.process.blind_mode = True
+    cfg.process.challenge_dispersion_threshold = 0.0      # render the challenge and revision prompts too
+    fs = _leaky_sheet()
+    leaky_lessons = ["CCC (Gamma Holdings) fell after 2024-12-01; do not chase."]
+    quant = ViewRecord(agent="quant", model="deterministic", view=view("technical", 0.55, ticker="CCC"))
+    quant.view.private_insight = "CCC ranks first in the universe; Gamma Holdings Inc momentum is strong."
+    llm = ScriptedLLM(SPLIT)
+    run_committee(llm, fs, cfg, quant_view=quant, believability={}, held=True,
+                  lessons={"committee": leaky_lessons, **{n: leaky_lessons for n in NAMES}})
+    roles = llm.roles()
+    assert {"challenge", "memo"} <= set(roles) and any(r.startswith("revision.") for r in roles)
+    for c in llm.calls:
+        _assert_blind(c["user"], c["role"])
+        _assert_blind(c["system"], c["role"])
+    for role in ROLES.values():
+        _assert_blind(analyst_user_prompt(role, fs, 21, "SPY", leaky_lessons, blind=True), role.name)
+        _assert_blind(analyst_system_prompt(role, 21, "SPY"), role.name)
+    seen = {}
+
+    def responder(role, system, user, schema):
+        seen["risk"] = (system, user)
+        return RiskReview(summary="s", hidden_concentrations=[], concerns=[], halt_trading=False)
+
+    tgt = TargetPortfolio(as_of=fs.as_of, core_weight=0.0, cash_weight=0.9, positions=[
+        TargetPosition(ticker="CCC", weight=0.10, prob_outperform=0.56, expected_excess_return_pct=1.0,
+                       rationale="CCC sized by Kelly")])
+    review_portfolio(OfflineLLM({"risk_review": responder}), tgt, {"CCC": fs}, cfg)
+    _assert_blind(seen["risk"][1], "risk_review")
+    _assert_blind(RISK_REVIEW_SYSTEM, "risk_review system")
+
+    def lesson_responder(role, system, user, schema):
+        seen["lesson"] = user
+        return make_offline_llm().responders["lesson"](role, system, user, schema)
+
+    rec = forecast().model_copy(update={"ticker": "CCC"})
+    write_lesson(OfflineLLM({"lesson": lesson_responder}), rec,
+                 "CCC.mom_12_1 was strong; CCC beat (see https://data.sec.gov/CIK0001045810).", cfg)
+    _assert_blind(seen["lesson"], "lesson")
+    _assert_blind(LESSON_SYSTEM, "lesson system")
+
+
+# --------------------------------------------------------------------------- served model and citations
+
+class ServedByLLM(ScriptedLLM):
+    """Looks like a live LLM whose calls are answered by a fallback model."""
+
+    @property
+    def is_offline(self) -> bool:
+        return False
+
+    def structured(self, **kw):
+        obj, rec = super().structured(**kw)
+        rec.model, rec.served_by = kw["model"], "claude-fable-5-2"
+        return obj, rec
+
+
+def test_committee_logs_the_model_that_served_each_call():
+    events = []
+    res = committee(ServedByLLM(SPLIT), log=lambda e, p: events.append((e, p)))
+    assert all(v.model == "claude-fable-5-2" for v in res.views)
+    for kind in ("challenge", "revision", "memo"):
+        payloads = [p for e, p in events if e == kind]
+        assert payloads and all(p["served_by"] == "claude-fable-5-2" for p in payloads), kind
+
+
+def test_revision_citing_a_bare_key_is_accepted():
+    revisions = {"technical": Revision(ticker="AAA", prob_outperform=0.50, expected_excess_return_pct=0.0, changed=True,
+                                       reason="Momentum is weaker than I thought.", new_evidence_fact_ids=["mom_12_1"])}
+    events = []
+    res = committee(ScriptedLLM(SPLIT, revisions=revisions), log=lambda e, p: events.append((e, p)))
+    tech = next(p for e, p in events if e == "revision" and p["agent"] == "technical")
+    assert tech["status"] == "accepted" and tech["new_evidence_fact_ids"] == ["AAA.mom_12_1"]
+    assert next(v for v in res.views if v.agent == "technical").revised_prob == pytest.approx(0.50)
+
+
+# --------------------------------------------------------------------------- risk review halt
+
+def test_halt_keeps_the_current_book_instead_of_liquidating():
+    from aifirm.agents.risk_review import RISK_REVIEW_SYSTEM
+    review = RiskReview(summary="data look broken", hidden_concentrations=[], halt_trading=True, concerns=[])
+    current = {"AAA": 0.06, "CCC": 0.04, "SPY": 0.30}          # BBB is a proposed new buy; CCC a proposed sale
+    out = apply_risk_review(target(), review, current_weights=current, benchmark="SPY")
+    assert out.weights() == {"AAA": pytest.approx(0.06), "CCC": pytest.approx(0.04)}
+    assert out.core_weight == pytest.approx(0.30) and out.cash_weight == pytest.approx(0.60)
+    assert any("no trades this cycle" in n for n in out.notes)
+    # Without ``benchmark``, current legs that are not target positions are the core (construction lists
+    # every held active name among its positions).
+    inferred = apply_risk_review(target(), review, current_weights={"AAA": 0.06, "SPY": 0.30})
+    assert inferred.weights() == {"AAA": pytest.approx(0.06)} and inferred.core_weight == pytest.approx(0.30)
+    # The model is told the same thing the code does.
+    desc = RiskReview.model_fields["halt_trading"].description
+    assert "current weight" in desc and "does not liquidate" in desc
+    assert "stays at its current weight" in RISK_REVIEW_SYSTEM and "does not liquidate" in RISK_REVIEW_SYSTEM

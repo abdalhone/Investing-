@@ -88,6 +88,22 @@ def test_edge_multiplier_scales_and_defaults_to_one_when_missing():
     assert _pos(tp3, "AAA").weight == 0
 
 
+def test_chair_multiplier_and_dispersion_shrink_even_when_kelly_exceeds_the_cap():
+    """Regression: quarter Kelly at a one-month horizon is several times max_position, so
+    applying the chair multiplier and the dispersion factor before the cap made them inert.
+    They now scale the capped weight: chair x0.5 halves the position, disagreement costs size."""
+    assert _kelly(0.56, 1.5) > 0.3                                # far above the 10% cap
+    full = _pos(_run({"AAA": _agg("AAA", 0.56, 1.5)}), "AAA").weight
+    assert full == pytest.approx(0.10)
+    half = _pos(_run({"AAA": _agg("AAA", 0.56, 1.5)}, mult={"AAA": 0.5}), "AAA").weight
+    assert half == pytest.approx(0.05)
+    disputed = _pos(_run({"AAA": _agg("AAA", 0.56, 1.5, dispersion=0.2)}), "AAA").weight
+    assert disputed == pytest.approx(0.10 * (1 - 2.0 * 0.2))
+    both = _pos(_run({"AAA": _agg("AAA", 0.56, 1.5, dispersion=0.2)}, mult={"AAA": 0.4}), "AAA").weight
+    assert both == pytest.approx(0.10 * 0.4 * 0.6)
+    assert both < disputed < full and half < full
+
+
 def test_dispersion_shrinks_size():
     half = _run({"AAA": _agg("AAA", 0.52, dispersion=0.25)})
     assert _pos(half, "AAA").weight == pytest.approx(_kelly(0.52, 0, disp_factor=0.5))
@@ -98,6 +114,19 @@ def test_dispersion_shrinks_size():
 def test_missing_vol_uses_30pct_fallback_and_tiny_vol_is_floored():
     tp = _run({"AAA": _agg("AAA", 0.52)}, factsheets={"AAA": _fs("AAA", vol=None)})
     assert _pos(tp, "AAA").weight == pytest.approx(_kelly(0.52, 0, vol=0.30))
+    # the fallback is a floor: a young listing whose 20-day vol is 80% is sized on 80%, not 30%
+    young = _fs("AAA", vol=None)
+    young.add(Fact("AAA.vol_20d", "Realized volatility, 20 days", 80.0, "%", AS_OF, "test"))
+    tp_young = _run({"AAA": _agg("AAA", 0.52)}, factsheets={"AAA": young})
+    assert _pos(tp_young, "AAA").weight == pytest.approx(_kelly(0.52, 0, vol=0.80))
+    # ... and with fewer than 20 returns, the realised vol of the available history counts too
+    rng = np.random.default_rng(0)
+    rets = pd.DataFrame({"AAA": rng.normal(0, 0.07, 12)}, index=pd.bdate_range(end=AS_OF, periods=12))
+    realised = float(rets["AAA"].std(ddof=1)) * math.sqrt(252)
+    assert realised > 0.8
+    tp_new = _run({"AAA": _agg("AAA", 0.52)}, factsheets={"AAA": _fs("AAA", vol=None)}, returns=rets)
+    assert _pos(tp_new, "AAA").weight == pytest.approx(_kelly(0.52, 0, vol=realised))
+    assert "vol_60d unavailable" in _pos(tp_new, "AAA").rationale
     tp2 = _run({"AAA": _agg("AAA", 0.501, 0.0)}, cfg=_cfg(min_prob_to_hold=0.5),
                factsheets={"AAA": _fs("AAA", vol=0.5)})
     assert _pos(tp2, "AAA").weight == pytest.approx(_kelly(0.501, 0, vol=0.05))
@@ -214,21 +243,87 @@ def test_no_trade_band_keeps_current_weight():
 
 
 def test_turnover_cap_scales_all_trades():
+    """max_turnover caps ONE-WAY turnover, 0.5 * sum|dw| (as the config documents)."""
     names = [f"T{i:02d}" for i in range(12)]
-    cfg = _cfg(target_vol=5.0, max_turnover=0.5)
+    cfg = _cfg(target_vol=5.0, max_turnover=0.25)
     tp = _run({t: _agg(t, 0.62, 3.0) for t in names}, cfg=cfg, sectors={t: t for t in names})
-    assert sum(abs(p.weight) for p in tp.positions) == pytest.approx(0.5)
+    assert 0.5 * sum(abs(p.weight) for p in tp.positions) == pytest.approx(0.25)
     assert all("turnover_cap" in p.constraints_hit for p in tp.positions)
+    assert any("one-way turnover" in n for n in tp.notes)
 
 
-def test_held_names_without_views_are_sold_unless_turnover_prevents_it():
+def test_turnover_cap_is_one_way_so_a_30pct_rotation_fits_a_50pct_cap():
+    """Regression: selling A, B, C (10% each) to buy D, E, F is 30% one-way turnover. With
+    max_turnover=0.5 the cap must not bind (it used to compare sum|dw| = 0.60 to 0.5)."""
+    current = {"A": 0.10, "B": 0.10, "C": 0.10}
+    aggs = {t: _agg(t, 0.40, -3.0) for t in "ABC"} | {t: _agg(t, 0.62, 3.0) for t in "DEF"}
+    tp = _run(aggs, cfg=_cfg(max_turnover=0.5, target_vol=5.0), current=current,
+              sectors={t: t for t in "ABCDEF"})
+    assert {t: _pos(tp, t).weight for t in "ABCDEF"} == pytest.approx(
+        {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.10, "E": 0.10, "F": 0.10})
+    assert not any("turnover_cap" in p.constraints_hit for p in tp.positions)
+
+
+def test_held_names_without_views_are_forced_exits_past_the_band_and_turnover_cap():
+    """Regression: a held name that is no longer covered is sold in full, even below the
+    no-trade band and even when the turnover cap binds; its turnover is spent first and the
+    discretionary trades share what is left."""
     tp = _run({"AAA": _agg("AAA", 0.52)}, current={"OLD": 0.08})
     assert _pos(tp, "OLD").weight == 0
     assert "no committee view" in _pos(tp, "OLD").rationale
-    slow = _run({"AAA": _agg("AAA", 0.62, 3.0)}, current={"OLD": 0.08}, cfg=_cfg(max_turnover=0.09))
-    total_trade = abs(_pos(slow, "OLD").weight - 0.08) + _pos(slow, "AAA").weight
-    assert total_trade == pytest.approx(0.09)
-    assert 0 < _pos(slow, "OLD").weight < 0.08
+    assert "forced_exit" in _pos(tp, "OLD").constraints_hit
+    stub = _run({}, current={"OLD": 0.008})                    # below the 1% band
+    assert _pos(stub, "OLD").weight == 0 and "no_trade_band" not in _pos(stub, "OLD").constraints_hit
+    slow = _run({"AAA": _agg("AAA", 0.62, 3.0)}, current={"OLD": 0.08}, cfg=_cfg(max_turnover=0.06))
+    assert _pos(slow, "OLD").weight == 0                      # never scaled by the turnover cap
+    # forced exit uses 0.04 of the 0.06 one-way budget; the AAA buy gets the remaining 0.02
+    assert 0.5 * (0.08 + _pos(slow, "AAA").weight) == pytest.approx(0.06)
+    assert "turnover_cap" in _pos(slow, "AAA").constraints_hit
+    tight = _run({"AAA": _agg("AAA", 0.62, 3.0)}, current={"OLD": 0.08}, cfg=_cfg(max_turnover=0.01))
+    assert _pos(tight, "OLD").weight == 0 and _pos(tight, "AAA").weight == 0
+
+
+def test_held_name_on_which_every_analyst_abstained_is_held_not_sold():
+    """Regression: n_views == 0 is no information (like an outage), so a held name keeps its
+    current weight instead of being liquidated at the pooled 0.5."""
+    no_view = AggregatedView(ticker="AAA", prob_outperform=0.5, prob_equal_weight=0.5, expected_excess_return_pct=0.0,
+                             dispersion=0.0, n_views=0, n_abstained=4)
+    tp = _run({"AAA": no_view, "BBB": _agg("BBB", 0.40, -2.0)}, current={"AAA": 0.08, "BBB": 0.05})
+    assert _pos(tp, "AAA").weight == pytest.approx(0.08)
+    assert "no_view_hold" in _pos(tp, "AAA").constraints_hit
+    assert _pos(tp, "BBB").weight == 0                         # a real negative view still sells
+    assert any("no analyst view on held name" in n for n in tp.notes)
+    # a hard limit still applies: a held position above the cap is cut back to it
+    big = _run({"AAA": no_view}, current={"AAA": 0.15})
+    assert _pos(big, "AAA").weight == pytest.approx(0.10)
+
+
+def test_keep_current_pins_a_held_name_whose_memo_failed():
+    """Regression (#18): a held name whose required IC memo failed (CommitteeResult.hold_current)
+    was re-sized from the unreviewed pooled view (3% -> 9.55%, a buy on an LLM failure).
+    ``keep_current`` keeps it at its current weight: no buy, no sale, only a hard limit can cut it."""
+    strong = _agg("AAA", 0.62, 3.0)                              # unpinned, this sizes to the 10% cap
+    tp = _run({"AAA": strong, "BBB": _agg("BBB", 0.40, -2.0)}, current={"AAA": 0.03, "BBB": 0.05},
+              mult={"AAA": 1.0, "BBB": 1.0})
+    assert _pos(tp, "AAA").weight == pytest.approx(0.10)         # the behaviour being guarded against
+    pinned = construct_portfolio({"AAA": strong, "BBB": _agg("BBB", 0.40, -2.0)}, {"AAA": 1.0, "BBB": 1.0},
+                                 {t: _fs(t) for t in ("AAA", "BBB")}, {"AAA": 0.03, "BBB": 0.05}, _cfg(), AS_OF, {},
+                                 keep_current=["AAA"])
+    assert _pos(pinned, "AAA").weight == pytest.approx(0.03)
+    assert "unreviewed_hold" in _pos(pinned, "AAA").constraints_hit
+    assert "not reviewed" in _pos(pinned, "AAA").rationale
+    assert _pos(pinned, "BBB").weight == 0                       # other names are unaffected
+    assert any("required IC memo failed on held name(s) AAA" in n for n in pinned.notes)
+    weak = construct_portfolio({"AAA": _agg("AAA", 0.40, -2.0)}, {"AAA": 1.0}, {"AAA": _fs("AAA")},
+                               {"AAA": 0.03}, _cfg(), AS_OF, {}, keep_current=["AAA"])
+    assert _pos(weak, "AAA").weight == pytest.approx(0.03)        # nor sold on the unreviewed view
+    # a hard limit still applies (only toward 0), and an unheld pinned name gets no position
+    big = construct_portfolio({"AAA": strong}, {"AAA": 1.0}, {"AAA": _fs("AAA")}, {"AAA": 0.15}, _cfg(), AS_OF, {},
+                              keep_current=["AAA"])
+    assert _pos(big, "AAA").weight == pytest.approx(0.10)
+    unheld = construct_portfolio({"AAA": strong}, {"AAA": 1.0}, {"AAA": _fs("AAA")}, {}, _cfg(), AS_OF, {},
+                                 keep_current=["AAA"])
+    assert unheld.weights().get("AAA", 0.0) == 0.0
 
 
 def test_benchmark_is_the_core_not_an_active_name():
@@ -350,16 +445,22 @@ def _check_hard_limits(tp, cfg, sectors, vols):
 @pytest.mark.parametrize("seed", range(60))
 def test_property_limits_and_turnover_over_chained_cycles(seed):
     """Feed each cycle's output back as the next cycle's current book: every hard limit holds
-    every cycle, and because the current book is always compliant, so does the turnover cap."""
+    every cycle, and because the current book is always compliant, so does the (one-way)
+    turnover cap, apart from forced exits."""
     rng = np.random.default_rng(seed)
     tickers, sectors, cfg, vols, fss = _random_setup(rng)
     current: dict[str, float] = {}
     for _ in range(4):
-        tp = construct_portfolio(_random_aggs(rng, tickers), {}, fss, current, cfg, AS_OF, sectors)
+        aggs = _random_aggs(rng, tickers)
+        tp = construct_portfolio(aggs, {}, fss, current, cfg, AS_OF, sectors)
         _check_hard_limits(tp, cfg, sectors, vols)
         new = {p.ticker: p.weight for p in tp.positions} | {BENCH: tp.core_weight}
-        turnover = sum(abs(new.get(t, 0.0) - current.get(t, 0.0)) for t in set(new) | set(current))
-        assert turnover <= cfg.portfolio.max_turnover + 1e-9
+        # one-way turnover; forced exits (held names with no view) are not capped but use the budget first
+        forced = {t for t in current if t != BENCH and t not in aggs}
+        assert all(new.get(t, 0.0) == 0.0 for t in forced)
+        forced_one_way = 0.5 * sum(abs(current[t]) for t in forced)
+        turnover = 0.5 * sum(abs(new.get(t, 0.0) - current.get(t, 0.0)) for t in set(new) | set(current))
+        assert turnover <= max(cfg.portfolio.max_turnover, forced_one_way) + 1e-9
         assert not any("override the turnover cap" in n for n in tp.notes)
         current = {t: x for t, x in new.items() if x != 0}
 

@@ -11,6 +11,7 @@ fact. This addresses the hallucinated-numbers failure mode and makes every claim
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -147,16 +148,27 @@ def _rsi(s: pd.Series, n: int = 14) -> float:
 
 
 def price_facts(ticker: str, prices: PriceData, benchmark: str | None = "SPY") -> list[Fact]:
-    """Trend, momentum and risk facts computed from data up to the last row of ``prices``."""
+    """Trend, momentum and risk facts computed from data up to the last row of ``prices``.
+
+    The ``price`` fact is the **as-traded** close (what printed that day, not back-adjusted
+    for later splits; see :mod:`aifirm.data.prices`), so it is consistent with as-filed SEC
+    share counts and with the minimum-price rule. Returns use the adjusted close.
+    Statistics that need a full year (12-month returns, momentum, 1-year drawdown, 52-week
+    high) are only computed with at least 252 observations, and windowed statistics only
+    with a full window: a few weeks after a listing they would be mislabelled."""
     t = ticker.upper()
     adj = prices.adj_close[t].dropna()
     close = prices.close[t].dropna()
+    level = prices.price_level(t).dropna()
     if adj.empty:
         return []
     asof = str(adj.index[-1].date())
     src = "Yahoo daily prices (returns from adjusted close)"
     rets = adj.pct_change().dropna()
-    out = [Fact(f"{t}.price", "Last close", float(close.iloc[-1]), "USD", asof, "Yahoo daily close")]
+    out = []
+    if not level.empty:
+        out.append(Fact(f"{t}.price", "Last close", float(level.iloc[-1]), "USD", str(level.index[-1].date()),
+                        "Yahoo daily close, as traded (not adjusted for later splits)"))
     for key, label, n, skip in [
         ("ret_1m", "Return, 1 month (21 trading days)", 21, 0),
         ("ret_3m", "Return, 3 months (63 trading days)", 63, 0),
@@ -173,33 +185,58 @@ def price_facts(ticker: str, prices: PriceData, benchmark: str | None = "SPY") -
         joined = pd.concat([rets, br], axis=1, join="inner").dropna().iloc[-TRADING_DAYS:]
         if len(joined) > 60 and joined.iloc[:, 1].var() > 0:
             beta = joined.iloc[:, 0].cov(joined.iloc[:, 1]) / joined.iloc[:, 1].var()
-            out.append(Fact(f"{t}.beta_1y", f"Beta vs {benchmark} (1 year daily)", float(beta), "ratio", asof, src))
+            window = "1 year daily" if len(joined) >= TRADING_DAYS - 1 else f"daily, only {len(joined)} trading days of history"
+            out.append(Fact(f"{t}.beta_1y", f"Beta vs {benchmark} ({window})", float(beta), "ratio", asof, src))
     if len(rets) >= 20:
         out.append(Fact(f"{t}.vol_20d", "Realized volatility, 20 days (annualized)", float(rets.iloc[-20:].std() * np.sqrt(TRADING_DAYS) * 100), "%", asof, src))
     if len(rets) >= 60:
         out.append(Fact(f"{t}.vol_60d", "Realized volatility, 60 days (annualized)", float(rets.iloc[-60:].std() * np.sqrt(TRADING_DAYS) * 100), "%", asof, src))
-    last_year = adj.iloc[-TRADING_DAYS:]
-    dd = last_year / last_year.cummax() - 1
-    out.append(Fact(f"{t}.max_dd_1y", "Maximum drawdown over the last year", float(dd.min() * 100), "%", asof, src))
-    out.append(Fact(f"{t}.dist_52w_high", "Distance below 52-week high", float((adj.iloc[-1] / last_year.max() - 1) * 100), "%", asof, src))
+    if len(adj) >= TRADING_DAYS:
+        last_year = adj.iloc[-TRADING_DAYS:]
+        dd = last_year / last_year.cummax() - 1
+        out.append(Fact(f"{t}.max_dd_1y", "Maximum drawdown over the last year", float(dd.min() * 100), "%", asof, src))
+        out.append(Fact(f"{t}.dist_52w_high", "Distance below 52-week high", float((adj.iloc[-1] / last_year.max() - 1) * 100), "%", asof, src))
     if len(adj) >= 200:
         sma50, sma200 = adj.iloc[-50:].mean(), adj.iloc[-200:].mean()
         out.append(Fact(f"{t}.sma50_sma200", "50-day / 200-day moving-average ratio (>1 = uptrend)", float(sma50 / sma200), "ratio", asof, src))
         out.append(Fact(f"{t}.price_vs_sma200", "Price vs 200-day moving average", float((adj.iloc[-1] / sma200 - 1) * 100), "%", asof, src))
     out.append(Fact(f"{t}.rsi_14", "RSI (14 days; >70 overbought, <30 oversold)", _rsi(adj), "index", asof, src))
-    vol = prices.volume[t].reindex(close.index).fillna(0)
-    adv = float((close * vol).iloc[-20:].mean())
-    out.append(Fact(f"{t}.adv_20d", "Average daily dollar volume, 20 days", adv, "USD", asof, "Yahoo daily close x volume"))
+    if len(close) >= 20:
+        vol = prices.volume[t].reindex(close.index).fillna(0)
+        adv = float((close * vol).iloc[-20:].mean())
+        out.append(Fact(f"{t}.adv_20d", "Average daily dollar volume, 20 days", adv, "USD", asof, "Yahoo daily close x volume"))
     return [f for f in out if not (isinstance(f.value, float) and math.isnan(f.value))]
+
+
+def price_history_gaps(ticker: str, prices: PriceData) -> list[str]:
+    """Data gaps for a short price history (e.g. a recent listing)."""
+    t = ticker.upper()
+    adj = prices.adj_close[t].dropna() if t in prices.adj_close.columns else pd.Series(dtype=float)
+    if adj.empty or len(adj) >= TRADING_DAYS:
+        return []
+    gap = (f"Only {len(adj)} trading days of price history (since {adj.index[0].date()}): 1-year statistics "
+           "(12-month return, momentum, 1-year drawdown, 52-week high) are not computed and the stock's "
+           "longer-term behaviour is unknown")
+    return [gap]
 
 
 # --------------------------------------------------------------------------- fundamental facts
 
-def fundamental_facts(f: Fundamentals, last_price: float | None) -> tuple[list[Fact], list[str]]:
+def fundamental_facts(f: Fundamentals, last_price: float | None,
+                      split_ratio: Callable[[str], float] | None = None) -> tuple[list[Fact], list[str]]:
+    """Fundamental and valuation facts.
+
+    ``last_price`` must be the as-traded close on the as-of date. ``split_ratio(date)``
+    returns the product of the stock's split ratios with ex-date after ``date`` and on or
+    before the as-of date; it puts an as-filed share count (dated before a split) on the
+    as-of share basis so that market cap = price x shares is consistent. Market cap and
+    multiples are omitted (with a data gap) for foreign private issuers, whose SEC share
+    count is of ordinary shares while the US listing may be an ADR."""
     t = f.ticker
     out: list[Fact] = []
-    gaps: list[str] = []
+    gaps: list[str] = list(f.gaps)
     v = f.values
+    ratio = split_ratio or (lambda _d: 1.0)
 
     def src(fv) -> str:
         filed = f" filed {fv.filed}" if fv.filed else ""
@@ -249,17 +286,29 @@ def fundamental_facts(f: Fundamentals, last_price: float | None) -> tuple[list[F
     if "current_assets" in v and "current_liabilities" in v and v["current_liabilities"].value > 0:
         out.append(Fact(f"{t}.current_ratio", "Current ratio", v["current_assets"].value / v["current_liabilities"].value, "ratio", v["current_assets"].period_end, "computed from SEC XBRL"))
 
-    sh = f.shares_outstanding
-    if sh:
-        out.append(Fact(f"{t}.shares_out", "Shares outstanding", sh.value, "count", sh.period_end, f"SEC cover page filed {sh.filed}"))
-        if f.shares_outstanding_prior_year and f.shares_outstanding_prior_year.value > 0:
-            chg = (sh.value / f.shares_outstanding_prior_year.value - 1) * 100
-            out.append(Fact(f"{t}.share_count_change_yoy", "Change in share count, ~1 year (negative = buybacks)", chg, "%", sh.period_end, "computed from SEC cover pages"))
-    else:
+    sh = f.shares_outstanding if f.shares_outstanding is not None and f.shares_outstanding.value > 0 else None
+    shares = None
+    if sh is not None:
+        k = ratio(sh.period_end)
+        shares = sh.value * k
+        source = f"SEC cover page filed {sh.filed}"
+        if k != 1.0:
+            source += f"; x{k:g} for stock splits after {sh.period_end}"
+        label = "Shares outstanding (ordinary shares per SEC filing)" if f.foreign_filer else "Shares outstanding"
+        out.append(Fact(f"{t}.shares_out", label, shares, "count", sh.period_end, source))
+        prior = f.shares_outstanding_prior_year
+        if prior is not None and prior.value > 0:
+            chg = (shares / (prior.value * ratio(prior.period_end)) - 1) * 100
+            out.append(Fact(f"{t}.share_count_change_yoy", "Change in share count, ~1 year (negative = buybacks)", chg, "%", sh.period_end, "computed from SEC cover pages (split-adjusted)"))
+    elif not any("share count" in g for g in gaps):   # fundamentals may already have said why
         gaps.append("Shares outstanding unavailable - valuation multiples not computed")
 
-    if sh and last_price:
-        mcap = sh.value * last_price
+    if shares and f.foreign_filer:
+        gaps.append("Foreign private issuer (20-F/40-F filer): the SEC share count is of ordinary shares while the "
+                    "US listing may be an ADR representing several of them - market cap and valuation multiples "
+                    "not computed")
+    elif shares and last_price is not None and last_price > 0:
+        mcap = shares * last_price
         out.append(Fact(f"{t}.market_cap", "Market capitalization (last close x shares outstanding)", mcap, "USD", f.as_of, "computed"))
         if "net_income" in v and v["net_income"].value > 0:
             out.append(Fact(f"{t}.pe_ttm", "Price / earnings (TTM)", mcap / v["net_income"].value, "x", f.as_of, "computed"))
@@ -267,9 +316,9 @@ def fundamental_facts(f: Fundamentals, last_price: float | None) -> tuple[list[F
             out.append(Fact(f"{t}.ps_ttm", "Price / sales (TTM)", mcap / v["revenue"].value, "x", f.as_of, "computed"))
         if "equity" in v and v["equity"].value > 0:
             out.append(Fact(f"{t}.pb", "Price / book", mcap / v["equity"].value, "x", f.as_of, "computed"))
-        if fcf is not None and mcap > 0:
+        if fcf is not None:
             out.append(Fact(f"{t}.fcf_yield", "Free-cash-flow yield (FCF / market cap)", fcf / mcap * 100, "%", f.as_of, "computed"))
-        if "net_income" in v and mcap > 0:
+        if "net_income" in v:
             out.append(Fact(f"{t}.earnings_yield", "Earnings yield (TTM net income / market cap)", v["net_income"].value / mcap * 100, "%", f.as_of, "computed"))
     return out, gaps
 
@@ -340,11 +389,15 @@ def build_factsheet(
     fs = FactSheet(ticker=t, as_of=as_of_s, sector=sector)
     for fct in price_facts(t, p, benchmark):
         fs.add(fct)
-    last_price = fs.get(f"{t}.price").value if fs.get(f"{t}.price") else None
+    fs.data_gaps += price_history_gaps(t, p)
+    price_fact = fs.get(f"{t}.price")
+    last_price = float(price_fact.value) if price_fact is not None else None
     if fundamentals is not None:
         fs.name = fundamentals.entity_name
         fs.sector = fs.sector or fundamentals.sic_description
-        ff, gaps = fundamental_facts(fundamentals, last_price)
+        # shares are put on the share basis of the day the price printed
+        through = price_fact.as_of if price_fact is not None else as_of_s
+        ff, gaps = fundamental_facts(fundamentals, last_price, split_ratio=lambda d: p.split_ratio(t, d, through))
         for fct in ff:
             fs.add(fct)
         fs.data_gaps += gaps

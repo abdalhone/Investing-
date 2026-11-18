@@ -13,6 +13,12 @@ Buys fill *above* the reference price and sells *below* it, so a round trip at a
 unchanged price always loses money. Cash can never go negative: a buy that cannot be paid
 for is scaled down to the cash available. Fractional shares are allowed.
 
+Cash dividends are credited with :meth:`PaperBroker.credit_dividends` on each ex-date
+(the caller supplies the per-share amounts, e.g. from
+:func:`aifirm.pipeline.implied_dividends`). Positions are marked at raw closes, so without
+this credit a paper book would earn only the *price* return while forecasts and the
+benchmark are measured on *total* return.
+
 The Alpaca adapter talks to the documented Alpaca Trading API v2 over HTTPS. Because it
 can move real money, it refuses to start without keys, refuses a live endpoint unless
 ``allow_live=True``, and with ``require_approval`` refuses to submit unless the caller
@@ -26,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -105,6 +112,10 @@ class PaperBroker:
         self._marks: dict[str, float] = {}       # last known price per ticker (stale-mark fallback)
         self.total_commission = 0.0
         self.total_slippage = 0.0
+        self.total_dividends = 0.0               # net dividend cash credited (shorts pay theirs)
+        # Last session whose ex-date dividends have been settled (None: never). A live book is
+        # settled between runs (aifirm.cli), so no ex-date is credited twice or skipped.
+        self.dividends_through: str | None = None
         self.last_rejections: list[str] = []     # why orders in the last submit() did not (fully) fill
 
     # -- Broker protocol -------------------------------------------------------------
@@ -150,6 +161,28 @@ class PaperBroker:
         if self.state_path:
             self.save()
         return fills
+
+    def credit_dividends(self, per_share: Mapping[str, float], date: str) -> float:
+        """Credit cash dividends for the shares held now and return the net cash credited.
+
+        Call it on the ex-date *before* that day's fills: the holder at the previous close
+        is entitled to the dividend (a buy at the ex-date open is already ex-dividend; a
+        sell at that open still collects it). ``per_share`` maps ticker -> cash dividend
+        per share; missing, non-finite or non-positive amounts are ignored. A short
+        position pays the dividend to the lender. ``date`` is accepted for the record and
+        protocol symmetry with :meth:`submit`.
+        """
+        total = 0.0
+        for t, q in sorted(self._positions.items()):
+            d = _positive(per_share.get(t))
+            if d is not None:
+                total += q * d
+        if total != 0.0:
+            self._cash += total
+            self.total_dividends += total
+            if self.state_path:
+                self.save()
+        return total
 
     # -- internals -------------------------------------------------------------------
     def _sell(self, t: str, qty: float, price: float, date: str, adv: float | None,
@@ -207,7 +240,8 @@ class PaperBroker:
         if not target:
             raise ValueError("no state_path to save to")
         data = {"cash": self._cash, "positions": self._positions, "marks": self._marks,
-                "total_commission": self.total_commission, "total_slippage": self.total_slippage}
+                "total_commission": self.total_commission, "total_slippage": self.total_slippage,
+                "total_dividends": self.total_dividends, "dividends_through": self.dividends_through}
         p = Path(target)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
@@ -231,6 +265,9 @@ class PaperBroker:
         self._cash, self._positions, self._marks = cash, positions, marks
         self.total_commission = float(data.get("total_commission", 0.0))
         self.total_slippage = float(data.get("total_slippage", 0.0))
+        self.total_dividends = float(data.get("total_dividends", 0.0))
+        through = data.get("dividends_through")
+        self.dividends_through = str(through)[:10] if through else None
         return True
 
 

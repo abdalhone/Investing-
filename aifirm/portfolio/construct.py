@@ -1,26 +1,72 @@
 """Deterministic portfolio construction: pooled forecasts in, target weights out (P1, P8).
 
 LLMs never size positions (P1). This module turns each ticker's pooled probability and
-expected excess return into a weight with a fixed, auditable recipe:
+expected excess return into a weight with a fixed, auditable recipe.
 
-1. **Edge.** ``mu_prob = sigma_h * Phi^-1(p)`` is the excess return a normal distribution
-   with the stock's horizon volatility implies for ``P(beat benchmark) = p``.
-   ``mu_exp = expected_excess / 100`` is the analysts' own number. The two are averaged
-   because each guards against a different failure: probabilities are scored and
-   calibrated (P7), while point forecasts carry magnitude. The edge is then shrunk by the
-   chair's ``edge_multiplier`` (which can only shrink it) and by analyst disagreement,
-   ``max(0, 1 - dispersion_shrink * dispersion)``. Disagreement is information about
-   uncertainty, so it costs size.
-2. **Fractional Kelly.** ``w = kelly_fraction * mu / sigma_h^2``. Full Kelly maximizes
-   growth only when the edge is known exactly; with estimated edges it is ruinous, hence
-   the default quarter Kelly (P8).
-3. **Caps and targets.** Per-name cap, sector caps, then sleeve volatility targeting
-   (sample covariance of the last 126 days when returns are given, else a
+Sizing formula (per ticker, long/short symmetric; ``h = horizon_days``)
+-----------------------------------------------------------------------
+::
+
+    sigma_h  = sigma_ann * sqrt(h / 252)            sigma_ann: vol_60d, else the floored fallback below
+    mu_prob  = sigma_h * Phi^-1(p)                  p: pooled P(beat benchmark), clipped to [0.01, 0.99]
+    mu_exp   = expected_excess_pct / 100
+    mu0      = 0.5 * (mu_prob + mu_exp)             the unshrunk edge
+    m        = clamp(edge_multiplier, 0, 1)         the chair (can only shrink; missing = 1, NaN = 0)
+    d        = max(0, 1 - dispersion_shrink * dispersion)
+    gate     : long  if p >= min_prob_to_hold      and mu0 * m * d > 0
+               short if p <= 1 - min_prob_to_hold  and mu0 * m * d < 0  (only if not long_only)
+    kelly    = kelly_fraction * mu0 / sigma_h^2     fractional Kelly on the unshrunk edge
+    w        = sign(kelly) * min(max_position, |kelly|) * m * d   (0 if the gate fails)
+
+The conviction multiplier ``m`` and the disagreement factor ``d`` are applied *after*
+the position cap. At a one-month horizon ``sigma_h`` is small, so quarter Kelly on any
+real edge is usually several times ``max_position``; applied before the cap, ``m`` and
+``d`` would only matter once their product fell below ``max_position / kelly`` and sizing
+would collapse to {0, max_position}. Applied after it, a chair multiplier of 0.5 always
+halves the position and disagreement always costs size, as documented. When the Kelly
+weight is below the cap the two orders are identical (``kelly * m * d``).
+
+Why each piece:
+
+1. **Edge.** ``mu_prob`` is the excess return a normal distribution with the stock's
+   horizon volatility implies for ``P(beat benchmark) = p``; ``mu_exp`` is the analysts'
+   own number. They are averaged because each guards against a different failure:
+   probabilities are scored and calibrated (P7), while point forecasts carry magnitude.
+   Disagreement is information about uncertainty, so it costs size.
+2. **Fractional Kelly.** Full Kelly maximizes growth only when the edge is known exactly;
+   with estimated edges it is ruinous, hence the default quarter Kelly (P8).
+3. **Volatility.** ``vol_60d`` from the fact sheet, floored at 5% (lower almost always
+   means stale prices). Without ``vol_60d`` (a listing younger than ~3 months) the
+   fallback is ``max(30%, vol_20d, realised vol over the available returns)``: young
+   listings are the most volatile names, so the fallback is a floor, never a cap.
+4. **Caps and targets.** Per-name cap (above), sector caps, then sleeve volatility
+   targeting (sample covariance of the last 126 days when returns are given, else a
    constant-correlation model with rho = 0.3).
-4. **Core-satellite.** ``core_weight`` of NAV sits passively in the benchmark. The agents
+5. **Core-satellite.** ``core_weight`` of NAV sits passively in the benchmark. The agents
    manage the rest, so a bad committee can only lose relative to part of the book.
-5. **Book limits** (gross and cash floor), stated as fractions of total NAV.
-6. **Trade path.** A no-trade band and a turnover cap avoid paying costs for noise.
+6. **Book limits** (gross and cash floor), stated as fractions of total NAV.
+7. **Trade path.** A no-trade band and a turnover cap avoid paying costs for noise.
+   Turnover is **one-way**: ``0.5 * sum(|w_target - w_current|)`` over every leg, core
+   included (buying 10% with the proceeds of selling 10% is 10% turnover), and
+   ``max_turnover`` caps that number.
+
+Exceptions on the trade path:
+
+* **Forced exits** (a held name with no committee view because it is no longer covered,
+  e.g. dropped from the universe) skip the no-trade band and are never scaled by the
+  turnover cap; their turnover is spent first and the discretionary trades share what
+  is left of ``max_turnover``. (Risk-engine exits, such as a freeze, the restricted list
+  or the minimum price, happen after construction and are not subject to these cost
+  controls either.)
+* **No information, no trade.** A held name on which every analyst abstained
+  (``n_views == 0``) keeps its current weight: an absence of views, like an LLM outage,
+  is not information about the stock, so it must not liquidate the position. Only a
+  hard limit (below) can cut it.
+* **Unreviewed, no trade** (``keep_current``). A held name whose required IC memo failed
+  (``CommitteeResult.hold_current``) is pinned the same way: the chair could not review
+  the pooled view, so that view is neither sized up (an unreviewed edge never adds
+  exposure) nor used to sell (an LLM failure is not information about the stock). Its
+  ideal weight is 0, so only a hard limit can move it, and only toward 0.
 
 Cost controls yield to risk limits: if the band or the turnover cap would leave the book
 breaching a hard limit (position cap, sector cap, gross, cash floor, volatility target,
@@ -28,10 +74,11 @@ long-only), the exposure-adding part of each trade is trimmed first; if that is 
 enough (the current book itself is out of bounds, e.g. after price drift), the book moves
 toward the ideal target just far enough to comply and the turnover cap is overridden with
 a note. The final book therefore always satisfies every hard limit. In a long-only book
-whose current weights are within limits, the turnover cap is also respected (strictly
-guaranteed when no pairwise correlation is negative, as in the fallback model; selling a
-negatively correlated hedge can raise volatility). In a long/short book, covering a short
-raises net exposure, so in rare cases a limit can still override the turnover cap.
+whose current weights are within limits, the turnover cap is also respected apart from
+forced exits (strictly guaranteed when no pairwise correlation is negative, as in the
+fallback model; selling a negatively correlated hedge can raise volatility). In a
+long/short book, covering a short raises net exposure, so in rare cases a limit can still
+override the turnover cap.
 
 Every binding constraint is recorded per position (``constraints_hit``) or in the
 portfolio ``notes``, so a report can explain each weight.
@@ -41,7 +88,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -53,8 +100,9 @@ from ..data.factsheet import FactSheet
 from ..schemas import AggregatedView, TargetPortfolio, TargetPosition, clamp
 
 TRADING_DAYS = 252
-FALLBACK_VOL = 0.30     # annualized vol assumed when vol_60d is unavailable (contract)
+FALLBACK_VOL = 0.30     # annualized vol floor when vol_60d is unavailable (contract)
 MIN_VOL = 0.05          # a single stock below 5% realized vol almost always means stale prices
+MIN_VOL_OBS = 5         # fewer daily returns and a realised volatility says nothing
 FALLBACK_CORR = 0.30    # average pairwise correlation of US large caps, used without returns
 COV_WINDOW = 126        # ~6 months of daily returns for the sample covariance
 MIN_COV_OBS = 60        # fewer complete rows than this and the sample covariance is too noisy
@@ -104,14 +152,32 @@ def _clean_current(current_weights: Mapping[str, float]) -> dict[str, float]:
     return out
 
 
-def _annual_vol(fs: FactSheet | None, ticker: str) -> tuple[float, str]:
+def _annual_vol(fs: FactSheet | None, ticker: str, returns: pd.DataFrame | None = None) -> tuple[float, str]:
+    """Annualized volatility for sizing and the reason, from ``vol_60d`` when it exists.
+
+    Without ``vol_60d`` (fewer than 60 daily returns: a recent listing) the fallback is a
+    *floor*, ``max(FALLBACK_VOL, vol_20d, realised vol of the available returns)``, so a
+    young, volatile name is never sized as if it were an average large cap. ``returns``
+    must already be cut at the as-of date (P3)."""
     fact = fs.get(f"{ticker}.vol_60d") if fs is not None else None
     v = _finite_or(fact.value, math.nan) / 100.0 if fact is not None else math.nan
-    if not math.isfinite(v) or v <= 0:
-        return FALLBACK_VOL, "vol_60d unavailable, fallback 30%"
-    if v < MIN_VOL:
-        return MIN_VOL, f"vol_60d {v:.1%} floored at {MIN_VOL:.0%}"
-    return v, "vol_60d"
+    if math.isfinite(v) and v > 0:
+        if v < MIN_VOL:
+            return MIN_VOL, f"vol_60d {v:.1%} floored at {MIN_VOL:.0%}"
+        return v, "vol_60d"
+    candidates = [(FALLBACK_VOL, f"fallback {FALLBACK_VOL:.0%}")]
+    fact20 = fs.get(f"{ticker}.vol_20d") if fs is not None else None
+    v20 = _finite_or(fact20.value, math.nan) / 100.0 if fact20 is not None else math.nan
+    if math.isfinite(v20) and v20 > 0:
+        candidates.append((v20, f"vol_20d {v20:.0%}"))
+    if returns is not None and ticker in returns.columns:
+        r = returns[ticker].dropna().tail(60)
+        if len(r) >= MIN_VOL_OBS:
+            realised = float(r.std(ddof=1)) * math.sqrt(TRADING_DAYS)
+            if math.isfinite(realised) and realised > 0:
+                candidates.append((realised, f"realised vol of {len(r)} daily returns {realised:.0%}"))
+    vol, why = max(candidates, key=lambda c: c[0])
+    return vol, f"vol_60d unavailable; using the largest of {', '.join(c[1] for c in candidates)}: {why}"
 
 
 @dataclass(frozen=True)
@@ -218,29 +284,36 @@ class _Sized:
 
 
 def _size_name(t: str, agg: AggregatedView, multiplier: object, fs: FactSheet | None,
-               cfg: FirmConfig, hits: list[str]) -> _Sized:
-    """Steps 1-2 for one ticker: edge, shrinkage, gating and capped fractional Kelly."""
+               cfg: FirmConfig, hits: list[str], returns: pd.DataFrame | None = None) -> _Sized:
+    """Edge, gating and capped fractional Kelly for one ticker (the module docstring's formula).
+
+    The chair multiplier and the dispersion factor scale the *capped* Kelly weight, so they
+    change the size even when the raw Kelly weight is far above ``max_position``."""
     pc = cfg.portfolio
-    sigma_ann, vol_src = _annual_vol(fs, t)
+    sigma_ann, vol_src = _annual_vol(fs, t, returns)
     sigma_h = sigma_ann * math.sqrt(cfg.process.horizon_days / TRADING_DAYS)
     p = clamp(agg.prob_outperform, 0.0, 1.0)
     mu_prob = sigma_h * float(norm.ppf(min(max(p, PROB_CLIP), 1.0 - PROB_CLIP)))
     mu_exp = _finite_or(agg.expected_excess_return_pct, 0.0) / 100.0
+    mu0 = 0.5 * (mu_prob + mu_exp)
     # The chair can only shrink the edge; a missing or broken multiplier is treated as 0 (no trade).
     m = clamp(_finite_or(multiplier, 0.0), 0.0, 1.0)
     disp = _finite_or(agg.dispersion, math.nan)
     disp_factor = max(0.0, 1.0 - pc.dispersion_shrink * max(0.0, disp)) if math.isfinite(disp) else 0.0
-    mu = 0.5 * (mu_prob + mu_exp) * m * disp_factor
+    mu = mu0 * m * disp_factor
 
     long_ok = p >= pc.min_prob_to_hold
     short_ok = (not pc.long_only) and p <= 1.0 - pc.min_prob_to_hold
     weight = 0.0
     if (long_ok and mu > 0) or (short_ok and mu < 0):
-        raw = pc.kelly_fraction * mu / sigma_h ** 2
-        weight = max(-pc.max_position, min(pc.max_position, raw))
-        if weight != raw:
+        kelly = pc.kelly_fraction * mu0 / sigma_h ** 2
+        capped = max(-pc.max_position, min(pc.max_position, kelly))
+        if capped != kelly:
             hits.append("max_position")
-        sizing = f"Kelly {pc.kelly_fraction:g} x mu / sigma_h^2 = {raw:+.4f}"
+        weight = capped * m * disp_factor
+        sizing = (f"Kelly {pc.kelly_fraction:g} x mu0 / sigma_h^2 = {kelly:+.4f}, capped at "
+                  f"{pc.max_position:g} -> {capped:+.4f}, x edge {m:.2f} x dispersion {disp_factor:.2f} "
+                  f"= {weight:+.4f}")
     elif long_ok or short_ok:
         hits.append("no_edge")
         sizing = "probability passes the hold threshold but the shrunk edge has the wrong sign: no position"
@@ -250,8 +323,7 @@ def _size_name(t: str, agg: AggregatedView, multiplier: object, fs: FactSheet | 
     rationale = (
         f"p={p:.3f} (equal-weight {agg.prob_equal_weight:.3f}, {agg.n_views} views, dispersion {agg.dispersion:.3f}); "
         f"E[excess]={agg.expected_excess_return_pct:+.2f}%; sigma_ann={sigma_ann:.1%} ({vol_src}); "
-        f"mu_prob={mu_prob:+.4f}, mu_exp={mu_exp:+.4f}, edge x{m:.2f}, dispersion x{disp_factor:.2f} "
-        f"-> mu={mu:+.4f}; {sizing}"
+        f"mu_prob={mu_prob:+.4f}, mu_exp={mu_exp:+.4f} -> mu0={mu0:+.4f}; {sizing}"
     )
     return _Sized(weight=weight, sigma_ann=sigma_ann, rationale=rationale)
 
@@ -298,22 +370,44 @@ def _apply_book_limits(active: dict[str, float], core: float, pc: PortfolioConfi
 
 
 def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: PortfolioConfig, limits: _Limits,
-                hits: dict[str, list[str]], notes: list[str]) -> dict[str, float]:
-    """No-trade band, turnover cap, then the compliance repair described in the module docstring."""
+                hits: dict[str, list[str]], notes: list[str], forced: frozenset[str] = frozenset(),
+                hold: Mapping[str, str] | None = None) -> dict[str, float]:
+    """No-trade band, turnover cap, then the compliance repair described in the module docstring.
+
+    ``forced``: held legs that must be exited in full (no longer covered); they skip the
+    band and the turnover cap, and their turnover is spent first. ``hold``: held legs to
+    keep this cycle (ticker -> the constraint label recorded, e.g. ``no_view_hold``);
+    their trade is 0, like a band, unless a hard limit forces a cut (their ideal weight is
+    0, so a repair only ever moves them toward 0). Turnover is one-way:
+    ``0.5 * sum|dw|`` over every leg, core included."""
+    hold = hold or {}
     legs = sorted(set(ideal) | set(current))
     delta = {t: ideal.get(t, 0.0) - current.get(t, 0.0) for t in legs}
     for t in legs:
-        if delta[t] != 0.0 and abs(delta[t]) < pc.no_trade_band:
+        if delta[t] == 0.0:
+            continue
+        if t in forced:
+            hits[t].append("forced_exit")
+        elif t in hold:
+            delta[t] = 0.0
+            hits[t].append(hold[t])
+        elif abs(delta[t]) < pc.no_trade_band:
             delta[t] = 0.0
             hits[t].append("no_trade_band")
-    turnover = sum(abs(d) for d in delta.values())
-    if turnover > pc.max_turnover:
-        s = pc.max_turnover / turnover
-        for t in legs:
-            if delta[t] != 0.0:
-                delta[t] *= s
-                hits[t].append("turnover_cap")
-        notes.append(f"turnover cap: sum|dw| {turnover:.3f} -> {pc.max_turnover:.3f} (all trades scaled by {s:.3f})")
+    forced_turnover = 0.5 * sum(abs(delta[t]) for t in legs if t in forced)
+    free = [t for t in legs if t not in forced and delta[t] != 0.0]
+    free_turnover = 0.5 * sum(abs(delta[t]) for t in free)
+    budget = max(0.0, pc.max_turnover - forced_turnover)
+    if free_turnover > budget:
+        s = budget / free_turnover
+        for t in free:
+            delta[t] *= s
+            hits[t].append("turnover_cap")
+        forced_note = f"; forced exits ({forced_turnover:.3f}) are not scaled and were counted first" \
+            if forced_turnover else ""
+        notes.append(f"turnover cap: one-way turnover 0.5*sum|dw| {free_turnover + forced_turnover:.3f} -> "
+                     f"{max(pc.max_turnover, forced_turnover):.3f} (discretionary trades scaled by {s:.3f}"
+                     f"{forced_note})")
     book = {t: current.get(t, 0.0) + delta[t] for t in legs}
     problems = limits.violations(book)
     if not problems:
@@ -353,15 +447,25 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
 def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[str, float],
                         factsheets: dict[str, FactSheet], current_weights: dict[str, float],
                         cfg: FirmConfig, as_of: str, sectors: dict[str, str],
-                        returns: pd.DataFrame | None = None) -> TargetPortfolio:
+                        returns: pd.DataFrame | None = None,
+                        keep_current: Iterable[str] = ()) -> TargetPortfolio:
     """Convert pooled views into a :class:`TargetPortfolio` (see the module docstring).
 
-    * ``edge_multipliers``: the chair's multiplier per ticker. A ticker missing from the
-      dict had no memo, which per the committee contract means 1.0; a non-finite value
+    * ``edge_multipliers``: the chair's multiplier per ticker (``CommitteeResult.edge_multiplier``).
+      Pass one for every ticker in ``aggs``: with memos enabled the committee gives an
+      unreviewed name 0, which only the caller can know. A ticker missing from the dict is
+      sized with 1.0 (no chair shrink, as when memos are disabled); a non-finite value
       means 0 (no trade).
+    * ``keep_current``: tickers whose pooled view must not be traded this cycle; a held
+      one keeps its current weight unless a hard limit requires a cut, an unheld one gets
+      no position. Pass the names whose ``CommitteeResult.hold_current`` is True (a held
+      name whose required IC memo failed: its view was never reviewed, and an LLM failure
+      is not a reason to buy or to sell).
     * ``current_weights``: current fraction of NAV per ticker, including the benchmark
-      (the core leg). Held tickers absent from ``aggs`` get target 0 (they are sold,
-      subject to the band and turnover cap).
+      (the core leg). Held tickers absent from ``aggs`` (no longer covered) get target 0
+      and are sold in full: forced exits bypass the no-trade band and the turnover cap.
+      Held tickers in ``aggs`` with ``n_views == 0`` (every analyst abstained) keep their
+      current weight unless a hard limit requires a cut.
     * ``sectors``: ticker -> sector, falling back to ``FactSheet.sector``. Unclassified
       names are not grouped under sector caps (only the position cap applies) and are
       listed in the notes.
@@ -376,24 +480,59 @@ def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[
     _validate(pc)
     bench = cfg.universe.benchmark
     current = _clean_current(current_weights)
+    rets = None
+    if returns is not None:
+        rets = returns.loc[: pd.Timestamp(as_of)] if isinstance(returns.index, pd.DatetimeIndex) else returns
     notes: list[str] = []
     hits: dict[str, list[str]] = defaultdict(list)
     rationale: dict[str, str] = {}
 
     # 1-2. per-name edge and capped fractional Kelly (sleeve weights, fractions of sleeve capital)
+    pinned = {str(t) for t in keep_current}
     sleeve: dict[str, float] = {}
     sigma: dict[str, float] = {}
     for t in sorted(aggs):
         if t == bench:
             notes.append(f"{t} is the benchmark (passive core); its committee view is not sized")
             continue
-        sized = _size_name(t, aggs[t], edge_multipliers.get(t, 1.0), factsheets.get(t), cfg, hits[t])
+        if t in pinned:
+            # Unreviewed: the view is shown for the record, but neither sized nor traded.
+            sized = _size_name(t, aggs[t], edge_multipliers.get(t, 1.0), factsheets.get(t), cfg, [], rets)
+            sleeve[t], sigma[t] = 0.0, sized.sigma_ann
+            rationale[t] = ("the pooled view was not reviewed by the chair (required IC memo failed): not sized; "
+                            f"for the record: {sized.rationale}")
+            continue
+        sized = _size_name(t, aggs[t], edge_multipliers.get(t, 1.0), factsheets.get(t), cfg, hits[t], rets)
         sleeve[t], sigma[t], rationale[t] = sized.weight, sized.sigma_ann, sized.rationale
+    forced: set[str] = set()
+    hold: dict[str, str] = {}
     for t in sorted(current):
-        if t != bench and t not in sleeve:
+        if t == bench:
+            continue
+        if t not in sleeve:
             sleeve[t] = 0.0
-            sigma[t] = _annual_vol(factsheets.get(t), t)[0]
-            rationale[t] = "held, but no committee view this cycle: target 0 (exit)"
+            sigma[t] = _annual_vol(factsheets.get(t), t, rets)[0]
+            rationale[t] = "held, but no committee view this cycle (no longer covered): forced exit to 0"
+            forced.add(t)
+        elif t in pinned:
+            rationale[t] = (f"held, kept at the current weight {current[t]:.2%} unless a hard limit requires a cut: "
+                            f"{rationale[t]}")
+            hold[t] = "unreviewed_hold"
+        elif aggs[t].n_views == 0:
+            rationale[t] = (f"held, but every analyst abstained (no information): kept at the current weight "
+                            f"{current[t]:.2%} unless a hard limit requires a cut. {rationale[t]}")
+            hold[t] = "no_view_hold"
+    if forced:
+        notes.append(f"forced exits (held, no longer covered; band and turnover cap bypassed): "
+                     f"{', '.join(sorted(forced))}")
+    no_view = sorted(t for t, label in hold.items() if label == "no_view_hold")
+    if no_view:
+        notes.append(f"no analyst view on held name(s) {', '.join(no_view)}: kept at the current weight "
+                     f"(an absence of information is not a reason to sell)")
+    unreviewed = sorted(t for t, label in hold.items() if label == "unreviewed_hold")
+    if unreviewed:
+        notes.append(f"required IC memo failed on held name(s) {', '.join(unreviewed)}: kept at the current weight "
+                     f"(an LLM failure is not a reason to buy or to sell)")
 
     # 3. sector caps
     sector_of = {}
@@ -431,7 +570,7 @@ def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[
     limits = _Limits(bench=bench, long_only=pc.long_only, max_position=pc.max_position, max_sector=pc.max_sector,
                      max_gross=pc.max_gross, min_cash=pc.min_cash, vol_cap=pc.target_vol * (1.0 - core),
                      sector_of=sector_of, cov=cov)
-    final = _trade_path(ideal, current, pc, limits, hits, notes)
+    final = _trade_path(ideal, current, pc, limits, hits, notes, frozenset(forced), hold)
     final = {t: (0.0 if abs(w) < DUST else w) for t, w in final.items()}
     if hits.get(bench):
         notes.append(f"core leg ({bench}): {', '.join(dict.fromkeys(hits[bench]))}")

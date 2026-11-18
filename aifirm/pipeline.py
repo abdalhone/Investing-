@@ -22,13 +22,27 @@ Fail-closed rules specific to this module:
   the required IC memos) fail, or the LLM budget is exhausted, the cycle trades nothing
   (target = current book, still subject to the risk engine). An API outage is not
   information about the stocks, so it must not liquidate the book or open positions.
-  Isolated failures follow the committee's own rules (an abstention, or an edge of 0).
+  Isolated failures follow the committee's own rules (an abstention; an edge of 0 for an
+  unheld name whose memo failed; a held name whose memo failed keeps its current weight,
+  ``CommitteeResult.hold_current``, with a warning).
+* **A risk-review halt keeps the book.** ``apply_risk_review`` receives the current
+  weights, so ``halt_trading`` means no trades from the committee this cycle (as the
+  reviewer is told), never a sale of the active sleeve; the risk engine still applies.
 * **A data source that fails is a data gap, not a crash** (``gather_data``): the agents
   are told what is missing and must not fill it in from memory (P2). A missing
   benchmark is the exception: without it nothing can be resolved or compared, so the
   run stops.
+* **No information is not a reason to trade.** A held name on which every analyst
+  abstained keeps its current weight (see ``construct_portfolio``), with a warning; an
+  agent that abstains on every name (e.g. the quant with fewer than three tickers) is
+  reported as a warning, so an all-cash book is never left unexplained.
 * **Any unexpected error stops the cycle** after writing a ``cycle_error`` ledger entry;
   no orders are produced.
+
+The risk state sees the whole NAV path, not only decision days (P9): ``nav_marks`` (or,
+for the live book, a path rebuilt from the held positions since the previous decision)
+raises the high-water mark with every daily close and feeds the worst one-day loss since
+the previous cycle to the daily-loss halt.
 
 ``decide`` slices ``prices`` at ``as_of`` itself, so a caller cannot leak the future
 into a decision by passing the full history (P3).
@@ -38,8 +52,9 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
@@ -63,6 +78,7 @@ STALE_PRICE_DAYS = 5            # a last close older than this (calendar days) i
 LIQUIDITY_WINDOW = 20           # trading days for ADV and daily volatility
 MIN_LIQUIDITY_OBS = 5           # fewer valid days and ADV / volatility are unknown (orders blocked)
 LLM_OUTAGE_FRACTION = 0.5       # this share of failed LLM calls means an outage: hold the book
+DIVIDEND_MIN_YIELD = 1e-6       # adj/raw close ratio moves smaller than this are rounding noise, not dividends
 MAX_LESSONS_PER_CYCLE = 8       # lesson calls cost money; learn from the most informative outcomes
 _GAP_TEXT_CHARS = 160           # error text shown to agents is truncated
 
@@ -141,9 +157,16 @@ def gather_data(cfg: FirmConfig, as_of: str, live: bool, prices: PriceData | Non
     * ``prices``: if None, daily prices for the universe and the benchmark are downloaded
       with :data:`PRICE_LOOKBACK_DAYS` of history. The returned prices are cut at
       ``as_of`` whether or not they were passed in.
+    * **The decision session.** A decision is made at a close, so ``as_of`` is first
+      resolved to the last trading session on or before it (the last row of the price
+      index). On a holiday or weekend that is the previous session: fundamentals, filings,
+      macro and headlines are then loaded as of that close, never as of the calendar day
+      (a filing accepted on Good Friday must not reach a decision at Thursday's close, P3).
+      The fact sheets' ``as_of`` is that session.
     * Fundamentals (SEC XBRL as filed), filing events and macro (FRED with publication
       lags) are point-in-time. Loaders are injectable so tests and backtests can run
-      offline; the defaults hit SEC and FRED (both cached on disk).
+      offline; the defaults hit SEC and FRED (both cached on disk), and use the SEC filer
+      pinned in ``cfg.universe.ciks`` when there is one.
     * Headlines are live-only feeds that cannot be replayed point-in-time, so they are
       loaded only when ``live`` and ``cfg.process.news_enabled``.
     * A loader that fails for one ticker becomes a data gap on that ticker's sheet; it
@@ -159,9 +182,11 @@ def gather_data(cfg: FirmConfig, as_of: str, live: bool, prices: PriceData | Non
     p = prices.as_of(as_of_s)
     if bench not in p.adj_close.columns or p.adj_close[bench].dropna().empty:
         raise RuntimeError(f"no prices for the benchmark {bench} as of {as_of_s}: cannot build fact sheets")
+    as_of_s = _day(p.close.index[-1])    # the session whose close is decided on (a holiday -> the day before)
 
-    fund_fn = fundamentals_loader or load_fundamentals
-    filings_fn = filings_loader or (lambda t, d: recent_filings(t, d, FILINGS_LOOKBACK_DAYS))
+    pins = cfg.universe.cik_pins()      # explicit SEC filers (config), else resolved by ticker and date
+    fund_fn = fundamentals_loader or (lambda t, d: load_fundamentals(t, d, cik=pins.get(t)))
+    filings_fn = filings_loader or (lambda t, d: recent_filings(t, d, FILINGS_LOOKBACK_DAYS, cik=pins.get(t)))
     macro_fn = macro_loader or macro_snapshot
     news_fn = headlines_loader or recent_headlines
     want_news = live and cfg.process.news_enabled
@@ -242,6 +267,29 @@ def market_snapshot(prices: PriceData, as_of: str, tickers: Iterable[str]) -> Ma
         if len(r) >= MIN_LIQUIDITY_OBS and r.std() > 0:
             vol[t] = float(r.std())
     return MarketSnapshot(prices=ref, adv=adv, daily_vol=vol)
+
+
+def implied_dividends(prices: PriceData) -> pd.DataFrame:
+    """Cash dividend per share on each ex-date, inferred from adjusted vs raw closes.
+
+    On an ex-date ``t`` the adjusted close (total return) gains on the raw close by the
+    dividend: ``adj_t / adj_{t-1} = (close_t + D_t) / close_{t-1}``, so
+    ``D_t = close_{t-1} * (adj_t / adj_{t-1} - close_t / close_{t-1})``. Only the factor for
+    the ex-date itself survives in that ratio, so no later dividend leaks in (P3). Moves
+    below ``DIVIDEND_MIN_YIELD`` of the previous close are rounding noise and negative ones
+    are data errors; both count as 0. Missing prints are forward-filled first, so a
+    dividend whose ex-date print is missing is credited on the next print. Same index and
+    columns as ``prices.close``; 0.0 where there is no dividend.
+
+    Paper books credit these amounts (``PaperBroker.credit_dividends``) and the backtest's
+    benchmark baseline uses the same amounts, so a book holding the benchmark earns
+    exactly the benchmark's total return before costs.
+    """
+    close = prices.close.ffill()
+    adj = prices.adj_close.reindex(index=close.index, columns=close.columns).ffill()
+    excess = adj / adj.shift(1) - close / close.shift(1)            # D_t / close_{t-1}
+    div = (close.shift(1) * excess).where(excess > DIVIDEND_MIN_YIELD, 0.0)
+    return div.fillna(0.0)
 
 
 # --------------------------------------------------------------------------- the decision record
@@ -342,6 +390,79 @@ def _hold_target(current_weights: Mapping[str, float], bench: str, as_of: str, n
 
 def _llm_failed(v: ViewRecord) -> bool:
     return any(i.startswith("llm failure") for i in v.grounding_issues)
+
+
+def _nav_path_since_last_decision(state: RiskState, p: PriceData, shares: Mapping[str, float], nav: float,
+                                  as_of: str) -> list[float]:
+    """The book's closing NAVs from the previous decision (``state.last_nav``) through the
+    day before ``as_of``, rebuilt from the shares held now and forward-filled closes.
+
+    Used when the caller passes no ``nav_marks`` (the live book). Valid because a paper
+    book's orders fill at the open of the day after a decision and nothing trades until the
+    next decision, so the shares held now were held at every close in between, and cash is
+    ``nav - shares * close(as_of)`` (a dividend credited in between shifts that by its
+    amount; small next to the losses the halt is about). Returns [] when it cannot be
+    rebuilt (no previous decision on record, or a held name without a price), in which
+    case the caller's ``prev_nav`` is used alone."""
+    if state.last_as_of is None or not _valid_nav(state.last_nav):
+        return []
+    last = pd.Timestamp(state.last_as_of)
+    if last >= pd.Timestamp(as_of):
+        return []
+    closes = p.close.ffill()
+    held = {t: float(q) for t, q in shares.items() if float(q) != 0.0}
+    if any(t not in closes.columns for t in held) or closes.empty:
+        return []
+    now = closes.iloc[-1]
+    if any(not (math.isfinite(now[t]) and now[t] > 0) for t in held):
+        return []
+    cash = float(nav) - sum(q * float(now[t]) for t, q in held.items())
+    between = closes.loc[(closes.index > last) & (closes.index < pd.Timestamp(as_of))]
+    path = [float(state.last_nav)]  # type: ignore[arg-type]
+    for _, row in between.iterrows():
+        px = [float(row[t]) for t in held]
+        if not all(math.isfinite(x) and x > 0 for x in px):
+            return []
+        path.append(cash + sum(q * x for q, x in zip(held.values(), px)))
+    return path
+
+
+def _valid_nav(x: object) -> bool:
+    try:
+        v = float(x)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v) and v > 0
+
+
+def _worst_day_return(path: Sequence[float]) -> float | None:
+    """The worst one-day return along consecutive NAVs (-inf if any NAV is broken)."""
+    worst: float | None = None
+    for a, b in zip(path, path[1:]):
+        r = b / a - 1.0 if _valid_nav(a) and _valid_nav(b) else -math.inf
+        worst = r if worst is None else min(worst, r)
+    return worst
+
+
+def _abstention_warnings(committee: Mapping[str, CommitteeResult], current_weights: Mapping[str, float]) -> list[str]:
+    """Explain cycles in which views are missing, so an all-cash or unchanged book is never
+    left unexplained: agents that abstained on every name (LLM failures excluded: the
+    outage rule reports those), and held names on which every analyst abstained."""
+    out = []
+    by_agent: dict[str, list[ViewRecord]] = {}
+    for r in committee.values():
+        for v in r.views:
+            by_agent.setdefault(v.agent, []).append(v)
+    for agent, views in by_agent.items():
+        if views and all(v.view.abstain for v in views) and not any(_llm_failed(v) for v in views):
+            reasons = Counter(v.view.abstain_reason.strip() or "no reason given" for v in views)
+            out.append(f"{agent} abstained on all {len(committee)} names: {reasons.most_common(1)[0][0]}")
+    held_blind = sorted(t for t, r in committee.items()
+                        if r.aggregate.n_views == 0 and float(current_weights.get(t, 0.0)) != 0.0)
+    if held_blind:
+        out.append(f"every analyst abstained on held name(s) {', '.join(held_blind)}: kept at the current weight "
+                   f"(no information is not a reason to sell)")
+    return out
 
 
 def _view_summary(payload: Mapping) -> str:
@@ -447,7 +568,8 @@ def decide(cfg: FirmConfig, llm: LLM | None, as_of: str, prices: PriceData, fact
            forecast_store: ForecastStore, lesson_store: LessonStore, ledger: Ledger, run_id: str,
            positions: dict[str, float] | None = None,
            trading_calendar: Iterable | None = None,
-           runs_dir: str | None = None) -> Decision:
+           runs_dir: str | None = None,
+           nav_marks: Sequence[float] | None = None) -> Decision:
     """Run one decision cycle at the close of ``as_of`` (see the module docstring).
 
     * ``llm``: None is allowed only when no stage needs a model (see
@@ -458,7 +580,16 @@ def decide(cfg: FirmConfig, llm: LLM | None, as_of: str, prices: PriceData, fact
     * ``trading_calendar``: dates used to set each forecast's resolution date; defaults to
       the price index up to ``as_of`` (beyond it, business days are used).
     * ``runs_dir``: where the risk engine looks for the kill-switch file (default
-      ``cfg.runs_dir``).
+      :meth:`FirmConfig.runs_path`: a relative ``runs_dir`` is relative to the config
+      file, never to the working directory).
+    * ``prev_nav``: the previous trading day's closing NAV. Used for the daily-loss halt
+      only when no NAV path since the previous decision is known.
+    * ``nav_marks``: the book's closing NAV on every trading day since the previous
+      decision, oldest first: that decision's NAV, then each later close, excluding
+      ``as_of`` (the backtest passes them). Each one updates the risk state's high-water
+      mark and the worst one-day loss among them feeds the daily-loss halt. If None, the
+      path is rebuilt from the held shares when ``risk_state`` records the previous
+      decision (``last_as_of``, ``last_nav``); see ``_nav_path_since_last_decision``.
 
     Orders are sized at the ``as_of`` close and are meant to be filled at the next
     trading day's open (P3); executing them is the caller's job.
@@ -482,12 +613,13 @@ def decide(cfg: FirmConfig, llm: LLM | None, as_of: str, prices: PriceData, fact
 
     log("cycle_start", {"mode": mode, "config_fingerprint": cfg.fingerprint(), "config": cfg.model_dump(),
                         "nav": nav, "prev_nav": prev_nav, "current_weights": current_weights,
-                        "positions": positions, "risk_state": risk_state})
+                        "positions": positions, "risk_state": risk_state,
+                        "nav_marks": list(nav_marks) if nav_marks is not None else None})
     try:
         return _decide(cfg, llm, model, mode, as_of_s, bench, p, factsheets, calendar, calls_before, log,
                        current_weights=current_weights, nav=nav, prev_nav=prev_nav, risk_state=risk_state,
                        forecast_store=forecast_store, lesson_store=lesson_store, ledger=ledger, run_id=run_id,
-                       positions=positions, runs_dir=runs_dir or cfg.runs_dir)
+                       positions=positions, runs_dir=runs_dir or str(cfg.runs_path()), nav_marks=nav_marks)
     except Exception as exc:
         log("cycle_error", {"error": _short(exc)})
         raise
@@ -498,7 +630,7 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
             log: Callable[[str, Mapping], None], *, current_weights: dict[str, float], nav: float,
             prev_nav: float | None, risk_state: RiskState, forecast_store: ForecastStore,
             lesson_store: LessonStore, ledger: Ledger, run_id: str, positions: dict[str, float] | None,
-            runs_dir: str) -> Decision:
+            runs_dir: str, nav_marks: Sequence[float] | None) -> Decision:
     warnings: list[str] = []
     tickers = [t for t in universe(cfg) if t in factsheets]
     missing = [t for t in universe(cfg) if t not in factsheets]
@@ -513,6 +645,11 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
         log("forecasts_resolved", {"n": len(resolved), "records": [
             {"id": r.id, "agent": r.agent, "outcome": r.outcome, "brier": r.brier,
              "realized_excess_return_pct": r.realized_excess_return_pct} for r in resolved]})
+    unresolvable = dict(getattr(forecast_store, "unresolvable", {}) or {})
+    if unresolvable:
+        log("forecasts_unresolvable", {"n": len(unresolvable), "reasons": unresolvable})
+        for why, n in Counter(unresolvable.values()).items():
+            warnings.append(f"{n} due forecast(s) cannot be resolved yet: {why}")
     lessons_written = _write_lessons(llm, resolved, cfg, ledger, lesson_store, log) if llm is not None else []
     agents = list(dict.fromkeys(cfg.analysts.enabled))
     # Deterministic rules (offline mode, the quant) cannot have memorised history, so their
@@ -553,6 +690,8 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     if math.isfinite(model.usage.budget_usd) and model.usage.spent_usd >= model.usage.budget_usd:
         outage_reasons.append(f"LLM budget of ${model.usage.budget_usd:.2f} exhausted")
     held_by_outage = bool(outage_reasons)
+    if not held_by_outage:
+        warnings.extend(_abstention_warnings(committee, current_weights))
 
     # 3. size (code), review (LLM, shrink only), risk engine (code, final say)
     sectors = sector_map(cfg, factsheets)
@@ -565,32 +704,61 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
         reviewed = proposed
         log("target_proposed", {"held_by_outage": True, "reasons": outage_reasons, "target": proposed})
     else:
+        # A held name whose required memo failed keeps its current weight: its pooled view was
+        # never reviewed (so it must not add exposure), and an LLM failure is not a reason to sell.
+        unreviewed = sorted(t for t, r in committee.items() if r.hold_current)
+        if unreviewed:
+            warnings.append(f"required IC memo failed on held name(s) {', '.join(unreviewed)}: kept at the current "
+                            "weight this cycle (an LLM failure is not a reason to buy or to sell)")
         proposed = construct_portfolio(aggregates, {t: r.edge_multiplier for t, r in committee.items()},
-                                       factsheets, current_weights, cfg, as_of, sectors, returns=p.returns())
-        log("target_proposed", {"held_by_outage": False, "target": proposed, "sectors": sectors})
+                                       factsheets, current_weights, cfg, as_of, sectors, returns=p.returns(),
+                                       keep_current=unreviewed)
+        log("target_proposed", {"held_by_outage": False, "target": proposed, "sectors": sectors,
+                                "kept_unreviewed": unreviewed})
         review = review_portfolio(model, proposed, factsheets, cfg) if cfg.process.risk_review_enabled else None
-        reviewed = apply_risk_review(proposed, review)
+        # The current book is passed so that a halt means what the reviewer was told: no trades
+        # this cycle (the book is kept), never a liquidation of the active sleeve.
+        reviewed = apply_risk_review(proposed, review, current_weights=current_weights, benchmark=bench)
+        if review is not None and review.halt_trading:
+            warnings.append(f"RISK REVIEW HALT: no trades from the committee this cycle, the current book is kept "
+                            f"({review.summary})")
         log("risk_review", {"enabled": cfg.process.risk_review_enabled, "review": review, "target": reviewed})
 
-    state = update_risk_state(risk_state, nav)
-    final, risk_messages = apply_risk_limits(reviewed, state, nav, prev_nav, current_weights, cfg, factsheets, runs_dir)
-    log("risk_engine", {"messages": risk_messages, "target": final, "risk_state": state})
-
-    # 4. orders at the close, to be filled at the next open (P3)
+    # Every NAV since the previous decision updates the high-water mark, and the worst one-day
+    # loss among them can halt buying (P9): a crash between rebalances must not go unseen.
     held = {t for t, w in current_weights.items() if float(w) != 0.0}
     market = market_snapshot(p, as_of, {*tickers, bench, *held, *(positions or {})})
     if positions is None:
         positions = {t: float(w) * nav / market.prices[t] for t, w in current_weights.items()
                      if float(w) != 0.0 and t in market.prices}
+    if nav_marks is not None:
+        path = [float(x) for x in nav_marks]
+    else:
+        path = _nav_path_since_last_decision(risk_state, p, positions, nav, as_of)
+    state = risk_state
+    for mark in path:
+        state = update_risk_state(state, mark)
+    state = replace(update_risk_state(state, nav), last_as_of=as_of)
+    worst_day = _worst_day_return([*path, nav]) if path else None
+    final, risk_messages = apply_risk_limits(reviewed, state, nav, None if path else prev_nav, current_weights, cfg,
+                                             factsheets, runs_dir, worst_day_return=worst_day)
+    log("risk_engine", {"messages": risk_messages, "target": final, "risk_state": state,
+                        "nav_path_days": len(path), "worst_day_return": worst_day})
+
+    # 4. orders at the close, to be filled at the next open (P3)
     orders, order_messages = orders_from_target(final, positions, market.prices, nav, market.adv, cfg, bench)
     log("orders", {"orders": orders, "messages": order_messages, "reference_prices": market.prices,
                    "adv": market.adv})
 
     # 5. every non-abstaining view becomes a resolvable forecast (P7)
-    forecasts = [rec for t in tickers for rec in
-                 make_forecast_records(run_id, as_of, committee[t].views, committee[t].aggregate, cfg, calendar)]
-    forecast_store.add(forecasts)
-    log("forecasts_written", {"n": len(forecasts), "ids": [r.id for r in forecasts]})
+    made = [rec for t in tickers for rec in
+            make_forecast_records(run_id, as_of, committee[t].views, committee[t].aggregate, cfg, calendar)]
+    forecasts = forecast_store.add(made)
+    if len(forecasts) < len(made):     # a re-decision of a session already decided (run --force)
+        warnings.append(f"{len(made) - len(forecasts)} forecast(s) were not stored: this session was already "
+                        "forecast by an earlier run, whose forecasts stand (no question is scored twice)")
+    log("forecasts_written", {"n": len(forecasts), "ids": [r.id for r in forecasts],
+                              "not_stored_repeats": len(made) - len(forecasts)})
 
     usage = _usage_summary(model.usage.calls[calls_before:])
     data_gaps = {t: list(factsheets[t].data_gaps) for t in tickers if factsheets[t].data_gaps}

@@ -63,10 +63,19 @@ def sortino(returns: pd.Series, rf_daily: float = 0.0) -> float:
     return float(r.mean() / dd * math.sqrt(TRADING_DAYS)) if dd > 0 else 0.0
 
 
-def max_drawdown(equity: pd.Series) -> float:
-    if equity.empty:
+def max_drawdown(equity: pd.Series, initial: float | None = None) -> float:
+    """Worst peak-to-trough fall of an equity curve (a negative fraction, or 0).
+
+    ``initial`` is the equity before the first point (e.g. 1.0 for a curve built from
+    returns): it is the first peak, so a loss on the very first day counts. Without it a
+    curve that starts with a loss would measure its drawdown from the already-lower first
+    point and understate it."""
+    values = equity.dropna().to_numpy(dtype=float)
+    if initial is not None:
+        values = np.concatenate([[float(initial)], values])
+    if values.size == 0:
         return 0.0
-    return float((equity / equity.cummax() - 1).min())
+    return float((values / np.maximum.accumulate(values) - 1.0).min())
 
 
 def probabilistic_sharpe(returns: pd.Series, sr_benchmark_annual: float = 0.0) -> float:
@@ -143,7 +152,7 @@ def performance_report(
     total = float(equity.iloc[-1] - 1)
     cagr = float(equity.iloc[-1] ** (1 / years) - 1) if years > 0 and equity.iloc[-1] > 0 else float("nan")
     vol = float(r.std(ddof=1) * math.sqrt(TRADING_DAYS)) if days > 1 else 0.0
-    mdd = max_drawdown(equity)
+    mdd = max_drawdown(equity, initial=1.0)     # the starting capital is the first high-water mark
     rep = PerformanceReport(
         start=str(r.index[0].date()) if hasattr(r.index[0], "date") else str(r.index[0]),
         end=str(r.index[-1].date()) if hasattr(r.index[-1], "date") else str(r.index[-1]),

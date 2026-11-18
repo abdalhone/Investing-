@@ -25,18 +25,33 @@ Why it works this way
 * **Sealed views are scored, not revisions.** Believability should measure each
   analyst's *independent* judgement from its own data slice (P4/P5); scoring revised
   views would reward moving toward the challenger, i.e. herding.
+* **One forecast per question.** A question is (decision date, ticker, agent, sample).
+  Re-deciding a session that was already decided (``aifirm run --force``) makes new
+  records under a new ``run_id``; :meth:`ForecastStore.add` keeps the first forecast of a
+  question and does not store the repeat, and :func:`scorecard` counts a question once
+  even in a store written before that rule, so a re-decision cannot double-count a
+  forecast in the scorecard or in the believability weights.
 * **Samples are not extra evidence.** With ``samples_per_analyst > 1`` an analyst answers
   the same question several times. Believability counts distinct questions
   (``n_questions``: one per ticker and decision date), so repeated samples cannot rush an
   analyst past ``min_n`` or inflate its shrinkage factor.
 
-Known limitation: a record whose ticker has no price on the resolution date (delisted,
+Missing prints: the start and end prices are the last close on or before the decision
+and resolution dates on which *both* the ticker and the benchmark have a price, at most
+:data:`MAX_PRINT_LAG_DAYS` calendar days earlier. So one missing print (of either series)
+no longer leaves a whole cycle unscored forever. A due record that still cannot be
+resolved (no price series, or a longer gap) stays pending (it is retried on the next call,
+in case the data are backfilled), and :attr:`ForecastStore.unresolvable` says why, so the
+pipeline can warn instead of dropping it silently.
+
+Known limitation: a record whose ticker has no price around the resolution date (delisted,
 halted) stays unresolved rather than being guessed. That biases scores toward survivors;
 use a point-in-time universe for serious research (see :mod:`aifirm.data.prices`).
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sqlite3
@@ -54,6 +69,7 @@ from ..data.prices import PriceData
 from ..schemas import AggregatedView, ForecastRecord, ViewRecord
 
 COMMITTEE_AGENT = "committee"
+MAX_PRINT_LAG_DAYS = 5         # a missing print is bridged by a close at most this many calendar days earlier
 DETERMINISTIC_MODELS = frozenset({"deterministic"})   # code, not a trained model: nothing to have memorised
 NO_SKILL_BRIER = 0.25          # Brier score of a constant 0.5 forecast
 BELIEVABILITY_SLOPE = 4.0      # k in weight = 1 + shrink * k * skill (contract, ARCHITECTURE.md 3.12)
@@ -62,6 +78,8 @@ LOG_LOSS_EPS = 1e-6
 CALIBRATION_EDGES = (0.0, 0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 1.0)
 
 TradingCalendar = Sequence[str | date | pd.Timestamp] | pd.Index
+
+log = logging.getLogger(__name__)
 
 
 def _day(d: str | date | pd.Timestamp) -> str:
@@ -149,6 +167,15 @@ def make_forecast_records(run_id: str, as_of: str, views: list[ViewRecord], agg:
     return records
 
 
+def question_key(r: ForecastRecord) -> str:
+    """The question a record answers: its id without the run prefix
+    (``as_of|ticker|agent|s<sample>``, or ``as_of|ticker|committee``). Records of different
+    runs with the same key forecast the same thing. A record whose id does not carry its
+    ``run_id`` prefix is its own question."""
+    prefix = f"{r.run_id}|"
+    return r.id[len(prefix):] if r.run_id and r.id.startswith(prefix) else r.id
+
+
 # --------------------------------------------------------------------------- store
 
 
@@ -166,6 +193,7 @@ class ForecastStore:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self.unresolvable: dict[str, str] = {}   # id -> why a due record could not resolve (last resolve() call)
         self._con = sqlite3.connect(self.path, check_same_thread=False)
         with self._lock, self._con:
             self._con.execute("""CREATE TABLE IF NOT EXISTS forecasts (
@@ -183,11 +211,26 @@ class ForecastStore:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def add(self, records: Iterable[ForecastRecord]) -> None:
-        rows = [(r.id, r.agent, r.ticker, _day(r.as_of), _day(r.resolve_on), int(r.resolved), r.model_dump_json())
-                for r in records]
+    def add(self, records: Iterable[ForecastRecord]) -> list[ForecastRecord]:
+        """Store ``records`` and return those kept. A record whose question
+        (:func:`question_key`) another run already forecast is not stored: the first
+        forecast of a question stands (a forced re-decision of the same session must not
+        count twice). Re-adding a stored record (same id) is a no-op."""
+        recs = list(records)
         with self._lock, self._con:
+            owner: dict[str, str] = {}
+            for d in sorted({_day(r.as_of) for r in recs}):
+                for (blob,) in self._con.execute("SELECT record FROM forecasts WHERE as_of = ?", (d,)):
+                    old = ForecastRecord.model_validate_json(blob)
+                    owner.setdefault(question_key(old), old.id)
+            kept = []
+            for r in recs:
+                if owner.setdefault(question_key(r), r.id) == r.id:
+                    kept.append(r)
+            rows = [(r.id, r.agent, r.ticker, _day(r.as_of), _day(r.resolve_on), int(r.resolved), r.model_dump_json())
+                    for r in kept]
             self._con.executemany("INSERT OR IGNORE INTO forecasts VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        return kept
 
     def all(self) -> list[ForecastRecord]:
         """Every record, ordered by decision date then id (deterministic)."""
@@ -200,12 +243,14 @@ class ForecastStore:
 
         ``prices`` is first cut at ``as_of`` (no look-ahead even if the caller passes the
         full history). Outcome = 1 if the ticker's adjusted-close (total) return from the
-        ``as_of`` close to the ``resolve_on`` close strictly beats the benchmark's. A
-        record stays pending when the data do not yet reach ``resolve_on`` or either
-        series lacks a price at the start or end date; it is never resolved by guessing.
-        Returns the newly resolved records.
+        ``as_of`` close to the ``resolve_on`` close strictly beats the benchmark's (with a
+        missing print bridged as described in the module docstring). A record stays
+        pending when the data do not yet reach ``resolve_on`` or no usable price exists;
+        it is never resolved by guessing. In the latter case :attr:`unresolvable` maps its
+        id to the reason (reset on every call). Returns the newly resolved records.
         """
         as_of_s = _day(as_of)
+        self.unresolvable = {}
         with self._lock:
             rows = self._con.execute(
                 "SELECT record FROM forecasts WHERE resolved = 0 AND resolve_on <= ? ORDER BY as_of, id",
@@ -216,8 +261,10 @@ class ForecastStore:
         resolved = []
         for (blob,) in rows:
             rec = ForecastRecord.model_validate_json(blob)
-            excess = _excess_return(adj, rec.ticker, rec.benchmark, rec.as_of, rec.resolve_on)
+            excess, why = _resolution(adj, rec.ticker, rec.benchmark, rec.as_of, rec.resolve_on)
             if excess is None:
+                if why is not None:
+                    self.unresolvable[rec.id] = why
                 continue
             outcome = int(excess > 0)
             resolved.append(rec.model_copy(update=dict(
@@ -226,26 +273,53 @@ class ForecastStore:
         with self._lock, self._con:
             self._con.executemany("UPDATE forecasts SET resolved = 1, record = ? WHERE id = ? AND resolved = 0",
                                   [(r.model_dump_json(), r.id) for r in resolved])
+        if self.unresolvable:
+            log.warning("%d due forecast(s) in %s could not be resolved, e.g. %s", len(self.unresolvable), self.path,
+                        next(iter(self.unresolvable.values())))
         return resolved
 
 
+def _resolution(adj: pd.DataFrame, ticker: str, benchmark: str, start: str,
+                end: str) -> tuple[float | None, str | None]:
+    """``(excess, None)`` when the outcome is knowable, else ``(None, reason)``.
+
+    Excess = ticker total return minus benchmark total return (fractions) between the last
+    row on or before ``start`` and the last row on or before ``end`` on which *both* series
+    have a positive price, each at most :data:`MAX_PRINT_LAG_DAYS` calendar days before its
+    date (so one missing print does not block resolution, and both legs always span the
+    same window). ``reason`` is None while the data simply do not reach ``end`` yet
+    (waiting is normal); otherwise it says why the record cannot resolve now."""
+    missing = [c for c in (ticker, benchmark) if c not in adj.columns]
+    if missing:
+        return None, f"no price series for {', '.join(missing)}"
+    if adj.empty or adj.index[-1] < pd.Timestamp(end):
+        return None, None                              # the resolution date has not been reached in the data
+    pair = adj[[ticker, benchmark]]
+    good = pair.index[(pair > 0).all(axis=1).to_numpy()]     # NaN compares False: both prints must exist
+
+    def last_print(d: str) -> pd.Timestamp | None:
+        ts = pd.Timestamp(d)
+        pos = int(good.searchsorted(ts, side="right")) - 1
+        if pos < 0 or (ts - good[pos]).days > MAX_PRINT_LAG_DAYS:
+            return None
+        return good[pos]
+
+    d0, d1 = last_print(start), last_print(end)
+    for d, label, when in ((d0, "decision", start), (d1, "resolution", end)):
+        if d is None:
+            return None, (f"no {ticker}/{benchmark} close within {MAX_PRINT_LAG_DAYS} days on or before the "
+                          f"{label} date {_day(when)}")
+    if d1 <= d0:
+        return None, f"no {ticker}/{benchmark} close between the decision date {_day(start)} and {_day(end)}"
+    t0, t1 = float(pair.at[d0, ticker]), float(pair.at[d1, ticker])
+    b0, b1 = float(pair.at[d0, benchmark]), float(pair.at[d1, benchmark])
+    return float((t1 / t0) - (b1 / b0)), None
+
+
 def _excess_return(adj: pd.DataFrame, ticker: str, benchmark: str, start: str, end: str) -> float | None:
-    """Ticker total return minus benchmark total return (fractions) from the last close on
-    or before ``start`` to the last close on or before ``end``; ``None`` if not knowable."""
-    if adj.empty or ticker not in adj.columns or benchmark not in adj.columns:
-        return None
-    idx = adj.index
-    if idx[-1] < pd.Timestamp(end):
-        return None                                   # the resolution date has not been reached in the data
-    i0 = int(idx.searchsorted(pd.Timestamp(start), side="right")) - 1
-    i1 = int(idx.searchsorted(pd.Timestamp(end), side="right")) - 1
-    if i0 < 0 or i1 <= i0:
-        return None
-    t0, t1 = adj[ticker].iloc[i0], adj[ticker].iloc[i1]
-    b0, b1 = adj[benchmark].iloc[i0], adj[benchmark].iloc[i1]
-    if not all(math.isfinite(x) and x > 0 for x in (t0, t1, b0, b1)):
-        return None
-    return float((t1 / t0) - (b1 / b0))
+    """Ticker total return minus benchmark total return (fractions); ``None`` if not knowable
+    (see :func:`_resolution`)."""
+    return _resolution(adj, ticker, benchmark, start, end)[0]
 
 
 # --------------------------------------------------------------------------- scoring
@@ -306,12 +380,18 @@ def scorecard(records: Iterable[ForecastRecord], as_of: str | None = None,
     constant 0.5), ``log_loss``, ``hit_rate`` (direction right, over forecasts != 0.5;
     ``None`` if none), ``mean_prob``, ``base_rate``, ``mean_realized_excess_pct`` and
     ``calibration`` (buckets with ``n``, ``mean_prob``, ``observed_rate``). Agents with no
-    scored record are absent. Ordered by agent name.
+    scored record are absent. Ordered by agent name. A question (:func:`question_key`)
+    forecast by several runs counts once (the first record in ``records``).
     """
     cutoff = _day(as_of) if as_of is not None else None
     by_agent: dict[str, list[ForecastRecord]] = defaultdict(list)
+    seen: set[str] = set()
     for r in records:
         if _scored(r, cutoff) and (include_pre_cutoff or not r.pre_cutoff):
+            key = question_key(r)
+            if key in seen:          # the same question forecast again by a re-decision: count it once
+                continue
+            seen.add(key)
             by_agent[r.agent].append(r)
     return {agent: _agent_stats(by_agent[agent]) for agent in sorted(by_agent)}
 

@@ -29,7 +29,11 @@ Method (ARCHITECTURE.md 3.7)
   normal with that mean and ``sigma_h`` (nodes ``mu`` and ``mu +/- sqrt(3) sigma_h`` with
   weights 2/3 and 1/6 each), so their probability-weighted mean equals the expected excess
   exactly and the view is internally consistent.
-* A name with no scorable factor abstains (fail closed: no data, no opinion).
+* A name with no scorable factor abstains (fail closed: no data, no opinion). With fewer
+  than ``MIN_NAMES`` names in the universe nothing can be ranked, so the quant abstains on
+  every name and says so in ``abstain_reason`` (a quant-only firm then never trades; the
+  pipeline surfaces that reason as a warning rather than reporting an all-cash book
+  silently).
 """
 
 from __future__ import annotations
@@ -166,18 +170,23 @@ def _direction(z: float) -> str:
     return "neutral"
 
 
-def _abstain(ticker: str) -> AnalystView:
+def _abstain(ticker: str, n_universe: int) -> AnalystView:
+    if n_universe < MIN_NAMES:
+        reason = (f"The universe has only {n_universe} name(s) with a fact sheet; ranking a cross-section needs "
+                  f"at least {MIN_NAMES}, so the quant abstains on every name (add tickers to use it).")
+    else:
+        reason = (f"No factor could be scored: each factor needs data for at least {MIN_NAMES} names "
+                  "with some dispersion, and this name had none.")
     return AnalystView(
         ticker=ticker, abstain=True,
-        abstain_reason=(f"No factor could be scored: each factor needs data for at least {MIN_NAMES} names "
-                        "with some dispersion, and this name had none."),
+        abstain_reason=reason,
         prob_outperform=0.5, expected_excess_return_pct=0.0, scenarios=[], evidence=[], key_risks=[],
         what_would_change_my_mind="", private_insight="")
 
 
-def _view(fs: FactSheet, s: _Scores, horizon_days: int) -> AnalystView:
+def _view(fs: FactSheet, s: _Scores, horizon_days: int, n_universe: int) -> AnalystView:
     if s.composite is None:
-        return _abstain(fs.ticker)
+        return _abstain(fs.ticker, n_universe)
     p = composite_probability(s.composite)
     vol_pct, vol_fallback = _annual_vol_pct(fs)
     sigma_h_pct = vol_pct * math.sqrt(horizon_days / TRADING_DAYS)
@@ -227,5 +236,5 @@ def quant_views(factsheets: list[FactSheet], horizon_days: int) -> dict[str, Vie
         raise ValueError(f"horizon_days must be positive, got {horizon_days}")
     scores = _score_universe(factsheets)
     return {fs.ticker: ViewRecord(agent=QUANT_AGENT, model=QUANT_MODEL, sample=0,
-                                  view=sanitize_view(_view(fs, scores[fs.ticker], horizon_days)))
+                                  view=sanitize_view(_view(fs, scores[fs.ticker], horizon_days, len(factsheets))))
             for fs in factsheets}

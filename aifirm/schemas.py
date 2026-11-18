@@ -111,7 +111,7 @@ class RiskReview(BaseModel):
     summary: str
     hidden_concentrations: list[str] = Field(description="Shared themes, factor bets or correlated exposures across names that position limits might miss.")
     concerns: list[RiskConcern]
-    halt_trading: bool = Field(description="True only for a serious problem (e.g. obviously broken data). Halts all new trades this cycle.")
+    halt_trading: bool = Field(description="True only for a serious problem (e.g. obviously broken data) that makes any trade unsafe. Halts ALL trading this cycle: every position, and the passive core, stays at its current weight (nothing is bought or sold). It does not liquidate; to cut or remove positions, use concern multipliers instead.")
 
 
 class Lesson(BaseModel):

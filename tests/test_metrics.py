@@ -30,6 +30,19 @@ def test_max_drawdown():
     assert max_drawdown(eq) == pytest.approx(0.65 / 1.3 - 1)
 
 
+def test_max_drawdown_counts_losses_from_the_starting_capital():
+    """Regression: the equity curve built from returns must start at the initial 1.0, or a
+    loss on the first day(s) is never measured against the starting capital."""
+    idx = pd.bdate_range("2024-01-01", periods=12)
+    two_losses = pd.Series([-0.05, -0.05] + [0.0] * 10, index=idx)
+    assert performance_report(two_losses).max_drawdown_pct == pytest.approx((0.95 * 0.95 - 1) * 100)
+    first_day_loss = pd.Series([-0.10] + [0.01] * 11, index=idx)
+    rep = performance_report(first_day_loss)
+    assert rep.max_drawdown_pct == pytest.approx(-10.0)
+    assert not math.isnan(rep.calmar)                         # a real drawdown gives a real Calmar ratio
+    assert max_drawdown(pd.Series([0.9, 1.0]), initial=1.0) == pytest.approx(-0.1)
+
+
 def test_psr_bounds_and_monotonic():
     good, bad = _series(mu=0.001), _series(mu=-0.001)
     assert 0.5 < probabilistic_sharpe(good) <= 1.0

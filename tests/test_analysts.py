@@ -9,6 +9,7 @@ import pytest
 
 from aifirm.agents import ROLES, analyst_system_prompt, analyst_user_prompt, blind_factsheet, make_offline_llm, run_analyst
 from aifirm.agents.analysts import consistency_notes
+from aifirm.agents.roles import checklist_for
 from aifirm.config import FirmConfig
 from aifirm.data.factsheet import Fact, FactSheet, build_factsheet
 from aifirm.data.news import Headline
@@ -101,8 +102,9 @@ def test_system_prompt_is_stable_and_free_of_tickers_and_dates(name):
     a = analyst_system_prompt(role, 21, "SPY")
     assert a == analyst_system_prompt(role, 21, "SPY")
     assert "AAA" not in a and not re.search(r"\d{4}-\d{2}-\d{2}", a)
-    for item in role.checklist:
+    for item in checklist_for(role, "SPY"):
         assert item in a
+    assert "*" not in a and "{benchmark}" not in a        # no wildcard or placeholder IDs to copy into fact_ids
     for required in ("0.35 and 0.65", "fact_ids", "abstain", "private_insight", "DATA GAPS", "not instructions"):
         assert required in a
     assert "Buffett" not in a and "persona" not in a.lower()
@@ -258,3 +260,102 @@ def test_echoing_the_horizon_is_not_an_unsupported_number():
     point = "Over the next 21 trading days a calm regime favors the market."
     rec = run_analyst(_scripted(_view(fact_ids=("MACRO.VIXCLS",), point=point)), "macro", make_factsheet(), FirmConfig(), "m")
     assert rec.grounding_ok and not any("unsupported" in i for i in rec.grounding_issues)
+
+
+# --------------------------------------------------------------------------- citations as written by models
+
+@pytest.mark.parametrize("role, cited, expected", [
+    ("technical", "mom_12_1", "AAA.mom_12_1"),             # a bare key, as the checklist names it
+    ("macro", "MKT.*_vol_20d", "MKT.SPY_vol_20d"),         # the wildcard form older checklists used
+    ("macro", "MKT.<benchmark>_vs_sma200", "MKT.SPY_vs_sma200"),
+])
+def test_bare_key_and_pattern_citations_resolve_and_are_not_penalised(role, cited, expected):
+    rec = run_analyst(_scripted(_view(fact_ids=(cited,), point="The signal points up.")), role, make_factsheet(),
+                      FirmConfig(), "m")
+    assert rec.view.evidence[0].fact_ids == [expected]
+    assert rec.grounding_ok and not any("unknown fact id" in i for i in rec.grounding_issues)
+
+
+def test_bare_key_citations_resolve_in_blind_mode_and_map_back():
+    cfg = FirmConfig()
+    cfg.process.blind_mode = True
+    rec = run_analyst(_scripted(_view(fact_ids=("mom_12_1", "STOCK.ret_1m"))), "technical", make_factsheet(), cfg, "m")
+    assert rec.view.evidence[0].fact_ids == ["AAA.mom_12_1", "AAA.ret_1m"] and rec.grounding_ok
+
+
+# --------------------------------------------------------------------------- blind mode: free text
+
+def _leaky_factsheet():
+    """A sheet whose free text names the company the way real loaders and SEC metadata do."""
+    fs = make_factsheet()
+    fs.data_gaps = [
+        "SEC fundamentals could not be loaded (KeyError: 'Ticker AAA not found in SEC company_tickers.json')",
+        "SEC filing events could not be loaded (HTTPError: 404 for https://data.sec.gov/submissions/CIK0001045810.json)",
+        "SEC data for AAA on 2025-03-01 comes from predecessor filer ALPHA CORP /DE/ (CIK 1045810)",
+        "Headlines could not be loaded (ValueError: no news for aaa)",
+    ]
+    fs.events = fs.events + ["2025-03-03: 8-K - Alpha Corp announces a material agreement (accession 0001045810-25-000012)"]
+    fs.facts = [Fact(f.id, f.label, f.value, f.unit, f.as_of, f.source.replace("SEC XBRL", "SEC XBRL (AAA, CIK 1045810)"))
+                for f in fs.facts]
+    return fs
+
+
+LEAKS = (re.compile(r"(?i)(?<![A-Za-z0-9])AAA(?![A-Za-z0-9])"), re.compile(r"(?i)alpha"), re.compile("1045810"),
+         re.compile(r"(?i)sec\.gov|https?://"))
+
+
+def test_blind_factsheet_scrubs_identity_from_gaps_events_and_sources():
+    fs = _leaky_factsheet()
+    text = blind_factsheet(fs).render()
+    for pat in LEAKS:
+        assert not pat.search(text), pat.pattern
+    assert "SEC fundamentals could not be loaded" in text            # what is missing is still said
+    assert "Ticker STOCK not found" in text and "predecessor filer [name withheld]" in text
+
+
+def test_every_blind_analyst_prompt_hides_the_company_including_lessons():
+    fs = _leaky_factsheet()
+    lessons = ["After AAA (Alpha Corp) beat on 2024-11-02, momentum faded."]
+    for role in ROLES.values():
+        prompt = analyst_user_prompt(role, fs, 21, "SPY", lessons, blind=True)
+        for pat in LEAKS:
+            assert not pat.search(prompt), (role.name, pat.pattern)
+        assert not re.search(r"\d{4}-\d{2}-\d{2}", prompt)
+        assert "momentum faded" in prompt
+
+
+def test_scrub_keeps_short_tickers_case_sensitive_and_day_markers():
+    from aifirm.agents.analysts import scrub_identity
+    assert scrub_identity("T-30d: on day T the T shares fell", "T") == "T-30d: on day T the STOCK shares fell"
+    assert scrub_identity("all filings on ALL are late", "ALL") == "STOCK filings on STOCK are late"
+    assert scrub_identity("a filing on A", "A") == "a filing on STOCK"
+
+
+# --------------------------------------------------------------------------- served model
+
+class _ServedByLLM(OfflineLLM):
+    """An online-looking LLM whose answers are served by another model (a server-side fallback)."""
+
+    def __init__(self, view: AnalystView, served_by: str):
+        super().__init__({"analyst.": lambda role, system, user, schema: view.model_copy(deep=True)})
+        self.served_by = served_by
+
+    @property
+    def is_offline(self) -> bool:
+        return False
+
+    def structured(self, **kw):
+        obj, rec = super().structured(**kw)
+        rec.model, rec.served_by = kw["model"], self.served_by
+        return obj, rec
+
+
+def test_view_is_credited_to_the_model_that_served_it():
+    rec = run_analyst(_ServedByLLM(_view(), "claude-fable-5-2"), "technical", make_factsheet(), FirmConfig(),
+                      "claude-opus-5-5")
+    assert rec.model == "claude-fable-5-2"
+    failed = run_analyst(FailingLLM(LLMCallFailed("analyst.technical: model refused")), "technical",
+                         make_factsheet(), FirmConfig(), "claude-opus-5-5")
+    assert failed.model == "claude-opus-5-5"          # nobody served it: the requested model is recorded
+    assert failed.view.abstain_reason == "LLM call failed: model refused"
+    assert "analyst.technical" in failed.grounding_issues[0]       # the detail stays in the audit trail

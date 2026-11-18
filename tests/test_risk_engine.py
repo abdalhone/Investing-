@@ -35,11 +35,12 @@ def _fss(prices):
 
 
 def _apply(tmp_path, target, *, nav=100.0, prev_nav=None, peak=100.0, frozen=False, current=None, cfg=None,
-           prices=None, state=None):
+           prices=None, state=None, worst_day_return=None):
     cfg = cfg or _cfg(tmp_path)
     state = state or RiskState(peak_nav=peak, frozen=frozen)
     prices = prices if prices is not None else {t: 50.0 for t in [p.ticker for p in target.positions]}
-    out, msgs = apply_risk_limits(target, state, nav, prev_nav, current or {}, cfg, _fss(prices), str(tmp_path))
+    out, msgs = apply_risk_limits(target, state, nav, prev_nav, current or {}, cfg, _fss(prices), str(tmp_path),
+                                  worst_day_return=worst_day_return)
     return out, msgs, state
 
 
@@ -122,6 +123,62 @@ def test_daily_loss_halt_prevents_any_increase(tmp_path):
     # an invalid previous NAV is treated as a loss day (fail closed)
     out3, _, _ = _apply(tmp_path, target, prev_nav=float("nan"), current=current)
     assert _w(out3)["NEW"] == 0.0
+
+
+def test_daily_loss_halt_sees_any_loss_day_since_the_last_cycle(tmp_path):
+    """Regression: a -8% day in the middle of a cycle must halt buying at the next decision,
+    even though the decision day itself was flat."""
+    target = _target({"UP": 0.08, "NEW": 0.04})
+    current = {"UP": 0.05}
+    out, msgs, _ = _apply(tmp_path, target, nav=100.0, prev_nav=100.0, current=current,
+                          worst_day_return=-0.08)
+    assert _w(out) == pytest.approx({"UP": 0.05, "NEW": 0.0})
+    assert any("DAILY-LOSS HALT" in m and "since the last cycle" in m for m in msgs)
+    out2, msgs2, _ = _apply(tmp_path, target, nav=100.0, prev_nav=100.0, current=current, worst_day_return=-0.01)
+    assert _w(out2) == pytest.approx({"UP": 0.08, "NEW": 0.04}) and msgs2 == []
+    out3, _, _ = _apply(tmp_path, target, current=current, worst_day_return=float("nan"))   # fail closed
+    assert _w(out3)["NEW"] == 0.0
+
+
+def test_human_unfreeze_resets_the_high_water_mark_instead_of_refreezing(tmp_path):
+    """Regression: the documented unfreeze (set "frozen": false in risk_state.json) must work.
+    A frozen book sits in cash and cannot regain the old peak, so the next cycle has to start
+    a new high-water mark rather than re-freeze at once."""
+    target = _target({"AAA": 0.10})
+    _, _, state = _apply(tmp_path, target, nav=80.0, peak=100.0)
+    assert state.frozen and state.frozen_at_nav == pytest.approx(80.0)
+    state.frozen = False                                              # the human decision
+    out, msgs, state2 = _apply(tmp_path, target, nav=80.0, state=state)
+    assert not state2.frozen and state2.peak_nav == pytest.approx(80.0) and state2.frozen_at_nav is None
+    assert _w(out) == {"AAA": 0.10}
+    assert any("unfrozen by a human" in m for m in msgs)
+    # a book that was never frozen keeps measuring drawdowns from its real peak
+    _, _, fresh = _apply(tmp_path, target, nav=80.0, state=RiskState(peak_nav=100.0))
+    assert fresh.frozen
+
+
+def test_forced_exits_are_not_skipped_by_the_no_trade_band(tmp_path):
+    """Regression: a freeze, the restricted list or a name absent from the target sets the
+    weight to 0; orders_from_target must sell those positions even when they are smaller
+    than the no-trade band (1% of NAV by default), or no rule could ever exit them."""
+    nav = 1_000_000.0
+    names = [f"T{i:02d}" for i in range(12)]
+    current = {"BAD": 0.008} | {t: 0.009 for t in names}
+    prices = {t: 50.0 for t in current}
+    cfg = _cfg(tmp_path, risk={"restricted": ["BAD"]})
+    out, _, state = _apply(tmp_path, _target(current), nav=nav, peak=1.25 * nav, current=current, cfg=cfg,
+                           prices=prices)
+    assert state.frozen and all(w == 0.0 for w in _w(out).values())
+    positions = {t: w * nav / prices[t] for t, w in current.items()}
+    adv = {t: 1e12 for t in [*prices, BENCH]}
+    orders, _ = orders_from_target(out, positions, {**prices, BENCH: 500.0}, nav, adv, cfg, BENCH)
+    assert {o.ticker for o in orders} == set(current) and all(o.side == "sell" for o in orders)
+    assert all(o.quantity == pytest.approx(positions[o.ticker]) for o in orders)
+    # a held name missing from the target is a full exit too; a discretionary sub-band change is not traded
+    keep = _target({"T00": 0.0095})
+    orders2, _ = orders_from_target(keep, {"T00": positions["T00"], "GONE": 100.0}, {**prices, "GONE": 50.0}, nav,
+                                    {**adv, "GONE": 1e12}, cfg, BENCH)
+    assert [(o.ticker, o.side) for o in orders2] == [("GONE", "sell")]
 
 
 def test_restricted_and_min_price(tmp_path):
@@ -259,3 +316,12 @@ def test_property_orders_move_toward_target_within_adv(tmp_path, seed):
         goal = tw.get(o.ticker, 0.0) * nav
         assert min(before, goal) - 1e-6 <= after <= max(before, goal) + 1e-6   # never overshoots
         assert after >= -1e-6                                     # never shorts
+
+
+def test_float_rounding_above_the_position_cap_is_clipped_silently(tmp_path):
+    """A construction weight of 0.10000000000100001 (cap 0.10, float rounding) used to raise the
+    message "exceeds the position cap" on every clean run; a real breach is still reported."""
+    out, msgs, _ = _apply(tmp_path, _target({"AAA": 0.10000000000100001, "BBB": 0.15}))
+    assert _w(out) == {"AAA": 0.10, "BBB": 0.10}
+    assert not any(m.startswith("AAA") for m in msgs)
+    assert any(m.startswith("BBB") and "exceeds the position cap" in m for m in msgs)

@@ -8,6 +8,34 @@ view. The check is deliberately lenient about *presentation* (rounding, "%", "$1
 verbatim in fact-sheet text the analyst was shown (labels such as "60 days", filing
 events, headlines), or be the view's own forecast.
 
+Matching is also *unit-aware*: a percentage ("7%") must match a percent fact (or a ratio
+shown as a percent), and a dollar amount must match a dollar fact; neither can be "supported"
+by a P/E multiple, an index level or a window length in a label ("60 days") that happens to
+round to the same integer. Headline summaries are not shown to analysts (only titles are),
+so they do not count as support.
+
+Matching is *scoped by precision*, so an invented round number cannot pass by coincidence.
+A slice holds a dozen or more percent facts, and an integer such as "7%" is a fair rounding
+of any of them within +-0.5, so about one invented integer in five used to match some fact
+by chance ("Short interest is 7% of float" passed because a price-vs-200-day fact was 6.57%).
+Therefore:
+
+* a number is checked leniently (rounding, 3% relative, 0.05 absolute) against the facts
+  the view **cites** (anywhere in the view: a number in a scenario or a risk may quote a
+  fact cited in the evidence);
+* against the rest of the slice it must be written with informative precision (at least
+  three significant digits, or one decimal and two significant digits: "12.3%", "$130.5B",
+  "45.67") and must equal the fact rounded to that precision; a low-precision number
+  ("7%", "$60B", "45 bps") that matches only an uncited fact is unsupported. Cite the fact
+  you quote.
+
+Citations: a non-abstaining view must cite the facts it uses. A view that writes numbers but
+cites no fact ID, or that cites nothing although its slice holds only numeric facts (no
+filing events or headlines to describe qualitatively), is flagged: that is what an answer
+from memory looks like. Citations are resolved leniently first (:func:`resolve_fact_id`):
+a bare key ("ret_3m") or a checklist-style pattern ("MKT.*_vol_20d") that names exactly
+one fact on the sheet counts as that fact.
+
 An ungrounded view is not discarded. It is flagged and its pooling weight is halved
 (see :mod:`aifirm.agents.committee`), because a single stray number is weak evidence of a
 bad forecast, while a pattern of them is strong evidence of fabrication.
@@ -15,16 +43,19 @@ bad forecast, while a pattern of them is strong evidence of fabrication.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
+from typing import Callable, Iterable
 
-from ..data.factsheet import FactSheet
+from ..data.factsheet import Fact, FactSheet
 from ..schemas import AnalystView
 
 # Fact-shaped and other non-quantity tokens are masked before numbers are extracted, so
 # digits inside identifiers ("NVDA.ret_3m", "MACRO.DGS10"), dates, SEC form names
-# ("8-K", "10-Q", "Form 4"), 8-K item numbers ("Item 2.02") and index names ("S&P 500")
-# are never mistaken for claimed quantities.
+# ("8-K", "10-Q", "Form 4"), 8-K item numbers ("Item 2.02"), index names ("S&P 500") and
+# fiscal-period labels ("3Q24", "1H25"; "Q3" and "FY25" never match as numbers) are never
+# mistaken for claimed quantities.
 _MASKS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b[A-Z][A-Z0-9\-]*\.[A-Za-z][A-Za-z0-9_]*\b"),                # fact IDs
     re.compile(r"\b\d{4}-\d{2}-\d{2}(?:T[\d:.+\-]+Z?)?\b"),                    # ISO dates
@@ -33,6 +64,8 @@ _MASKS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bitems?\s+\d{1,2}\.\d{2}(?:\s*(?:,|and|&)\s*\d{1,2}\.\d{2})*", re.I),
     re.compile(r"(?:S&P|Russell|Nasdaq|Dow)\s*\d+", re.I),
     re.compile(r"\b\d+s\d+s\b"),                                                # "2s10s" curve
+    re.compile(r"\b50\s*[/-]\s*50\b"),                                          # "a 50/50 call": odds, not a quantity
+    re.compile(r"\b(?:[1-4]Q|[12]H)(?:\s?FY)?'?\d{2}(?:\d{2})?\b", re.I),             # period labels: "3Q24", "1H2025"
 )
 
 _NUMBER = re.compile(r"(?<![\w.])(?P<dollar>\$)?(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)")
@@ -46,9 +79,13 @@ _TIME_UNIT = re.compile(
 _BPS = re.compile(r"\s?(?:bps?|basis\s+points?)\b", re.I)
 _PERCENT = re.compile(r"\s?(?:%|percent\b|pct\b|percentage\s+points?\b|pp\b)", re.I)
 
-# Base-rate references the prompts themselves make ("about 0.5", "50%"); quoting them is fine.
-_BASE_RATE_VALUES = (0.5, 50.0)
+# Base-rate references the prompts themselves make ("about 0.5", "50%"); quoting them as a
+# probability is fine, but "$50" or "50 days" is a claim like any other.
+_BASE_RATE_PROB = 0.5
+_BASE_RATE_PCT = 50.0
 _MAX_UNSUPPORTED = 2
+_PERCENT_UNITS = ("%", "%pts")       # facts a percentage may quote as they are
+_RATIO_UNITS = ("ratio",)            # facts a percentage may quote x100 (0.42 -> "42%")
 
 
 @dataclass(frozen=True)
@@ -69,6 +106,20 @@ class NumberToken:
         return (self.decimals == 0 and "," not in self.text and 1900 <= self.value <= 2100
                 and not (self.dollar or self.percent or self.bps or self.scale != 1.0))
 
+    @property
+    def significant_digits(self) -> int:
+        """Significant digits as written: "12.30" -> 4, "0.45" -> 2, "130" -> 2, "7" -> 1."""
+        digits = f"{self.value:.{self.decimals}f}".replace(".", "").lstrip("0")
+        if self.decimals == 0:
+            digits = digits.rstrip("0")       # trailing zeros of an integer are not significant
+        return max(1, len(digits))
+
+    @property
+    def precise(self) -> bool:
+        """Written precisely enough that matching an uncited fact is unlikely to be chance."""
+        sig = self.significant_digits
+        return sig >= 3 or (self.decimals >= 1 and sig >= 2)
+
 
 @dataclass
 class GroundingReport:
@@ -76,11 +127,15 @@ class GroundingReport:
     unknown_fact_ids: list[str]
     unsupported_numbers: list[str]
     checked_numbers: int
+    cited_fact_ids: int = 0         # citations (with repeats) that name a fact on the sheet
+    citation_issue: str = ""        # set when a non-abstaining view cites no fact although it must
 
     def issues(self) -> list[str]:
         """Human-readable issues for ``ViewRecord.grounding_issues`` and the ledger."""
         out = [f"unknown fact id: {i}" for i in self.unknown_fact_ids]
         out += [f"unsupported number: {n}" for n in self.unsupported_numbers]
+        if self.citation_issue:
+            out.append(f"no citations: {self.citation_issue}")
         return out
 
 
@@ -134,29 +189,54 @@ def _rounds_to(n: float, decimals: int, c: float) -> bool:
     return abs(n - abs(c)) <= 0.5 * 10.0 ** (-decimals) + 1e-12
 
 
-def _fact_variants(fs: FactSheet) -> tuple[list[float], list[float]]:
-    """(all display variants, absolute-scale values) of the numeric facts on ``fs``."""
-    variants: list[float] = []
-    absolute: list[float] = []
-    for f in fs.facts:
+@dataclass(frozen=True)
+class _Variants:
+    """Display variants of the numeric facts on a sheet, by how a number may quote them."""
+
+    any: list[float]        # a bare number may quote any fact in any display form
+    percent: list[float]    # "x%": percent facts as they are, ratios x100
+    usd: list[float]        # "$x": dollar facts, raw or in thousands/millions/billions/trillions
+    absolute: list[float]   # "$x B" / "x million": absolute USD and count facts
+
+
+def _fact_variants(facts: Iterable[Fact]) -> _Variants:
+    out = _Variants([], [], [], [])
+    for f in facts:
         if isinstance(f.value, bool) or not isinstance(f.value, (int, float)):
             continue
         v = abs(float(f.value))
-        variants.append(v)
+        out.any.append(v)
+        if f.unit in _PERCENT_UNITS:
+            out.percent.append(v)
         if f.unit in ("ratio", "x"):
-            variants.append(v * 100.0)          # a ratio quoted as a percentage
+            out.any.append(v * 100.0)           # a ratio quoted as a percentage
+        if f.unit in _RATIO_UNITS:
+            out.percent.append(v * 100.0)
         if f.unit in ("USD", "count"):
-            absolute.append(v)
-            variants += [v / 1e3, v / 1e6, v / 1e9, v / 1e12]
-    return variants, absolute
+            out.absolute.append(v)
+            scaled = [v / 1e3, v / 1e6, v / 1e9, v / 1e12]
+            out.any.extend(scaled)
+            if f.unit == "USD":
+                out.usd.extend([v, *scaled])
+    return out
 
 
-def _sheet_text_numbers(fs: FactSheet) -> list[float]:
-    """Numbers printed in fact-sheet *text* the analyst saw: fact labels ("60 days",
-    "52-week"), filing events, headlines and data-gap notes."""
+_TEXT_PERCENT, _TEXT_TIME, _TEXT_OTHER, _TEXT_ANY = "percent", "time", "other", "any"
+
+
+def _kind(tok: NumberToken) -> str:
+    if tok.percent or tok.bps:
+        return _TEXT_PERCENT
+    return _TEXT_TIME if tok.time_unit else _TEXT_OTHER
+
+
+def _sheet_text_numbers(fs: FactSheet) -> list[tuple[float, str]]:
+    """Numbers printed in fact-sheet *text* the analyst saw, with their presentation: fact
+    labels ("60 days", "52-week"), filing events, headline titles (summaries are not
+    rendered) and data-gap notes."""
     texts = [f.label for f in fs.facts] + list(fs.events) + list(fs.data_gaps)
-    texts += [f"{h.title} {h.summary}" for h in fs.headlines]
-    return [t.value * t.scale for text in texts for t in extract_numbers(text)]
+    texts += [h.title for h in fs.headlines]
+    return [(t.value * t.scale, _kind(t)) for text in texts for t in extract_numbers(text)]
 
 
 def _own_values(view: AnalystView) -> list[float]:
@@ -178,6 +258,50 @@ def normalize_fact_id(fid: str) -> str:
     return fid.strip().strip("[]`'\"").strip()
 
 
+_PLACEHOLDER = re.compile(r"<[^>]*>|\{[^}]*\}")
+
+
+def resolve_fact_id(fid: str, known: Iterable[str], ticker: str = "") -> str:
+    """Map a citation to the fact ID it unambiguously names on the sheet.
+
+    * decoration is stripped ("[NVDA.ret_3m]" -> "NVDA.ret_3m");
+    * a bare key resolves to the ticker's fact ("ret_3m" -> "NVDA.ret_3m"), or to the only
+      fact with that key ("DGS10" -> "MACRO.DGS10");
+    * a checklist-style pattern resolves to the only fact it matches
+      ("MKT.*_vol_20d" or "MKT.<benchmark>_vol_20d" -> "MKT.SPY_vol_20d");
+    * a difference in letter case only is forgiven when one fact matches.
+
+    Anything else comes back normalized and unchanged (and is then an unknown ID)."""
+    nid = normalize_fact_id(fid)
+    known = known if isinstance(known, (set, frozenset, dict)) else set(known)
+    if not nid or nid in known:
+        return nid
+    if "." not in nid:
+        if ticker and f"{ticker}.{nid}" in known:
+            return f"{ticker}.{nid}"
+        bare = [k for k in known if k.split(".", 1)[-1] == nid]
+        if len(bare) == 1:
+            return bare[0]
+    if "*" in nid or _PLACEHOLDER.search(nid):
+        pattern = _PLACEHOLDER.sub("*", nid).replace("?", "[?]")
+        matches = [k for k in known if fnmatch.fnmatchcase(k, pattern)]
+        if len(matches) == 1:
+            return matches[0]
+    folded = [k for k in known if k.lower() == nid.lower()]
+    return folded[0] if len(folded) == 1 else nid
+
+
+def resolve_fact_ids(ids: Iterable[str], known: Iterable[str], ticker: str = "") -> list[str]:
+    """:func:`resolve_fact_id` over a list, dropping empty entries and repeats (order kept)."""
+    known = known if isinstance(known, (set, frozenset, dict)) else set(known)
+    out: list[str] = []
+    for fid in ids:
+        rid = resolve_fact_id(fid, known, ticker)
+        if rid and rid not in out:
+            out.append(rid)
+    return out
+
+
 def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03,
                prompt_numbers: tuple[float, ...] = ()) -> GroundingReport:
     """Audit ``view`` against ``fs``.
@@ -186,18 +310,29 @@ def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03,
     cited ID the analyst could not have seen counts as unknown. ``prompt_numbers`` are
     numbers the prompt itself states (e.g. the horizon in trading days), which the analyst
     may repeat. ``ok`` is False if any cited fact ID is unknown or more than two distinct
-    numbers are unsupported.
+    numbers are unsupported, or if the view must cite facts and cites none (see the module
+    docstring). Citations are resolved with :func:`resolve_fact_id` first. A number is
+    matched leniently against the cited facts and, only when written with informative
+    precision, strictly against the rest of the slice (see the module docstring).
     """
     known = fs.ids()
     unknown: list[str] = []
+    cited = 0
+    cited_ids: set[str] = set()
     for item in view.evidence:
         for fid in item.fact_ids:
-            nid = normalize_fact_id(fid)
-            if nid and nid not in known and nid not in unknown:
+            nid = resolve_fact_id(fid, known, fs.ticker)
+            if not nid:
+                continue
+            if nid in known:
+                cited += 1
+                cited_ids.add(nid)
+            elif nid not in unknown:
                 unknown.append(nid)
 
-    variants, absolute = _fact_variants(fs)
-    text_numbers = _sheet_text_numbers(fs) + [float(n) for n in prompt_numbers]
+    variants = _Scoped(cited=_fact_variants(f for f in fs.facts if f.id in cited_ids),
+                       sheet=_fact_variants(fs.facts))
+    text_numbers = _sheet_text_numbers(fs) + [(float(n), _TEXT_ANY) for n in prompt_numbers]
     own = _own_values(view)
     unsupported: list[str] = []
     checked = 0
@@ -206,32 +341,64 @@ def check_view(view: AnalystView, fs: FactSheet, rel_tol: float = 0.03,
             if _ignored(tok, own):
                 continue
             checked += 1
-            if not _is_supported(tok, variants, absolute, text_numbers, rel_tol) and tok.text not in unsupported:
+            if not _is_supported(tok, variants, text_numbers, rel_tol) and tok.text not in unsupported:
                 unsupported.append(tok.text)
 
-    ok = not unknown and len(unsupported) <= _MAX_UNSUPPORTED
+    citation_issue = ""
+    if not view.abstain and cited == 0 and not unknown:
+        if checked:
+            citation_issue = f"the view states {checked} number(s) but cites no fact ID"
+        elif not (fs.events or fs.headlines):
+            citation_issue = "the view cites no fact ID, and its slice has only numeric facts"
+    ok = not unknown and len(unsupported) <= _MAX_UNSUPPORTED and not citation_issue
     return GroundingReport(ok=ok, unknown_fact_ids=unknown, unsupported_numbers=unsupported,
-                           checked_numbers=checked)
+                           checked_numbers=checked, cited_fact_ids=cited, citation_issue=citation_issue)
 
 
 def _ignored(tok: NumberToken, own: list[float]) -> bool:
     """Numbers that are not claims about the world: years, short time windows ("3 months",
-    "12-month"), the view's own forecast numbers, and the 0.5 / 50% base rate."""
+    "12-month"), the view's own forecast numbers, and the base rate written as a probability
+    ("0.5" or "50%"; "$50" or "50 days" are checked like any other number)."""
     if tok.is_year or (tok.time_unit and tok.value <= 12):
+        return True
+    if tok.scale != 1.0 or tok.bps or tok.dollar:
+        return False
+    if (tok.value == _BASE_RATE_PROB and not tok.percent and not tok.time_unit) or \
+            (tok.value == _BASE_RATE_PCT and tok.percent):
+        return True
+    return any(_rounds_to(tok.value, tok.decimals, o) for o in own)
+
+
+@dataclass(frozen=True)
+class _Scoped:
+    cited: _Variants        # facts the view cites: lenient matching
+    sheet: _Variants        # every fact on the slice: strict matching of precise numbers only
+
+
+def _matches(tok: NumberToken, variants: _Variants, close: Callable[[float, int, float], bool]) -> bool:
+    """Does ``tok`` quote one of ``variants`` in a unit-compatible form, judged by ``close``?"""
+    if tok.scale != 1.0:
+        # "$130.5B" must match an absolute USD/count fact at that scale, not any value ~130.5
+        return any(close(tok.value, tok.decimals, a / tok.scale) for a in variants.absolute)
+    if tok.bps:
+        # "45 bps" is 0.45 percentage points
+        return any(close(tok.value / 100.0, tok.decimals + 2, v) for v in variants.any)
+    candidates = variants.percent if tok.percent else variants.usd if tok.dollar else variants.any
+    return any(close(tok.value, tok.decimals, v) for v in candidates)
+
+
+def _is_supported(tok: NumberToken, variants: _Scoped, text_numbers: list[tuple[float, str]],
+                  rel_tol: float) -> bool:
+    if _matches(tok, variants.cited, lambda n, d, c: _close(n, d, c, rel_tol)):
+        return True
+    if tok.precise and _matches(tok, variants.sheet, _rounds_to):
         return True
     if tok.scale != 1.0 or tok.bps:
         return False
-    return tok.value in _BASE_RATE_VALUES or any(_rounds_to(tok.value, tok.decimals, o) for o in own)
-
-
-def _is_supported(tok: NumberToken, variants: list[float], absolute: list[float],
-                  text_numbers: list[float], rel_tol: float) -> bool:
-    if tok.scale != 1.0:
-        # "$130.5B" must match an absolute USD/count fact at that scale, not any value ~130.5
-        return any(_close(tok.value, tok.decimals, a / tok.scale, rel_tol) for a in absolute)
-    if tok.bps:
-        # "45 bps" is 0.45 percentage points
-        return any(_close(tok.value / 100.0, tok.decimals + 2, v, rel_tol) for v in variants)
-    if any(_close(tok.value, tok.decimals, v, rel_tol) for v in variants):
-        return True
-    return any(_rounds_to(tok.value, tok.decimals, t) for t in text_numbers)
+    if tok.percent:
+        kinds: tuple[str, ...] = (_TEXT_PERCENT, _TEXT_ANY)
+    elif tok.dollar:
+        kinds = (_TEXT_OTHER, _TEXT_ANY)
+    else:
+        kinds = (_TEXT_PERCENT, _TEXT_TIME, _TEXT_OTHER, _TEXT_ANY)
+    return any(_rounds_to(tok.value, tok.decimals, t) for t, kind in text_numbers if kind in kinds)

@@ -18,18 +18,34 @@ Why the process looks like this (see docs/ARCHITECTURE.md):
 * **The chair can only shrink the edge.** The IC memo produces a multiplier in [0, 1]; it
   cannot raise or reverse the pooled view (P1). Views are shown to the chair anonymised
   and in a deterministic random order, so the memo responds to arguments, not to names
-  or to a fixed speaking order.
+  or to a fixed speaking order. Anonymous means anonymous: role titles, role strings
+  ("analyst.technical") and self-descriptions ("as the macro analyst") are removed from
+  every peer-written text shown to the chair, the challenger and the revisers.
+* **Every name that could be held is reviewed.** A memo is required whenever the pooled
+  probability clears the portfolio's holding threshold (``min_prob_to_hold``, or its
+  mirror for shorts), whenever ``|p - 0.5| >= memo_min_edge``, and for every held name.
+  With memos enabled, a name that was not reviewed gets an edge multiplier of 0: an
+  unreviewed edge never opens a position. A chair "hold" on a name the book does not own
+  means "do not buy", so it also gets 0.
 * **Weights from track record (P7).** Each view is weighted by its agent's believability;
   ungrounded views count half (P2).
 * **Fail closed.** A failed analyst call is an abstention; a failed challenge leaves the
-  sealed pool in place; a failed revision keeps the sealed view; a failed memo that was
-  required sets the edge multiplier to 0, so an unreviewed edge is never traded.
+  sealed pool in place; a failed revision keeps the sealed view. A failed memo on a name
+  the book does not own sets the edge multiplier to 0, so an unreviewed edge is never
+  traded. A failed memo on a *held* name must not sell it either: an LLM outage is not
+  information about the stock. The result is flagged ``hold_current=True``: the pipeline
+  passes such names to ``construct_portfolio(keep_current=...)``, which keeps them at
+  their current weight (the unreviewed view is neither sized up nor used to sell; only a
+  hard limit can cut them) and warns. The edge multiplier stays 1.0, never 0, so a caller
+  that ignores the flag does not sell on an LLM failure; such a caller re-sizes from an
+  unreviewed view, which is why the flag must be honoured.
 """
 
 from __future__ import annotations
 
 import hashlib
 import random
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -40,9 +56,9 @@ from ..data.factsheet import FactSheet
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
 from ..portfolio.aggregate import aggregate_views
 from ..schemas import AggregatedView, Challenge, EvidenceItem, ICMemo, Revision, ViewRecord, clamp
-from .analysts import (BLIND_ALIAS, EVIDENCE_RULES, NEUTRALITY, blind_factsheet, blind_ids_in_text, horizon_phrase,
-                       render_slice, run_analyst, shown_sheet, unblind_id)
-from .grounding import normalize_fact_id
+from .analysts import (BLIND_ALIAS, EVIDENCE_RULES, NEUTRALITY, blind_factsheet, blind_ids_in_text, blind_text,
+                       horizon_phrase, render_slice, run_analyst, served_model, shown_sheet, unblind_id)
+from .grounding import resolve_fact_id
 from .roles import ROLES
 
 QUANT_AGENT = "quant"
@@ -74,7 +90,13 @@ class CommitteeResult:
     challenge: Challenge | None
     challenger: str | None
     memo: ICMemo | None
-    edge_multiplier: float          # memo.conviction_multiplier clamped to [0,1]; 1.0 if no memo; 0 if memo says review/avoid
+    # memo.conviction_multiplier clamped to [0, 1]; 0 if the memo says review (or avoid/sell in a
+    # long-only book), or "hold" on a name the book does not own; 1.0 if memos are disabled; 0 for
+    # an unreviewed name the book does not own; 1.0 (with hold_current) if a held name's memo failed.
+    edge_multiplier: float
+    # True when the chair was required but could not review a HELD name (the memo call failed):
+    # keep the current weight this cycle instead of re-sizing or selling on an LLM failure.
+    hold_current: bool = False
 
 
 # --------------------------------------------------------------------------- prompts
@@ -95,6 +117,7 @@ You now see the full fact sheet, not just your original slice. If the full sheet
 
 RULES
 - Argue against the inference, never against people. You do not know who the other analysts are; do not speculate about them.
+- Your challenge is shown to the committee anonymously. Do not state your role, title or data desk, or which analyst you are (for example, never write "as the technical analyst"); let the facts speak.
 - Never mention position sizes, weights or trades.
 {EVIDENCE_RULES}
 
@@ -143,7 +166,7 @@ MULTIPLIER GUIDANCE
 Start at 1.0. About 0.75 for one serious checklist failure, about 0.5 for two, 0.25 or less for three or more. If the data or the analysis looks broken, set 0 and recommend "review".
 
 RECOMMENDATION
-buy = a positive edge worth acting on; hold = keep an existing position, or the edge is small or unclear; avoid = do not own; sell = exit an existing position; review = the data or analysis looks wrong and nobody should trade until a human checks. The book may be long-only, in which case a negative pooled edge means avoid (or sell if held).
+buy = a positive edge worth acting on (opens or adds to a position); hold = keep an existing position, or the edge is small or unclear (for a name the book does not currently hold, hold means do not buy: no position is opened); avoid = do not own; sell = exit an existing position; review = the data or analysis looks wrong and nobody should trade until a human checks. The book may be long-only, in which case a negative pooled edge means avoid (or sell if held).
 
 RULES
 - The analysts are shown under random letters in a random order. Weigh their arguments, not their identity or their position in the list.
@@ -188,8 +211,41 @@ def _letter(i: int) -> str:
     return letters[i % 26] + (str(i // 26 + 1) if i >= 26 else "")
 
 
-def _evidence_lines(items: Iterable[EvidenceItem], indent: str = "") -> list[str]:
-    return [f"{indent}- [{e.direction}] {e.point} (facts: {', '.join(e.fact_ids) or 'none'})" for e in items]
+def _evidence_lines(items: Iterable[EvidenceItem], indent: str = "",
+                    tx: Callable[[str], str] = lambda x: x) -> list[str]:
+    return [f"{indent}- [{e.direction}] {tx(e.point)} (facts: {', '.join(e.fact_ids) or 'none'})" for e in items]
+
+
+# Who wrote a view must not leak into the anonymised prompts: role strings from error messages
+# ("analyst.technical: model refused") and self-descriptions ("as the macro analyst", the role
+# titles) are replaced. Fact IDs stay: they are the evidence the chair audits.
+_ROLE_STRING = re.compile(r"\b(?:analyst|revision)\.[A-Za-z_]+\b(?::\s*)?", re.I)
+_ROLE_WORDS = (r"fundamentals?|technical|macro(?:[- ]?economic)?(?:\s+and\s+market[- ]regime)?|market[- ]regime|"
+               r"events?(?:\s+and\s+filings)?|filings|quant(?:itative)?")
+_ROLE_PHRASE = re.compile(rf"\b(?:(?:the|a|an|our|my|this)\s+)?(?:{_ROLE_WORDS})\s+(?:analyst|desk|team)s?\b", re.I)
+
+
+def anonymize_roles(text: str) -> str:
+    """Remove analyst identities from peer-written text shown under an anonymous label."""
+    if not text:
+        return text
+    out = _ROLE_STRING.sub("", text)
+    return _ROLE_PHRASE.sub("a committee member", out)
+
+
+def _peer_text(fs: FactSheet, blind: bool) -> Callable[[str], str]:
+    """Transform for text another committee member wrote: identities removed, and in blind
+    mode the company's identity scrubbed and dates made relative."""
+    if blind:
+        return lambda text: anonymize_roles(blind_text(text, fs))
+    return anonymize_roles
+
+
+def _own_text(fs: FactSheet, blind: bool) -> Callable[[str], str]:
+    """Transform for an agent's own earlier text (blind-mode scrubbing only)."""
+    if blind:
+        return lambda text: blind_text(text, fs)
+    return lambda text: text
 
 
 def select_challenger(views: list[ViewRecord], pooled_prob: float) -> ViewRecord | None:
@@ -204,14 +260,29 @@ def select_challenger(views: list[ViewRecord], pooled_prob: float) -> ViewRecord
     return max(opposed or candidates, key=lambda v: abs(v.view.prob_outperform - pooled_prob))
 
 
-def edge_multiplier_for(memo: ICMemo | None, long_only: bool) -> float:
-    """1.0 without a memo; 0 for "review", and for "avoid"/"sell" in a long-only book;
-    otherwise the chair's conviction multiplier clamped to [0, 1] (it can only shrink)."""
+def edge_multiplier_for(memo: ICMemo | None, long_only: bool, held: bool = False) -> float:
+    """1.0 without a memo; 0 for "review", for "avoid"/"sell" in a long-only book, and for
+    "hold" on a name the book does not own (hold means keep an existing position, so for
+    an unowned name it means do not buy); otherwise the chair's conviction multiplier
+    clamped to [0, 1] (it can only shrink). ``held`` defaults to False, the fail-closed
+    reading: a "hold" never opens a position unless the name is known to be held."""
     if memo is None:
         return 1.0
     if memo.recommendation == "review" or (long_only and memo.recommendation in ("avoid", "sell")):
         return 0.0
+    if memo.recommendation == "hold" and not held:
+        return 0.0
     return clamp(memo.conviction_multiplier, 0.0, 1.0)
+
+
+def memo_required(agg: AggregatedView, cfg: FirmConfig, held: bool) -> bool:
+    """Whether the chair must review this name: it is held, its pooled probability clears the
+    portfolio's holding threshold (so construction could size it), or its edge is at least
+    ``memo_min_edge``. The holding-threshold rule makes sure no name can be sized without a
+    memo, whatever the two thresholds are set to."""
+    p, pc = agg.prob_outperform, cfg.portfolio
+    could_hold = p >= pc.min_prob_to_hold or (not pc.long_only and p <= 1.0 - pc.min_prob_to_hold)
+    return held or could_hold or abs(p - 0.5) >= cfg.process.memo_min_edge
 
 
 def _set_weights(views: list[ViewRecord], believability: dict[str, float]) -> None:
@@ -244,8 +315,23 @@ def _finish_prompt(text: str, fs: FactSheet, blind: bool) -> str:
     return blind_ids_in_text(text, fs.ticker) if blind else text
 
 
-def _restore_ids(ids: list[str], ticker: str, blind: bool) -> list[str]:
-    return [unblind_id(i, ticker) if blind else normalize_fact_id(i) for i in ids if normalize_fact_id(i)]
+def _restore_ids(ids: list[str], ticker: str, blind: bool, shown_ids: set[str], shown_ticker: str) -> list[str]:
+    """Citations as the model wrote them -> real fact IDs. Each is first resolved against the
+    IDs the model was shown (a bare key "ret_3m" or a pattern "MKT.*_vol_20d" -> the ID on the
+    sheet, see ``grounding.resolve_fact_id``), then mapped back from the blind alias."""
+    out: list[str] = []
+    for i in ids:
+        rid = resolve_fact_id(i, shown_ids, shown_ticker)
+        if not rid:
+            continue
+        rid = unblind_id(rid, ticker) if blind else rid
+        if rid not in out:
+            out.append(rid)
+    return out
+
+
+def _shown_full(fs: FactSheet, blind: bool) -> FactSheet:
+    return blind_factsheet(fs) if blind else fs
 
 
 # --------------------------------------------------------------------------- stages
@@ -282,18 +368,19 @@ def challenge_user_prompt(fs: FactSheet, cfg: FirmConfig, challenger: ViewRecord
     own = challenger.view
     lines = [
         _header(fs, cfg, blind), "",
-        "YOUR ROLE ON THE COMMITTEE", f"{role.title}: {role.mandate}", "",
+        "YOUR ROLE ON THE COMMITTEE (for your eyes only: do not state it in your challenge)",
+        f"{role.title}: {role.mandate}", "",
         "YOUR SEALED VIEW (written from your own data slice before seeing anything else)",
         f"{SEALED_PROB_LABEL}: {own.prob_outperform:.3f}",
         f"{SEALED_EXCESS_LABEL}: {own.expected_excess_return_pct:+.2f}%",
-        "Your evidence:", *_evidence_lines(own.evidence), "",
+        "Your evidence:", *_evidence_lines(own.evidence, tx=_own_text(fs, blind)), "",
         "THE COMMITTEE'S POOLED VIEW (anonymised)",
         f"{POOLED_PROB_LABEL}: {pooled:.3f}",
         f"Pooled expected excess return: {agg.expected_excess_return_pct:+.2f}%",
         f"{DISPERSION_LABEL}: {agg.dispersion:.3f}",
         f"Member probabilities, sorted (yours included, no names): {members}",
         "Main arguments on the consensus side:",
-        *(_evidence_lines(points[:_MAX_CONSENSUS_POINTS]) or ["- (none stated)"]), "",
+        *(_evidence_lines(points[:_MAX_CONSENSUS_POINTS], tx=_peer_text(fs, blind)) or ["- (none stated)"]), "",
         "THE FULL FACT SHEET (every desk's data, not only your slice)",
         "<fact_sheet>", _full_sheet(fs, blind), "</fact_sheet>", "",
         f'Write your challenge. Use ticker "{_display_ticker(fs, blind)}".',
@@ -306,6 +393,7 @@ def revision_user_prompt(fs: FactSheet, cfg: FirmConfig, view: ViewRecord, chall
     blind = cfg.process.blind_mode
     role = ROLES[view.agent]
     own = view.view
+    mine, peer = _own_text(fs, blind), _peer_text(fs, blind)
     lines = [
         _header(fs, cfg, blind), "",
         "YOUR ROLE ON THE COMMITTEE", f"{role.title}: {role.mandate}", "",
@@ -313,13 +401,10 @@ def revision_user_prompt(fs: FactSheet, cfg: FirmConfig, view: ViewRecord, chall
         "YOUR SEALED VIEW",
         f"{SEALED_PROB_LABEL}: {own.prob_outperform:.3f}",
         f"{SEALED_EXCESS_LABEL}: {own.expected_excess_return_pct:+.2f}%",
-        "Your evidence:", *_evidence_lines(own.evidence),
-        "Your key risks:", *[f"- {r}" for r in own.key_risks], "",
+        "Your evidence:", *_evidence_lines(own.evidence, tx=mine),
+        "Your key risks:", *[f"- {mine(r)}" for r in own.key_risks], "",
         f"{CHALLENGE_HEADER} (written by a committee member who disagrees with the consensus; identity withheld)",
-        f"Strongest counterargument: {challenge.strongest_counterargument}",
-        "Evidence:", *_evidence_lines(challenge.evidence),
-        "Overlooked risks or opportunities:", *[f"- {x}" for x in challenge.overlooked_risks_or_opportunities],
-        "Questions for the committee:", *[f"- {q}" for q in challenge.questions_for_the_committee], "",
+        *_challenge_lines(challenge, peer), "",
         f'Re-estimate privately. Use ticker "{_display_ticker(fs, blind)}".',
     ]
     return _finish_prompt("\n".join(lines), fs, blind)
@@ -343,73 +428,98 @@ def memo_user_prompt(fs: FactSheet, cfg: FirmConfig, views: list[ViewRecord], ag
         f"{CHALLENGE_ROUND_LABEL}: " + (f"yes (analysts who crossed 0.50 afterwards: {agg.flips})" if agg.challenged else "no"),
         "", "ANALYST VIEWS (anonymised; letters are random labels in a random order, not ranks)",
     ]
+    peer = _peer_text(fs, blind)
     for pos, i in enumerate(anonymous_order(fs.ticker, len(views))):
         v, view = views[i], views[i].view
         lines.append(f"Analyst {_letter(pos)}")
         if view.abstain:
-            lines.append(f"  {ABSTAINED_LABEL} {view.abstain_reason}")
+            lines.append(f"  {ABSTAINED_LABEL} {peer(view.abstain_reason)}")
             continue
         sealed = f"  {MEMBER_SEALED_LABEL} {view.prob_outperform:.3f}, expected excess {view.expected_excess_return_pct:+.2f}%"
         if v.revised_prob is not None and (v.revised_prob, v.revised_excess_pct) != (view.prob_outperform, view.expected_excess_return_pct):
             sealed += f"; after the challenge: {v.revised_prob:.3f}, {v.revised_excess_pct:+.2f}%"
         lines.append(sealed)
-        lines.append("  Grounding: OK" if v.grounding_ok else f"  {FLAGGED_LABEL} ({'; '.join(v.grounding_issues) or 'unspecified'})")
+        issues = "; ".join(peer(x) for x in v.grounding_issues)
+        lines.append("  Grounding: OK" if v.grounding_ok else f"  {FLAGGED_LABEL} ({issues or 'unspecified'})")
         if v.grounding_ok and v.grounding_issues:
-            lines.append(f"  Notes: {'; '.join(v.grounding_issues)}")
+            lines.append(f"  Notes: {issues}")
         lines.append("  Scenarios: " + " | ".join(
-            f"{s.name} {s.probability:.0%} ({s.excess_return_pct:+.2f}%): {s.description}" for s in view.scenarios))
-        lines += ["  Evidence:", *_evidence_lines(view.evidence, "  ")]
-        lines.append(f"  Key risks: {'; '.join(view.key_risks) or 'none stated'}")
-        lines.append(f"  Private insight: {view.private_insight or 'none stated'}")
+            f"{s.name} {s.probability:.0%} ({s.excess_return_pct:+.2f}%): {peer(s.description)}" for s in view.scenarios))
+        lines += ["  Evidence:", *_evidence_lines(view.evidence, "  ", tx=peer)]
+        lines.append(f"  Key risks: {'; '.join(peer(r) for r in view.key_risks) or 'none stated'}")
+        lines.append(f"  Private insight: {peer(view.private_insight) or 'none stated'}")
     lines.append("")
     if challenge is None:
         lines.append("CHALLENGE: none (dispersion below the threshold, too few views, or the round was skipped).")
     else:
-        lines += [f"{CHALLENGE_HEADER} (from the most opposed analyst; identity withheld)",
-                  f"Strongest counterargument: {challenge.strongest_counterargument}",
-                  "Evidence:", *_evidence_lines(challenge.evidence),
-                  "Overlooked risks or opportunities:", *[f"- {x}" for x in challenge.overlooked_risks_or_opportunities],
-                  "Questions for the committee:", *[f"- {q}" for q in challenge.questions_for_the_committee]]
+        lines += [f"{CHALLENGE_HEADER} (from the most opposed analyst; identity withheld)", *_challenge_lines(challenge, peer)]
     lines.append("")
     if lessons:
+        own = _own_text(fs, blind)
         lines += ["PAST PROCESS LESSONS FOR THE COMMITTEE (from forecasts resolved before the as-of date)",
-                  *[f"- {x}" for x in lessons], ""]
+                  *[f"- {own(x)}" for x in lessons], ""]
     lines += ["FULL FACT SHEET", "<fact_sheet>", _full_sheet(fs, blind), "</fact_sheet>", "",
               f'Write the IC memo. Use ticker "{_display_ticker(fs, blind)}".']
     return _finish_prompt("\n".join(lines), fs, blind)
 
 
-def _call(llm: LLM, schema: type[_T], **kwargs) -> tuple[_T | None, str | None]:
-    """One structured call; LLM failures come back as an error string instead of raising."""
+def _challenge_lines(challenge: Challenge, tx: Callable[[str], str]) -> list[str]:
+    return [f"Strongest counterargument: {tx(challenge.strongest_counterargument)}",
+            "Evidence:", *_evidence_lines(challenge.evidence, tx=tx),
+            "Overlooked risks or opportunities:", *[f"- {tx(x)}" for x in challenge.overlooked_risks_or_opportunities],
+            "Questions for the committee:", *[f"- {tx(q)}" for q in challenge.questions_for_the_committee]]
+
+
+@dataclass
+class _CallResult:
+    obj: object | None
+    error: str | None
+    served_by: str
+
+
+def _call(llm: LLM, schema: type[_T], **kwargs) -> _CallResult:
+    """One structured call; LLM failures come back as an error string instead of raising.
+    ``served_by`` is the model that actually answered (the requested one if none did)."""
+    requested = kwargs.get("model", "")
     try:
-        obj, _ = llm.structured(schema=schema, **kwargs)
-        return obj, None
+        obj, rec = llm.structured(schema=schema, **kwargs)
+        return _CallResult(obj, None, served_model(llm, requested, getattr(rec, "served_by", "")))
     except (LLMCallFailed, BudgetExceeded) as exc:
-        return None, str(exc)
+        return _CallResult(None, str(exc), requested)
 
 
 def _run_challenge(llm: LLM, fs: FactSheet, cfg: FirmConfig, challenger: ViewRecord, views: list[ViewRecord],
                    agg: AggregatedView, log: LogFn) -> Challenge | None:
-    challenge, err = _call(llm, Challenge, role="challenge", model=challenger.model, system=CHALLENGE_SYSTEM,
-                           user=challenge_user_prompt(fs, cfg, challenger, views, agg),
-                           effort=cfg.models.analyst_effort, max_tokens=cfg.models.max_tokens)
+    blind = cfg.process.blind_mode
+    res = _call(llm, Challenge, role="challenge", model=challenger.model, system=CHALLENGE_SYSTEM,
+                user=challenge_user_prompt(fs, cfg, challenger, views, agg),
+                effort=cfg.models.analyst_effort, max_tokens=cfg.models.max_tokens)
     base = {"ticker": fs.ticker, "challenger": challenger.agent, "challenger_sample": challenger.sample,
-            "challenger_prob": challenger.view.prob_outperform, "pooled_prob": agg.prob_outperform}
+            "challenger_prob": challenger.view.prob_outperform, "pooled_prob": agg.prob_outperform,
+            "model": challenger.model, "served_by": res.served_by}
+    challenge = res.obj
     if challenge is None:
-        log("challenge", {**base, "error": err})
+        log("challenge", {**base, "error": res.error})
         return None
     challenge.ticker = fs.ticker
+    shown = _shown_full(fs, blind)
     for e in challenge.evidence:
-        e.fact_ids = _restore_ids(e.fact_ids, fs.ticker, cfg.process.blind_mode)
+        e.fact_ids = _restore_ids(e.fact_ids, fs.ticker, blind, shown.ids(), shown.ticker)
     log("challenge", {**base, **challenge.model_dump()})
     return challenge
 
 
-def _apply_revision(v: ViewRecord, rev: Revision, valid_ids: set[str], ticker: str, blind: bool) -> dict:
+def _apply_revision(v: ViewRecord, rev: Revision, valid_ids: set[str], ticker: str, blind: bool,
+                    shown_ids: set[str] | None = None, shown_ticker: str | None = None) -> dict:
     """Store an accepted revision on ``v`` and return the ledger payload. A claimed change
-    is accepted only if it cites at least one fact the analyst could legitimately use."""
+    is accepted only if it cites at least one fact the analyst could legitimately use.
+    ``shown_ids`` are those facts as the reviser saw them (aliased in blind mode), used to
+    resolve bare keys and patterns; they default to ``valid_ids``."""
     before_p, before_x = v.view.prob_outperform, v.view.expected_excess_return_pct
-    cited = _restore_ids(rev.new_evidence_fact_ids, ticker, blind)
+    if shown_ids is None:
+        shown_ids = {blind_ids_in_text(i, ticker) for i in valid_ids} if blind else set(valid_ids)
+    cited = _restore_ids(rev.new_evidence_fact_ids, ticker, blind, shown_ids,
+                         shown_ticker or (BLIND_ALIAS if blind else ticker))
     grounded = [i for i in cited if i in valid_ids]
     if not rev.changed:
         status = "unchanged"
@@ -436,35 +546,55 @@ def _run_revisions(llm: LLM, fs: FactSheet, cfg: FirmConfig, views: list[ViewRec
     revisers = [v for v in active if v.agent in ROLES and v.agent != challenger.agent]
     challenge_ids = {i for e in challenge.evidence for i in e.fact_ids}
 
-    def run(v: ViewRecord) -> tuple[Revision | None, str | None]:
+    def run(v: ViewRecord) -> _CallResult:
         return _call(llm, Revision, role=f"revision.{v.agent}", model=v.model, system=REVISION_SYSTEM,
                      user=revision_user_prompt(fs, cfg, v, challenge), effort=cfg.models.analyst_effort,
                      max_tokens=cfg.models.max_tokens)
 
-    for v, (rev, err) in zip(revisers, _parallel_map(run, revisers, cfg.models.max_parallel_calls)):
-        if rev is None:
+    for v, res in zip(revisers, _parallel_map(run, revisers, cfg.models.max_parallel_calls)):
+        if res.obj is None:
             log("revision", {"ticker": fs.ticker, "agent": v.agent, "sample": v.sample, "model": v.model,
-                             "status": "failed: sealed view kept", "error": err})
+                             "served_by": res.served_by, "status": "failed: sealed view kept", "error": res.error})
             continue
-        slice_ids = {unblind_id(i, fs.ticker) for i in shown_sheet(ROLES[v.agent], fs, blind).ids()}
-        log("revision", _apply_revision(v, rev, slice_ids | challenge_ids, fs.ticker, blind))
+        shown = shown_sheet(ROLES[v.agent], fs, blind)
+        slice_ids = {unblind_id(i, fs.ticker) for i in shown.ids()}
+        shown_ids = shown.ids() | ({blind_ids_in_text(i, fs.ticker) for i in challenge_ids} if blind else challenge_ids)
+        payload = _apply_revision(v, res.obj, slice_ids | challenge_ids, fs.ticker, blind, shown_ids, shown.ticker)
+        log("revision", {**payload, "served_by": res.served_by})
+
+
+# Edge multiplier for a held name whose required memo failed: the pooled view stands without
+# the chair's shrink, and ``hold_current`` asks the pipeline to keep the current weight.
+FAILED_MEMO_HELD_MULTIPLIER = 1.0
 
 
 def _run_memo(llm: LLM, fs: FactSheet, cfg: FirmConfig, views: list[ViewRecord], agg: AggregatedView,
-              challenge: Challenge | None, held: bool, lessons: list[str], log: LogFn) -> tuple[ICMemo | None, float]:
-    memo, err = _call(llm, ICMemo, role="memo", model=cfg.models.committee_model, system=MEMO_SYSTEM,
-                      user=memo_user_prompt(fs, cfg, views, agg, challenge, held, lessons),
-                      effort=cfg.models.committee_effort, max_tokens=cfg.models.max_tokens)
+              challenge: Challenge | None, held: bool, lessons: list[str],
+              log: LogFn) -> tuple[ICMemo | None, float, bool]:
+    """The chair's memo. Returns (memo, edge multiplier, hold_current)."""
+    model = cfg.models.committee_model
+    res = _call(llm, ICMemo, role="memo", model=model, system=MEMO_SYSTEM,
+                user=memo_user_prompt(fs, cfg, views, agg, challenge, held, lessons),
+                effort=cfg.models.committee_effort, max_tokens=cfg.models.max_tokens)
+    memo = res.obj
     if memo is None:
-        log("memo", {"ticker": fs.ticker, "error": err, "edge_multiplier": 0.0})
-        return None, 0.0
+        if held:   # an LLM failure is not information about the stock: keep the position, do not sell it
+            log("memo", {"ticker": fs.ticker, "model": model, "served_by": res.served_by, "error": res.error,
+                         "held": True, "hold_current": True, "edge_multiplier": FAILED_MEMO_HELD_MULTIPLIER,
+                         "note": "required memo failed on a held name: keep the current weight this cycle"})
+            return None, FAILED_MEMO_HELD_MULTIPLIER, True
+        log("memo", {"ticker": fs.ticker, "model": model, "served_by": res.served_by, "error": res.error,
+                     "held": False, "hold_current": False, "edge_multiplier": 0.0})
+        return None, 0.0, False
     memo.ticker = fs.ticker
-    if cfg.process.blind_mode:
-        for k in memo.kill_criteria:
-            k.metric = unblind_id(k.metric, fs.ticker)
-    multiplier = edge_multiplier_for(memo, cfg.portfolio.long_only)
-    log("memo", {**memo.model_dump(), "edge_multiplier": multiplier})
-    return memo, multiplier
+    shown = _shown_full(fs, cfg.process.blind_mode)
+    for k in memo.kill_criteria:
+        metric = resolve_fact_id(k.metric, shown.ids(), shown.ticker) or k.metric
+        k.metric = unblind_id(metric, fs.ticker) if cfg.process.blind_mode else metric
+    multiplier = edge_multiplier_for(memo, cfg.portfolio.long_only, held=held)
+    log("memo", {**memo.model_dump(), "model": model, "served_by": res.served_by, "held": held,
+                 "hold_current": False, "edge_multiplier": multiplier})
+    return memo, multiplier, False
 
 
 # --------------------------------------------------------------------------- entry point
@@ -476,7 +606,13 @@ def run_committee(llm: LLM, fs: FactSheet, cfg: FirmConfig, *, quant_view: ViewR
 
     ``lessons`` maps agent name to retrieved process lessons; the chair receives
     ``lessons["committee"]``. ``log(event, payload)`` receives "view", "aggregate",
-    "challenge", "revision" and "memo" events for the ledger."""
+    "challenge", "revision" and "memo" events for the ledger; challenge, revision and memo
+    payloads carry ``served_by``, the model that actually answered.
+
+    With memos enabled, the chair reviews every name :func:`memo_required` selects; any
+    other name gets an edge multiplier of 0. ``CommitteeResult.hold_current`` is True when
+    a held name's required memo failed: the caller should keep that name at its current
+    weight this cycle (an LLM failure is not a reason to trade it)."""
     views = _sealed_views(llm, fs, cfg, lessons)
     if quant_view is not None:
         views.append(quant_view.model_copy(deep=True))
@@ -502,11 +638,16 @@ def run_committee(llm: LLM, fs: FactSheet, cfg: FirmConfig, *, quant_view: ViewR
             log("aggregate", {"stage": "revised", **agg.model_dump()})
 
     memo: ICMemo | None = None
-    edge_multiplier = 1.0
-    if cfg.process.memo_enabled and (abs(agg.prob_outperform - 0.5) >= cfg.process.memo_min_edge or held):
-        memo, edge_multiplier = _run_memo(llm, fs, cfg, views, agg, challenge, held,
-                                          lessons.get("committee", []), log)
+    edge_multiplier = 1.0                 # memos disabled: the pooled view is sized as it is
+    hold_current = False
+    if cfg.process.memo_enabled:
+        if memo_required(agg, cfg, held):
+            memo, edge_multiplier, hold_current = _run_memo(llm, fs, cfg, views, agg, challenge, held,
+                                                            lessons.get("committee", []), log)
+        else:
+            edge_multiplier = 0.0         # not reviewed (and not held): an unreviewed edge opens nothing
 
     challenger_name = challenger.agent if challenge is not None and challenger is not None else None
     return CommitteeResult(ticker=fs.ticker, views=views, aggregate=agg, challenge=challenge,
-                           challenger=challenger_name, memo=memo, edge_multiplier=edge_multiplier)
+                           challenger=challenger_name, memo=memo, edge_multiplier=edge_multiplier,
+                           hold_current=hold_current)

@@ -18,9 +18,15 @@ Design choices, each tied to a principle in docs/ARCHITECTURE.md:
   default opinion.
 * **Blind mode (P3).** For historical research, the ticker, company name, absolute dollar
   amounts and absolute dates are hidden so the model cannot recognise the company and
-  recall what happened next. Macro levels can still hint at the period, so blind mode
-  reduces memorisation leakage rather than removing it; the pre/post model-cutoff split in
-  the backtest remains the primary control.
+  recall what happened next. That covers *every* piece of free text that reaches a prompt,
+  not only the fact lines: data-gap notes (often built from exception messages that name
+  the ticker, the SEC filer or a CIK URL), filing events, fact sources and retrieved
+  lessons all go through :func:`scrub_identity`. Macro levels can still hint at the period,
+  so blind mode reduces memorisation leakage rather than removing it; the pre/post
+  model-cutoff split in the backtest remains the primary control.
+* **Credit the model that answered.** With server-side fallbacks a refused call can be
+  answered by another model; the view records the model that actually served it, so its
+  forecast is scored, weighted and cutoff-checked against the right model.
 """
 
 from __future__ import annotations
@@ -32,12 +38,24 @@ from ..config import FirmConfig
 from ..data.factsheet import PRICE_KEYS, Fact, FactSheet
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
 from ..schemas import AnalystView, ViewRecord, sanitize_view
-from .grounding import check_view, normalize_fact_id
-from .roles import ROLES, AnalystRole
+from .grounding import check_view, normalize_fact_id, resolve_fact_ids
+from .roles import ROLES, AnalystRole, checklist_for
 
 BLIND_ALIAS = "STOCK"
 _BLIND_DROP_KEYS = frozenset({"shares_out"})   # an absolute share count identifies a company as well as a dollar amount
 _ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})(?:T[\d:.+\-]+Z?)?\b")
+
+# Identity scrubbing for blind mode. Exception texts and SEC metadata name the filer, its CIK
+# and the URLs fetched; all of them identify the company as surely as the ticker does.
+_URL = re.compile(r"(?:\bhttps?://|\bwww\.)\S+", re.I)
+_FILER_NAME = re.compile(r"\b(filer)\s+[^()\n;]+?(?=\s*\(\s*CIK)", re.I)
+_CIK = re.compile(r"\bCIK\s*[#:]?\s*\d+", re.I)
+_ACCESSION = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
+_PADDED_ID = re.compile(r"\b0\d{9}\b")                 # zero-padded 10-digit CIK
+_CORP_SUFFIX = re.compile(
+    r"(?:[\s,]+(?:inc|incorporated|corp|corporation|co|company|ltd|limited|plc|llc|lp|holdings?|group|"
+    r"n\.?v|s\.?a|ag|se|class\s+[a-c])\.?|\s*/[a-z]{2}/)\s*$", re.I)
+_MIN_NAME_CHARS = 3
 
 # --------------------------------------------------------------------------- shared prompt text
 # These blocks are reused by the committee, risk-review and lesson prompts so that every
@@ -45,7 +63,7 @@ _ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})(?:T[\d:.+\-]+Z?)?\b")
 
 EVIDENCE_RULES = """\
 - The fact sheet in the user message is your only source. Each fact is one line: [FACT_ID] label: value (as of date; source). Do not use numbers, events or news from memory or training data, even if you believe you know the company: your memory may describe a different date than the as-of date, and the fact sheet is what was knowable then.
-- Cite the IDs of the facts behind every evidence point in fact_ids (the ID inside the square brackets, without the brackets). Every number you write in a text field must be copied from the fact sheet (rounding is fine), except your own forecast numbers. An automated checker compares every number you write with the fact sheet and flags views that introduce numbers that are not on it.
+- Cite the IDs of the facts behind every evidence point in fact_ids (the ID inside the square brackets, without the brackets). Every number you write in a text field must be copied from the fact sheet, except your own forecast numbers. Rounding is fine for a fact whose ID you cite in this view; a number from a fact you do not cite must be written as precisely as the sheet shows it. An automated checker compares every number you write with the fact sheet and flags views that introduce numbers that are not on it.
 - Do not compute new numbers (ratios, differences, averages, annualisations). To compare two facts, describe the relation in words (e.g. "free cash flow exceeds net income") and cite both IDs.
 - Anything listed under DATA GAPS is unknown. Say what is missing; never fill it in.
 - Filing events and headlines have no fact IDs. For a point based on them, describe the event and its date in the point and cite only the numeric facts you also use (fact_ids may be empty for a purely qualitative event point).
@@ -108,7 +126,7 @@ def horizon_phrase(horizon_days: int) -> str:
 
 def analyst_system_prompt(role: AnalystRole, horizon_days: int, benchmark: str) -> str:
     """Stable system prompt for ``role``. Contains no ticker or date, so it is cacheable."""
-    checklist = "\n".join(f"{i}. {item}" for i, item in enumerate(role.checklist, 1))
+    checklist = "\n".join(f"{i}. {item}" for i, item in enumerate(checklist_for(role, benchmark), 1))
     return _ANALYST_SYSTEM.format(
         title=role.title, benchmark=benchmark, horizon_days=horizon_days,
         horizon_phrase=horizon_phrase(horizon_days), mandate=role.mandate, checklist=checklist,
@@ -169,26 +187,79 @@ def _relative_dates(text: str, anchor: date) -> str:
     return _ISO_DATE.sub(repl, text)
 
 
+def _name_variants(name: str) -> list[str]:
+    """The company name and its core without legal suffixes ("NVIDIA CORP" -> "NVIDIA"),
+    longest first. Variants shorter than three characters are not scrubbed (too ambiguous)."""
+    out: list[str] = []
+    cur = name.strip().strip(",. ")
+    while len(cur) >= _MIN_NAME_CHARS and cur not in out:
+        out.append(cur)
+        cur = _CORP_SUFFIX.sub("", cur).strip().strip(",. ")
+    out += [v[4:] for v in out if v.lower().startswith("the ") and len(v) - 4 >= _MIN_NAME_CHARS]
+    return sorted(set(out), key=len, reverse=True)
+
+
+def scrub_identity(text: str, ticker: str, name: str = "", alias: str = BLIND_ALIAS) -> str:
+    """Remove what identifies the company from free text: URLs, SEC filer names, CIK and
+    accession numbers, the company name (and its core without "Inc", "Corp"...) and the
+    ticker, which becomes ``alias`` ("NVDA.ret_3m" becomes "STOCK.ret_3m" too).
+
+    The ticker is matched as a whole word; case-insensitively when it has three or more
+    characters (exception texts and URLs often lower-case it), case-sensitively when it is
+    shorter, since "a" or "on" in lower case are ordinary words. A one-letter ticker such as
+    "T" is never confused with the blind-mode day marker ("T-30d", "day T")."""
+    if not text:
+        return text
+    out = _URL.sub("[link withheld]", text)
+    out = _FILER_NAME.sub(r"\1 [name withheld]", out)
+    out = _CIK.sub("CIK [withheld]", out)
+    out = _ACCESSION.sub("[filing id withheld]", out)
+    out = _PADDED_ID.sub("[id withheld]", out)
+    for variant in _name_variants(name):
+        out = re.sub(rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])", "the company", out, flags=re.I)
+    t = ticker.strip()
+    if t and t != alias:
+        flags = re.I if len(t) >= 3 else 0
+        out = re.sub(rf"(?<![A-Za-z0-9_])(?<!day ){re.escape(t)}(?![A-Za-z0-9_])(?![-+]\d+d\b)", alias, out,
+                     flags=flags)
+    return out
+
+
+def blind_text(text: str, fs: FactSheet, alias: str = BLIND_ALIAS) -> str:
+    """Free text for a blind-mode prompt about ``fs`` (the real, un-blinded sheet): identity
+    scrubbed (:func:`scrub_identity`) and ISO dates made relative to the as-of date."""
+    if not text:
+        return text
+    return _relative_dates(scrub_identity(text, fs.ticker, fs.name, alias), date.fromisoformat(fs.as_of))
+
+
 def blind_factsheet(fs: FactSheet, alias: str = BLIND_ALIAS) -> FactSheet:
     """Anonymised copy of ``fs``: the ticker becomes ``alias`` (also in fact IDs), the
     company name is removed, absolute-scale facts (USD amounts and the share count) are
-    dropped, dates become relative to the as-of date ("T-35d"), and headlines are withheld
-    because they name the company."""
+    dropped, dates become relative to the as-of date ("T-35d"), headlines are withheld
+    because they name the company, and every piece of free text (labels, sources, filing
+    events, data-gap notes) is scrubbed of the ticker, the name, SEC filer names, CIKs
+    and URLs (:func:`scrub_identity`)."""
     anchor = date.fromisoformat(fs.as_of)
     prefix = f"{fs.ticker}."
+
+    def scrub(text: str) -> str:
+        return _relative_dates(scrub_identity(text, fs.ticker, fs.name, alias), anchor)
+
     facts: list[Fact] = []
     for f in fs.facts:
         is_ticker_fact = f.id.startswith(prefix)
         if f.unit == "USD" or (is_ticker_fact and f.id[len(prefix):] in _BLIND_DROP_KEYS):
             continue
         fid = f"{alias}.{f.id[len(prefix):]}" if is_ticker_fact else f.id
-        facts.append(Fact(fid, f.label, f.value, f.unit, _relative_dates(f.as_of, anchor),
-                          _relative_dates(f.source, anchor)))
-    gaps = [_relative_dates(g, anchor) for g in fs.data_gaps]
+        value = scrub(f.value) if isinstance(f.value, str) else f.value
+        facts.append(Fact(fid, scrub_identity(f.label, fs.ticker, fs.name, alias), value, f.unit,
+                          _relative_dates(f.as_of, anchor), scrub(f.source)))
+    gaps = [scrub(g) for g in fs.data_gaps]
     if fs.headlines:
         gaps.append("Headlines withheld in blind mode (they would identify the company)")
     return FactSheet(ticker=alias, as_of="T", name="", sector=fs.sector, facts=facts,
-                     events=[_relative_dates(e, anchor) for e in fs.events], headlines=[], data_gaps=gaps)
+                     events=[scrub(e) for e in fs.events], headlines=[], data_gaps=gaps)
 
 
 def unblind_id(fact_id: str, ticker: str, alias: str = BLIND_ALIAS) -> str:
@@ -231,7 +302,7 @@ def analyst_user_prompt(role: AnalystRole, fs: FactSheet, horizon_days: int, ben
         parts += ["LESSONS FROM YOUR PAST RESOLVED FORECASTS",
                   "Process lessons, retrieved only from forecasts that had resolved by the as-of date. Apply one only "
                   "if its conditions match this case; they are not information about this stock."]
-        parts += [f"- {lesson}" for lesson in lessons]
+        parts += [f"- {blind_text(lesson, fs) if blind else lesson}" for lesson in lessons]
         parts.append("")
     parts.append(f'Return your sealed view. Use ticker "{shown.ticker}".')
     return "\n".join(parts)
@@ -264,13 +335,35 @@ def consistency_notes(view: AnalystView) -> list[str]:
     return notes
 
 
+_ROLE_PREFIX = re.compile(r"^\s*(?:analyst|revision)\.[A-Za-z_]+\s*:\s*")
+
+
+def llm_failure_reason(exc: BaseException) -> str:
+    """Abstention reason for a failed call, without the role string the LLM client puts in
+    its messages ("analyst.technical: model refused"): abstention reasons are shown to the
+    chair under an anonymous letter, so they must not say which analyst failed. The full
+    message stays in ``grounding_issues`` and the ledger."""
+    return f"LLM call failed: {_ROLE_PREFIX.sub('', str(exc)) or type(exc).__name__}"
+
+
+def served_model(llm: LLM, requested: str, served_by: str) -> str:
+    """The model to credit with an answer: the one that actually served it (a server-side
+    fallback may answer instead of ``requested``). The offline stand-in keeps the requested
+    model's label, since it simulates that model's role in tests and dry runs."""
+    if llm.is_offline or not served_by:
+        return requested
+    return served_by
+
+
 def run_analyst(llm: LLM, role_name: str, fs: FactSheet, cfg: FirmConfig, model: str, sample: int = 0,
                 lessons: list[str] | None = None) -> ViewRecord:
     """Produce one sealed, sanitized and grounding-checked view.
 
-    An LLM failure (refusal, truncation, API error or exhausted budget) becomes an
-    abstention, never a default view (fail closed). ``sample`` > 0 adds a one-line note to
-    the user prompt so repeated samples are distinct requests rather than cache hits."""
+    An LLM failure (refusal, truncation, API error, an answer that does not fit the schema,
+    or an exhausted budget) becomes an abstention, never a default view (fail closed).
+    ``sample`` > 0 adds a one-line note to the user prompt so repeated samples are distinct
+    requests rather than cache hits. ``ViewRecord.model`` is the model that actually
+    answered (see :func:`served_model`)."""
     role = ROLES.get(role_name)
     if role is None:
         raise ValueError(f"unknown analyst role '{role_name}'; known: {sorted(ROLES)}")
@@ -281,18 +374,19 @@ def run_analyst(llm: LLM, role_name: str, fs: FactSheet, cfg: FirmConfig, model:
     if sample > 0:
         user += _SAMPLE_NOTE.format(n=sample + 1)
     try:
-        view, _ = llm.structured(role=f"analyst.{role.name}", model=model,
-                                 system=analyst_system_prompt(role, horizon, benchmark), user=user,
-                                 schema=AnalystView, effort=cfg.models.analyst_effort,
-                                 max_tokens=cfg.models.max_tokens)
+        view, call = llm.structured(role=f"analyst.{role.name}", model=model,
+                                    system=analyst_system_prompt(role, horizon, benchmark), user=user,
+                                    schema=AnalystView, effort=cfg.models.analyst_effort,
+                                    max_tokens=cfg.models.max_tokens)
     except (LLMCallFailed, BudgetExceeded) as exc:
         return ViewRecord(agent=role.name, model=model, sample=sample,
-                          view=abstaining_view(fs.ticker, f"LLM call failed: {exc}"),
+                          view=abstaining_view(fs.ticker, llm_failure_reason(exc)),
                           grounding_ok=False, grounding_issues=[f"llm failure: {exc}"])
 
     view = sanitize_view(view)
-    for item in view.evidence:
-        item.fact_ids = [normalize_fact_id(i) for i in item.fact_ids if normalize_fact_id(i)]
+    known = shown.ids()
+    for item in view.evidence:   # "[AAA.ret_3m]", a bare "ret_3m" or "MKT.*_vol_20d" -> the ID on the sheet
+        item.fact_ids = resolve_fact_ids(item.fact_ids, known, shown.ticker)
     report = check_view(view, shown, prompt_numbers=(float(horizon),))
     issues = report.issues() + consistency_notes(view)
     if blind:
@@ -300,5 +394,5 @@ def run_analyst(llm: LLM, role_name: str, fs: FactSheet, cfg: FirmConfig, model:
             item.fact_ids = [unblind_id(i, fs.ticker) for i in item.fact_ids]
         issues = [unblind_text(i, fs.ticker) for i in issues]
     view.ticker = fs.ticker
-    return ViewRecord(agent=role.name, model=model, sample=sample, view=view,
-                      grounding_ok=report.ok, grounding_issues=issues)
+    return ViewRecord(agent=role.name, model=served_model(llm, model, getattr(call, "served_by", "")),
+                      sample=sample, view=view, grounding_ok=report.ok, grounding_issues=issues)

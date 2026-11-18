@@ -9,7 +9,11 @@ it invites the model to role-play a style instead of reading the data.
 
 The checklists name concrete fact keys (e.g. ``mom_12_1``) so the analyst knows which
 lines of its slice answer which question. They describe what to evaluate, never what to
-conclude.
+conclude. Market facts are named with a ``{benchmark}`` placeholder that
+:func:`checklist_for` fills in, so the checklist shows the real ID (``MKT.SPY_vol_20d``)
+rather than a wildcard the analyst might copy into ``fact_ids``. A citation written as a
+bare key ("mom_12_1") is still accepted: :func:`aifirm.agents.grounding.resolve_fact_id`
+maps it to the ticker's fact ID.
 """
 
 from __future__ import annotations
@@ -112,11 +116,12 @@ MACRO = AnalystRole(
         "signals that favor defensive over cyclical exposure.",
         "Credit: high-yield spread (MACRO.BAMLH0A0HYM2) level and 3-month change. Widening spreads mean risk-off, which "
         "tends to hurt high-beta and leveraged companies relative to the market.",
-        "Volatility: VIX (MACRO.VIXCLS) level and change, and the benchmark's realized volatility (MKT.*_vol_20d). "
+        "Volatility: VIX (MACRO.VIXCLS) level and change, and the benchmark's realized volatility (MKT.{benchmark}_vol_20d). "
         "Elevated or rising volatility tends to favor low-beta names; calm, falling volatility favors high-beta names.",
         "Inflation and labor: CPI inflation (MACRO.CPIAUCSL) and unemployment (MACRO.UNRATE) as indicators of policy "
         "pressure. Note their publication lags (as-of dates).",
-        "Market trend: the benchmark versus its 200-day average (MKT.*_vs_sma200) and its 3- and 12-month returns.",
+        "Market trend: the benchmark versus its 200-day average (MKT.{benchmark}_vs_sma200) and its 3- and 12-month "
+        "returns (MKT.{benchmark}_ret_3m, MKT.{benchmark}_ret_12m).",
         "Interaction: combine the regime with this stock's beta_1y, vol_60d, sector and rel_ret_3m. A beta near 1 means "
         "the regime implies little relative edge, so stay close to 0.50. State explicitly which way beta times regime "
         "points and how strongly.",
@@ -160,3 +165,11 @@ EVENTS = AnalystRole(
 )
 
 ROLES: dict[str, AnalystRole] = {r.name: r for r in (FUNDAMENTAL, TECHNICAL, MACRO, EVENTS)}
+
+
+BENCHMARK_PLACEHOLDER = "{benchmark}"
+
+
+def checklist_for(role: AnalystRole, benchmark: str) -> tuple[str, ...]:
+    """``role.checklist`` with the benchmark filled into market fact IDs ("MKT.{benchmark}_vol_20d")."""
+    return tuple(item.replace(BENCHMARK_PLACEHOLDER, benchmark) for item in role.checklist)

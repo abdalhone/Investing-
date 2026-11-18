@@ -9,12 +9,20 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
 * **Drawdown freeze**: at ``drawdown_freeze`` below peak NAV the active sleeve goes to 0
   and ``state.frozen`` is set. It stays set until a human resets it, even if NAV
   recovers (section 4 of ARCHITECTURE.md: resetting a frozen book is a human decision).
-  The passive core is kept, because the core is not the thing that failed.
+  The passive core is kept, because the core is not the thing that failed. The freeze
+  also records ``state.frozen_at_nav``. A human unfreezes the book by setting
+  ``frozen`` to false (e.g. in ``risk_state.json``); the next cycle sees ``frozen_at_nav``
+  still set, treats that as the human reset, restarts the high-water mark at the current
+  NAV and clears the marker. Without that, a book frozen to cash could never recover the
+  old peak and would re-freeze on the very next run.
 * **Drawdown de-risk**: at ``drawdown_derisk`` active weights are halved.
 * **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
   may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
-* **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more, no weight
-  may increase this cycle (sells and reductions still go through).
+* **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more on *any*
+  day since the previous cycle (``worst_day_return``, or ``nav / prev_nav``), no weight
+  may increase this cycle (sells and reductions still go through). The high-water mark
+  must likewise see every daily NAV (:func:`update_risk_state` per mark), not only the
+  decision-day NAVs, or drawdowns inside a cycle are measured from a too-low peak.
 * **Backstops**: non-finite weights -> 0, shorts in a long-only book -> 0, position cap,
   max gross and cash floor. Construction already enforces these; repeating them here
   means a bug upstream cannot reach the broker.
@@ -24,7 +32,10 @@ rule only moves a weight toward zero, so ``|out_w| <= |target_w|`` for every nam
 engine can never raise gross exposure above the proposed target.
 
 ``orders_from_target`` turns weights into share orders with the same fail-closed stance:
-no price, no ADV or no valid NAV means no order for that name, with a message.
+no price, no ADV or no valid NAV means no order for that name, with a message. A full
+exit (target exactly 0 on a held name: a freeze, the restricted list, the minimum price,
+a name no longer covered) is never skipped by the no-trade band; otherwise a position
+below the band could never be exited by any rule.
 """
 
 from __future__ import annotations
@@ -39,15 +50,23 @@ from ..data.factsheet import FactSheet
 from ..schemas import Order, TargetPortfolio, TargetPosition
 
 DUST = 1e-12
+CAP_NOISE = 1e-9   # a weight this close above the position cap is float rounding, not a breach
 
 
 @dataclass
 class RiskState:
-    """Book-level risk memory carried between cycles. ``frozen`` is only ever cleared by a human."""
+    """Book-level risk memory carried between cycles. ``frozen`` is only ever cleared by a human.
+
+    ``last_nav`` / ``last_as_of``: the NAV and date of the last decision (set by the
+    pipeline), so the next cycle can see the path since then. ``frozen_at_nav``: set when
+    the book freezes and kept after a human clears ``frozen``, which is how the next cycle
+    recognises the human reset (see the module docstring)."""
 
     peak_nav: float
     frozen: bool = False
     last_nav: float | None = None
+    last_as_of: str | None = None
+    frozen_at_nav: float | None = None
 
 
 def _valid_positive(x: object) -> bool:
@@ -66,10 +85,12 @@ def update_risk_state(state: RiskState, nav: float) -> RiskState:
     to ``nav`` and the book frozen, so drawdown math works again once a human unfreezes it.
     """
     if not _valid_positive(nav):
-        return replace(state, frozen=True)
+        marker = state.frozen_at_nav if state.frozen_at_nav is not None else (state.last_nav or 0.0)
+        return replace(state, frozen=True, frozen_at_nav=marker)
     nav = float(nav)
     if not _valid_positive(state.peak_nav):
-        return replace(state, peak_nav=nav, last_nav=nav, frozen=True)
+        return replace(state, peak_nav=nav, last_nav=nav, frozen=True,
+                       frozen_at_nav=state.frozen_at_nav if state.frozen_at_nav is not None else nav)
     return replace(state, peak_nav=max(float(state.peak_nav), nav), last_nav=nav)
 
 
@@ -102,13 +123,18 @@ def _hold_current(target: TargetPortfolio, current_weights: dict[str, float], be
 
 def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, prev_nav: float | None,
                       current_weights: dict[str, float], cfg: FirmConfig, factsheets: dict[str, FactSheet],
-                      runs_dir: str) -> tuple[TargetPortfolio, list[str]]:
+                      runs_dir: str, *, worst_day_return: float | None = None) -> tuple[TargetPortfolio, list[str]]:
     """Apply the invariant rules (module docstring) and return ``(target, messages)``.
 
-    ``state.frozen`` is set in place when the freeze triggers. Drawdown is measured from
-    ``max(state.peak_nav, nav)`` so a caller that has not yet called
-    :func:`update_risk_state` cannot under-state it. ``current_weights`` includes the
-    benchmark (core) leg. Messages are also appended to the returned target's notes.
+    ``state.frozen`` / ``state.frozen_at_nav`` are set in place when the freeze triggers,
+    and ``state.peak_nav`` is reset in place when a human has unfrozen the book. Drawdown
+    is measured from ``max(state.peak_nav, nav)`` so a caller that has not yet called
+    :func:`update_risk_state` cannot under-state it; callers should feed every daily NAV
+    to :func:`update_risk_state` so the peak is the true high-water mark.
+    ``worst_day_return`` is the worst one-day NAV return since the previous cycle (a
+    fraction; None if unknown); the daily-loss halt triggers if it, or ``nav / prev_nav - 1``,
+    is a loss of ``daily_loss_halt`` or more. ``current_weights`` includes the benchmark
+    (core) leg. Messages are also appended to the returned target's notes.
     """
     rc, pc = cfg.risk, cfg.portfolio
     bench = cfg.universe.benchmark
@@ -138,8 +164,11 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             hits[p.ticker].append("risk:long_only")
             w = 0.0
         if abs(w) > pc.max_position:
-            msgs.append(f"{p.ticker}: {w:.2%} exceeds the position cap -> {pc.max_position:.2%}")
-            hits[p.ticker].append("risk:max_position")
+            # Construction meets the cap up to float rounding (e.g. 0.10000000000100001); clip
+            # that silently and report only a real breach.
+            if abs(w) > pc.max_position + CAP_NOISE:
+                msgs.append(f"{p.ticker}: {w:.2%} exceeds the position cap -> {pc.max_position:.2%}")
+                hits[p.ticker].append("risk:max_position")
             w = math.copysign(pc.max_position, w)
         weights[p.ticker] = w
     core = float(target.core_weight) if math.isfinite(float(target.core_weight)) else 0.0
@@ -148,10 +177,20 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         msgs.append(f"core weight {core:.2%} outside [0, {core_limit:.2%}] -> clipped")
         core = min(max(core, 0.0), core_limit)
 
+    # A human cleared ``frozen`` after a freeze: the reset restarts the high-water mark here,
+    # otherwise the book (in cash, so unable to recover the old peak) would re-freeze at once.
+    if not state.frozen and state.frozen_at_nav is not None:
+        msgs.append(f"book unfrozen by a human since the freeze (NAV then {state.frozen_at_nav:,.2f}): "
+                    f"high-water mark reset from {float(state.peak_nav):,.2f} to the current NAV {float(nav):,.2f}")
+        state.peak_nav = float(nav)
+        state.frozen_at_nav = None
+
     # Drawdown: freeze (sticky) or de-risk.
     peak = max(float(state.peak_nav), float(nav))
     drawdown = 1.0 - float(nav) / peak
     if state.frozen or drawdown >= rc.drawdown_freeze:
+        if state.frozen_at_nav is None:
+            state.frozen_at_nav = float(nav)       # marks the freeze, so a human reset can be recognised
         if not state.frozen:
             state.frozen = True
             msgs.append(f"DRAWDOWN FREEZE: {drawdown:.1%} from peak >= {rc.drawdown_freeze:.0%}; "
@@ -196,18 +235,28 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         msgs.append(f"{bench} (core) is restricted -> core 0")
         core = 0.0
 
-    # Daily-loss halt: nothing may grow this cycle.
+    # Daily-loss halt: nothing may grow this cycle. Any one-day loss since the previous
+    # cycle counts, not only the decision day's own return. A non-finite return (a broken
+    # NAV) counts as a loss (fail closed).
+    losses: list[tuple[float, str]] = []
     if prev_nav is not None:
         day = float(nav) / float(prev_nav) - 1.0 if _valid_positive(prev_nav) else -math.inf
-        if day <= -rc.daily_loss_halt:
-            reason = f"one-day NAV change {day:.1%}" if math.isfinite(day) else f"invalid previous NAV {prev_nav!r}"
-            msgs.append(f"DAILY-LOSS HALT: {reason}; no weight may increase this cycle")
-            for t in weights:
-                capped = _no_increase(weights[t], float(current_weights.get(t, 0.0)))
-                if capped != weights[t]:
-                    hits[t].append("risk:daily_loss_halt")
-                    weights[t] = capped
-            core = max(0.0, _no_increase(core, float(current_weights.get(bench, 0.0))))
+        losses.append((day, f"one-day NAV change {day:.1%}" if math.isfinite(day)
+                       else f"invalid previous NAV {prev_nav!r}"))
+    if worst_day_return is not None:
+        w = float(worst_day_return)
+        losses.append((w if math.isfinite(w) else -math.inf,
+                       f"worst one-day NAV change since the last cycle {w:.1%}" if math.isfinite(w)
+                       else "invalid NAV in the path since the last cycle"))
+    halt = min(losses, key=lambda x: x[0]) if losses else None
+    if halt is not None and halt[0] <= -rc.daily_loss_halt:
+        msgs.append(f"DAILY-LOSS HALT: {halt[1]}; no weight may increase this cycle")
+        for t in weights:
+            capped = _no_increase(weights[t], float(current_weights.get(t, 0.0)))
+            if capped != weights[t]:
+                hits[t].append("risk:daily_loss_halt")
+                weights[t] = capped
+        core = max(0.0, _no_increase(core, float(current_weights.get(bench, 0.0))))
 
     # Backstop: gross and cash floor on the whole book (only scales active weights down).
     gross = sum(abs(w) for w in weights.values())
@@ -240,7 +289,12 @@ def orders_from_target(target: TargetPortfolio, positions: dict[str, float], pri
 
     * The benchmark's target is ``core_weight`` (plus any active weight on it). Held
       tickers absent from the target are sold: a target is the complete desired book.
-    * Trades with ``|delta notional| < no_trade_band * nav`` are skipped (not worth the cost).
+    * Trades with ``|delta notional| < no_trade_band * nav`` are skipped (not worth the cost),
+      except a full exit: a held name whose target is exactly 0 (frozen book, restricted,
+      below the minimum price, no longer covered, or simply absent from the target) is
+      always sold. Upstream construction already applies the band to discretionary
+      trades (it keeps the current weight, not 0), so a 0 here is a decision to exit, and
+      skipping it would leave a sub-band position that no rule could ever remove.
     * Each order's notional is capped at ``max_adv_participation * ADV`` (``adv`` is the
       average daily *dollar* volume) so we never are the market; a message says so.
     * A missing or invalid price or ADV blocks that ticker's order with a message (fail
@@ -276,7 +330,8 @@ def orders_from_target(target: TargetPortfolio, positions: dict[str, float], pri
             continue
         price = float(price)
         delta = w * nav - held * price
-        if delta == 0.0 or abs(delta) < band:
+        full_exit = w == 0.0 and held != 0.0
+        if delta == 0.0 or (abs(delta) < band and not full_exit):
             continue
         a = adv.get(t)
         if not _valid_positive(a):

@@ -136,6 +136,23 @@ def test_property_cash_never_negative_and_nav_identity(seed):
             assert all(q > 0 for q in b.positions().values())
 
 
+def test_dividends_are_credited_to_cash_for_shares_held(tmp_path):
+    """Regression: the paper broker never received dividends, so books earned only the price
+    return while the benchmark and forecasts are total return."""
+    b = PaperBroker(10_000.0, COSTS, state_path=str(tmp_path / "s.json"), allow_short=True)
+    b.submit([_order("AAA", "buy", 10), _order("SHT", "sell", 5)], {"AAA": 100.0, "SHT": 100.0}, "2026-01-02")
+    cash = b.cash()
+    nav = b.nav({"AAA": 100.0, "SHT": 100.0})
+    paid = b.credit_dividends({"AAA": 0.5, "SHT": 0.2, "NOT_HELD": 3.0, "BAD": float("nan")}, "2026-01-05")
+    assert paid == pytest.approx(10 * 0.5 - 5 * 0.2)              # a short pays the dividend to the lender
+    assert b.cash() == pytest.approx(cash + paid) and b.total_dividends == pytest.approx(paid)
+    assert b.nav({"AAA": 100.0, "SHT": 100.0}) == pytest.approx(nav + paid)
+    assert b.credit_dividends({"AAA": -1.0, "SHT": 0.0}, "2026-01-06") == 0.0   # never a debit from bad data
+    restored = PaperBroker(0.0, COSTS)
+    assert restored.load(str(tmp_path / "s.json")) and restored.total_dividends == pytest.approx(paid)
+    assert restored.cash() == pytest.approx(b.cash())
+
+
 def test_save_load_round_trip_and_autosave(tmp_path):
     path = tmp_path / "state" / "broker.json"
     b = PaperBroker(50_000.0, COSTS, state_path=str(path))

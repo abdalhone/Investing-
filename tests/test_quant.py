@@ -112,6 +112,9 @@ def test_too_few_names_or_no_dispersion_makes_a_factor_unavailable():
     assert all(v == 0.0 for s in factor_scores(two).values() for v in s.values())
     views = quant_views(two, 21)
     assert all(v.view.abstain and v.view.prob_outperform == 0.5 for v in views.values())
+    # the reason names the real cause, so a quant-only firm that never trades can say why
+    assert all("only 2 name(s)" in v.view.abstain_reason and "at least 3" in v.view.abstain_reason
+               for v in views.values())
     flat = [_fs(t, mom_12_1=12.0, vol_60d=v) for t, v in (("A1", 20.0), ("A2", 30.0), ("A3", 40.0))]
     s = factor_scores(flat)
     assert all(x["momentum"] == 0.0 for x in s.values())     # identical momentum carries no information

@@ -5,9 +5,14 @@
 #   aifirm backtest --config examples/firm.toml --start 2023-01-01 --end 2025-12-31 --mode quant
 # The reasoning behind each default is in docs/ARCHITECTURE.md (principles P1-P10).
 
+# Unknown keys are errors (a typo never silently leaves a default in force) and numbers are
+# range-checked. Fractions are fractions: 0.10 means 10% (writing 10 is refused).
+
 name = "AI Investment Firm"
 # Where the live book (ledger, forecasts, lessons, paper-broker state, reports) and
-# backtest runs are stored. Creating the file <runs_dir>/KILL stops all orders (kill switch).
+# backtest runs are stored. A relative path is relative to THIS FILE's directory (so this
+# example keeps its books in examples/runs/), never to the directory a command runs from.
+# Creating the file <runs_dir>/KILL stops all orders (kill switch).
 runs_dir = "runs"
 
 [universe]
@@ -30,6 +35,11 @@ benchmark = "SPY"
 # XOM = "Energy"
 # JNJ = "Health care"
 # PG = "Consumer staples"
+
+# Optional SEC filer pins (ticker -> CIK) for fundamentals and filing events. Needed only
+# when SEC's current ticker table points a ticker at the wrong filer for your dates.
+[universe.ciks]
+# FOO = 1234567          # a ticker -> its SEC CIK (digits; leading zeros optional)
 
 [models]
 # Analyst models. With several models listed, repeated samples rotate through them
@@ -59,7 +69,8 @@ challenge_enabled = true         # a red-team round runs only when analysts disa
 challenge_dispersion_threshold = 0.12
 trim_fraction = 0.2              # trimmed log-odds pooling: drop this share of weight from each tail
 memo_enabled = true              # the chair writes an IC memo and may only shrink the edge (P1)
-memo_min_edge = 0.03             # memo when |pooled P - 0.5| >= this, or the name is held
+memo_min_edge = 0.03             # memo when |pooled P - 0.5| >= this, when P clears min_prob_to_hold,
+                                 # or when the name is held; an unreviewed unheld name is not bought
 risk_review_enabled = true
 blind_mode = false               # hide ticker, name and dates from LLMs (historical research)
 news_enabled = true              # live headlines (never used in backtests: not point-in-time)
@@ -83,6 +94,7 @@ dispersion_shrink = 2.0          # edge x max(0, 1 - 2 x analyst disagreement)
 # The invariant risk core (P9). Nothing an LLM says can override these.
 drawdown_derisk = 0.10           # halve the active sleeve at a 10% drawdown from peak NAV
 drawdown_freeze = 0.15           # move the active sleeve to cash at 15%; only a human unfreezes
+                                 # (`aifirm unfreeze --config ... --reason "..."`)
 daily_loss_halt = 0.05           # after a 5% one-day loss, no position may grow this cycle
 max_adv_participation = 0.02     # an order may be at most 2% of 20-day dollar volume
 restricted = []                  # tickers that must never be held

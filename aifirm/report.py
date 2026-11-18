@@ -422,6 +422,8 @@ def render_backtest_report(result: BacktestResult) -> str:
               f"- Commission paid: {_usd(r.costs_usd.get('commission'))}; slippage and impact: "
               f"{_usd(r.costs_usd.get('slippage'))}",
               f"- Total costs: {_pp(s.total_costs_pct, 3)} of NAV",
+              f"- Dividends credited to the strategy book: {_usd(r.dividends_usd)} (books are marked at raw "
+              "closes; dividend cash makes their returns total returns, like the benchmark's)",
               f"- Cycles held by an LLM outage: {sum(1 for x in r.decisions if x.get('held_by_outage'))}; "
               f"book frozen at the end: {'YES' if r.decisions and r.decisions[-1].get('frozen') else 'no'}", ""]
 

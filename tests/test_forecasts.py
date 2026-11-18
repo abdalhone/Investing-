@@ -143,6 +143,31 @@ def test_store_round_trip_persistence_and_idempotent_add(tmp_path):
         assert len(reopened.all()) == len(recs)
 
 
+def test_a_question_is_stored_and_scored_once_across_runs(tmp_path):
+    """A forced re-decision of the same session (new run_id) must not store or score the same
+    questions twice; the first forecast of a question stands."""
+    from aifirm.journal.forecasts import question_key, scorecard
+
+    as_of = str(DATES[2].date())
+    first = make_forecast_records("run-a", as_of, [_view("technical", 0.7)], _agg(0.7), _cfg(), DATES)
+    again = make_forecast_records("run-b", as_of, [_view("technical", 0.2)], _agg(0.2), _cfg(), DATES)
+    assert [question_key(r) for r in first] == [question_key(r) for r in again]
+    with ForecastStore(tmp_path / "f.sqlite") as store:
+        assert store.add(first) == first
+        assert store.add(again) == [] and store.add(first) == first     # repeats dropped; re-adding is a no-op
+        assert store.all() == sorted(first, key=lambda r: (r.as_of, r.id))
+        later = make_forecast_records("run-b", str(DATES[3].date()), [_view("technical", 0.2)], _agg(0.2), _cfg(),
+                                      DATES)
+        assert store.add(later) == later                                 # a new session is a new question
+        resolved = store.resolve(_prices(), str(DATES[-1].date()))
+    # a store written before the rule may hold both copies: the scorecard still counts each question once
+    dupes = [r.model_copy(update={"resolved": True, "outcome": 1, "brier": (r.prob_outperform - 1) ** 2})
+             for r in first + again]
+    card = scorecard(dupes)
+    assert card["technical"]["n"] == 1 and card["technical"]["brier"] == pytest.approx(0.09)
+    assert len(resolved) == 4
+
+
 def test_resolve_uses_adjusted_close_total_returns(tmp_path):
     prices = _prices()
     as_of = str(DATES[2].date())
@@ -180,9 +205,9 @@ def test_resolve_is_point_in_time_and_waits_for_data(tmp_path):
         assert len(store.resolve(prices, resolve_on)) == 2
 
 
-def test_resolve_leaves_missing_prices_pending(tmp_path):
+def test_resolve_leaves_unknowable_records_pending_with_a_reason(tmp_path):
     prices = _prices()
-    prices.adj_close.loc[DATES[2 + H], "AAA"] = np.nan                       # halted on the resolution date
+    prices.adj_close.loc[DATES[2 + H - 3]:DATES[2 + H + 2], "AAA"] = np.nan    # halted for a week around resolution
     as_of = str(DATES[2].date())
     recs = (make_forecast_records("r", as_of, [_view("technical", 0.6)], _agg(), _cfg(), DATES)
             + make_forecast_records("r", as_of, [_view("technical", 0.6, ticker="ZZZ")], _agg(ticker="ZZZ"),
@@ -191,6 +216,41 @@ def test_resolve_leaves_missing_prices_pending(tmp_path):
         store.add(recs)
         assert store.resolve(prices, str(DATES[-1].date())) == []
         assert not any(r.resolved for r in store.all())
+        reasons = store.unresolvable
+        assert set(reasons) == {r.id for r in recs}                          # every due record says why
+        assert all("no price series for ZZZ" in why for rid, why in reasons.items() if "|ZZZ|" in rid)
+        assert all("resolution date" in why for rid, why in reasons.items() if "|AAA|" in rid)
+        # waiting for data is normal and gives no reason (ZZZ has no series at all, so it still does)
+        assert store.resolve(prices.as_of(DATES[2 + H - 1]), str(DATES[-1].date())) == []
+        assert set(store.unresolvable) == {r.id for r in recs if r.ticker == "ZZZ"}
+
+
+@pytest.mark.parametrize("gap", ["resolution", "decision", "benchmark"])
+def test_one_missing_print_uses_the_last_common_close_instead_of_blocking_forever(tmp_path, gap):
+    """Regression: a single NaN print of the ticker or the benchmark on the decision or the
+    resolution date used to leave the record unresolved forever. It now uses the last close
+    on or before that date on which both series have a price (both legs, same window)."""
+    prices = _prices()
+    i0, i1 = 2, 2 + H
+    as_of = str(DATES[i0].date())
+    recs = make_forecast_records("r", as_of, [_view("technical", 0.6)], _agg(), _cfg(), DATES)
+    assert recs[0].resolve_on == str(DATES[i1].date())
+    adj = prices.adj_close.copy()
+    if gap == "resolution":
+        prices.adj_close.loc[DATES[i1], "AAA"] = np.nan
+        j0, j1 = i0, i1 - 1
+    elif gap == "decision":
+        prices.adj_close.loc[DATES[i0], "AAA"] = np.nan
+        j0, j1 = i0 - 1, i1
+    else:
+        prices.adj_close.loc[DATES[i0], "SPY"] = np.nan
+        j0, j1 = i0 - 1, i1
+    with ForecastStore(tmp_path / "f.sqlite") as store:
+        store.add(recs)
+        done = store.resolve(prices, str(DATES[-1].date()))
+        assert len(done) == 2 and store.unresolvable == {}
+    expected = (adj["AAA"].iloc[j1] / adj["AAA"].iloc[j0] - adj["SPY"].iloc[j1] / adj["SPY"].iloc[j0]) * 100
+    assert all(r.realized_excess_return_pct == pytest.approx(expected) for r in done)
 
 
 def test_resolution_is_not_reset_by_re_adding(tmp_path):

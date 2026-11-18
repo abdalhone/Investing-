@@ -20,7 +20,7 @@ from __future__ import annotations
 from ..config import FirmConfig
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
 from ..schemas import ForecastRecord, Lesson
-from .analysts import BLIND_ALIAS, blind_ids_in_text
+from .analysts import BLIND_ALIAS, scrub_identity
 
 FORECAST_PROB_LABEL = "Forecast probability that the stock beats the benchmark"
 OUTCOME_LABEL = "Outcome"
@@ -52,7 +52,8 @@ def lesson_user_prompt(forecast: ForecastRecord, view_summary: str, blind: bool)
                 if forecast.realized_excess_return_pct is not None else "")
     stock = f"{BLIND_ALIAS} (identity withheld)" if blind else forecast.ticker
     when = "" if blind else f" | made on {forecast.as_of}, resolved on {forecast.resolve_on}"
-    summary = blind_ids_in_text(view_summary, forecast.ticker) if blind else view_summary
+    # blind: the ticker (also inside fact IDs), CIKs and URLs are scrubbed from the stored summary
+    summary = scrub_identity(view_summary, forecast.ticker) if blind else view_summary
     return "\n".join([
         "RESOLVED FORECAST",
         f"Forecaster: {forecast.agent}",

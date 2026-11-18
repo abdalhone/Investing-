@@ -15,24 +15,37 @@ What makes it honest, and why each rule exists:
   passes, and believability weights and lessons use outcomes resolved by the decision
   date only. Changing any price after a date cannot change a decision on that date (a
   test perturbs future prices to prove it).
-* **Daily mark to market** at the close, so drawdowns between rebalances are visible.
+* **Daily mark to market** at the close, so drawdowns between rebalances are visible,
+  and every daily NAV reaches the risk engine: at each decision ``decide`` receives the
+  NAV path since the previous one, which raises the high-water mark and feeds the worst
+  one-day loss to the daily-loss halt (P9).
+* **Total-return accounting.** Books are marked at raw closes and fill at raw opens, and
+  each ex-date's cash dividend (inferred from the adjusted vs raw closes,
+  :func:`aifirm.pipeline.implied_dividends`) is credited to the paper broker for the
+  shares held at the previous close. The benchmark baseline is built from the *same*
+  raw closes and dividend amounts, so a book that holds the benchmark earns exactly the
+  benchmark's return before costs, and forecasts (scored on total return) and P&L agree.
 * **Baselines through the same engine.** Benchmark buy-and-hold (no costs: it is the
   investable alternative), an equal-weight universe rebalanced on the same schedule with
   the same costs, and (unless the run *is* quant-only) the deterministic quant analyst
   alone. If an LLM committee cannot beat the quant-only run, the LLMs add nothing.
+* **Turnover** is reported one-way: half the traded notional over NAV per fill date, the
+  same definition ``max_turnover`` caps.
 * **Training contamination (P10).** An LLM may have memorised what happened in the
   period covered by its training data, so a decision made on or before the model's
   training cutoff can "predict" an outcome it has already seen. Returns earned on such
   decisions are reported separately as *contaminated* and never count as evidence of
   skill. An unknown cutoff is treated as "today" (everything contaminated).
 * **Multiple testing.** Each run is appended to ``<runs_dir>/trials.jsonl``; the number of
-  distinct (config fingerprint, mode) pairs tried feeds the deflated Sharpe ratio
-  (Bailey and Lopez de Prado). Trying many variants and reporting the best is exactly
-  what DSR corrects for, so the trial ledger must be complete to be meaningful.
+  distinct (config fingerprint, mode, start, end) trials feeds the deflated Sharpe ratio
+  (Bailey and Lopez de Prado). Trying many variants, or one variant over many windows,
+  and reporting the best is exactly what DSR corrects for, so the trial ledger must be
+  complete to be meaningful.
 
 Known limitations (also stated in the report): a universe chosen today is biased toward
-survivors; costs are modelled, not observed; no taxes, borrow fees or corporate-action
-cash flows beyond what adjusted prices capture.
+survivors; costs are modelled, not observed; no taxes, withholding or borrow fees; cash
+distributions are inferred from Yahoo's adjusted closes (ordinary dividends and other
+distributions alike), not read from a corporate-actions feed.
 """
 
 from __future__ import annotations
@@ -58,7 +71,7 @@ from ..execution.broker import PaperBroker
 from ..journal import ForecastStore, Ledger, LessonStore, scorecard
 from ..llm.client import LLM
 from ..pipeline import (PRICE_LOOKBACK_DAYS, FilingsLoader, FundamentalsLoader, MacroLoader, MarketSnapshot, decide,
-                        gather_data, market_snapshot, quant_only_config, universe)
+                        gather_data, implied_dividends, market_snapshot, quant_only_config, universe)
 from ..portfolio import RiskState, orders_from_target
 from ..schemas import Order, TargetPortfolio, TargetPosition
 from .metrics import PerformanceReport, performance_report
@@ -70,8 +83,10 @@ _ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 log = logging.getLogger(__name__)
 
-# policy(decision date, broker, nav at that close, previous close nav, marks) -> (orders, market, record)
-Policy = Callable[[pd.Timestamp, PaperBroker, float, float | None, dict[str, float]],
+# policy(decision date, broker, nav at that close, previous close nav, marks, nav path) -> (orders, market, record)
+# The nav path is the closing NAV of every day since the previous decision (that decision's NAV
+# first), excluding today; empty at the first decision.
+Policy = Callable[[pd.Timestamp, PaperBroker, float, float | None, dict[str, float], list[float]],
                   tuple[list[Order], MarketSnapshot, dict]]
 
 
@@ -102,7 +117,7 @@ class BacktestResult:
     returns: pd.Series
     benchmark_returns: pd.Series
     baseline_returns: dict[str, pd.Series]
-    turnover: pd.Series                 # traded notional / NAV, per fill date
+    turnover: pd.Series                 # one-way: 0.5 * traded notional / NAV, per fill date
     costs: pd.Series                    # commission + slippage / NAV, per fill date
     decisions: list[dict]
     reports: dict[str, PerformanceReport]
@@ -114,6 +129,7 @@ class BacktestResult:
     usage: dict
     costs_usd: dict[str, float]
     warnings: list[str] = field(default_factory=list)
+    dividends_usd: float = 0.0          # net dividend cash credited to the strategy book
 
 
 # --------------------------------------------------------------------------- simulation core
@@ -128,18 +144,22 @@ class _Sim:
     decision_dates: list[pd.Timestamp]
     commission_usd: float
     slippage_usd: float
+    dividends_usd: float = 0.0
 
 
 def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebalance_days: set[pd.Timestamp],
               policy: Policy) -> _Sim:
     """The daily loop shared by the strategy and every traded baseline.
 
-    Each trading day: (1) orders decided at the previous rebalance close fill at today's
-    open; (2) the book is marked at today's close; (3) on a rebalance day the policy
-    decides at today's close. The last day never decides (there is no next open)."""
+    Each trading day: (1) cash dividends with an ex-date today are credited for the shares
+    held at the previous close; (2) orders decided at the previous rebalance close fill at
+    today's open; (3) the book is marked at today's close; (4) on a rebalance day the policy
+    decides at today's close, seeing the NAV path since its previous decision. The last day
+    never decides (there is no next open)."""
     broker = PaperBroker(cfg.execution.initial_cash, cfg.costs)
     close_ff = prices.close.ffill()           # a missing close is marked at the last known close
     opens = prices.open if prices.open is not None else prices.close
+    dividends = implied_dividends(prices)
     navs: dict[pd.Timestamp, float] = {}
     turnover: dict[pd.Timestamp, float] = {}
     costs: dict[pd.Timestamp, float] = {}
@@ -147,7 +167,12 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
     decision_dates: list[pd.Timestamp] = []
     pending: tuple[list[Order], MarketSnapshot, float, dict] | None = None
     prev_nav: float | None = None
+    since_decision: list[float] = []          # closing NAVs from the last decision through yesterday
     for i, d in enumerate(days):
+        if i > 0 and broker.positions():      # the holder at the previous close receives the dividend
+            row_div = dividends.loc[d]
+            broker.credit_dividends({t: float(row_div[t]) for t in broker.positions()
+                                     if t in row_div.index and row_div[t] > 0}, _day(d))
         if pending is not None:
             orders, market, decision_nav, rec = pending
             fill_px = {}
@@ -156,7 +181,7 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
                 if math.isfinite(px) and px > 0:
                     fill_px[o.ticker] = float(px)
             fills = broker.submit(orders, fill_px, _day(d), market.adv, market.daily_vol)
-            turnover[d] = sum(f.quantity * f.price for f in fills) / decision_nav
+            turnover[d] = 0.5 * sum(f.quantity * f.price for f in fills) / decision_nav     # one-way
             costs[d] = sum(f.commission + f.slippage_cost for f in fills) / decision_nav
             rec["fill_date"] = _day(d)
             rec["fills"] = [f.model_dump() for f in fills]
@@ -167,18 +192,32 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
         nav = broker.nav(marks)
         navs[d] = nav
         if d in rebalance_days and i + 1 < len(days):
-            orders, market, rec = policy(d, broker, nav, prev_nav, marks)
+            orders, market, rec = policy(d, broker, nav, prev_nav, marks, list(since_decision))
             rec.update({"as_of": _day(d), "nav": nav,
                         "orders": [{"ticker": o.ticker, "side": o.side, "quantity": o.quantity,
                                     "notional": o.notional} for o in orders]})
             records.append(rec)
             decision_dates.append(d)
+            since_decision = []
             if orders:
                 pending = (orders, market, nav, rec)
+        since_decision.append(nav)
         prev_nav = nav
     return _Sim(nav=pd.Series(navs, dtype=float), turnover=pd.Series(turnover, dtype=float),
                 costs=pd.Series(costs, dtype=float), decisions=records, decision_dates=decision_dates,
-                commission_usd=broker.total_commission, slippage_usd=broker.total_slippage)
+                commission_usd=broker.total_commission, slippage_usd=broker.total_slippage,
+                dividends_usd=broker.total_dividends)
+
+
+def _total_returns(prices: PriceData, ticker: str, days: pd.DatetimeIndex) -> pd.Series:
+    """Daily total returns of ``ticker`` on ``days[1:]`` from raw closes plus the same implied
+    dividends the paper broker credits: ``(close_t + D_t) / close_{t-1} - 1``. A missing
+    print is forward-filled (the move across a gap lands on the next print instead of
+    being dropped), so a book holding ``ticker`` and this series agree exactly."""
+    close = prices.close[ticker].ffill()
+    div = implied_dividends(prices)[ticker]
+    tr = (close + div) / close.shift(1) - 1.0
+    return tr.reindex(days).iloc[1:].fillna(0.0)
 
 
 class _CommitteePolicy:
@@ -195,19 +234,20 @@ class _CommitteePolicy:
         self.state: RiskState | None = None
         self.cycles = 0
         self._warning_counts: Counter[str] = Counter()     # insertion-ordered: first seen first
+        self.final_warnings: list[str] = []
 
     def __call__(self, d: pd.Timestamp, broker: PaperBroker, nav: float, prev_nav: float | None,
-                 marks: dict[str, float]) -> tuple[list[Order], MarketSnapshot, dict]:
+                 marks: dict[str, float], nav_path: list[float]) -> tuple[list[Order], MarketSnapshot, dict]:
         as_of = _day(d)
         _, factsheets = gather_data(self.cfg, as_of, live=False, prices=self.prices, **self.loaders)
         if self.state is None:
-            self.state = RiskState(peak_nav=nav)
+            self.state = RiskState(peak_nav=nav_path[0] if nav_path else nav)
         held = broker.positions()
         current = {t: q * marks[t] / nav for t, q in held.items() if t in marks}
         dec = decide(self.cfg, self.llm, as_of, self.prices, factsheets, current_weights=current, nav=nav,
                      prev_nav=prev_nav, risk_state=self.state, forecast_store=self.store, lesson_store=self.lessons,
                      ledger=self.ledger, run_id=self.run_id, positions=held,
-                     trading_calendar=self.prices.close.index, runs_dir=str(self.run_dir))
+                     trading_calendar=self.prices.close.index, runs_dir=str(self.run_dir), nav_marks=nav_path)
         self.state = dec.risk_state
         self.cycles += 1
         messages = [*dec.warnings, *(f"{t}: {g}" for t, gaps in dec.data_gaps.items() for g in gaps)]
@@ -231,8 +271,10 @@ class _CommitteePolicy:
 
     @property
     def warnings(self) -> list[str]:
-        """Distinct warnings and data gaps (dates masked) with how many decisions they affected."""
-        return [f"{w} ({n} of {self.cycles} decisions)" for w, n in self._warning_counts.items()]
+        """Distinct warnings and data gaps (dates masked) with how many decisions they affected,
+        then anything found when the run was scored at its end."""
+        return [*(f"{w} ({n} of {self.cycles} decisions)" for w, n in self._warning_counts.items()),
+                *self.final_warnings]
 
     def run(self, prices: PriceData, days: pd.DatetimeIndex, rebalance_days: set[pd.Timestamp],
             end: str) -> tuple[_Sim, dict[str, dict]]:
@@ -241,6 +283,8 @@ class _CommitteePolicy:
         try:
             sim = _simulate(prices, self.cfg, days, rebalance_days, self)
             self.store.resolve(prices, end)
+            for why, n in Counter(self.store.unresolvable.values()).items():
+                self.final_warnings.append(f"{n} forecast(s) due by {end} could not be resolved: {why}")
             return sim, scorecard(self.store.all(), as_of=end)
         finally:
             self.store.close()
@@ -252,7 +296,7 @@ def _equal_weight_policy(cfg: FirmConfig, prices: PriceData) -> Policy:
     names_all = universe(cfg)
 
     def policy(d: pd.Timestamp, broker: PaperBroker, nav: float, prev_nav: float | None,
-               marks: dict[str, float]) -> tuple[list[Order], MarketSnapshot, dict]:
+               marks: dict[str, float], nav_path: list[float]) -> tuple[list[Order], MarketSnapshot, dict]:
         market = market_snapshot(prices, _day(d), {*names_all, bench, *broker.positions()})
         names = [t for t in names_all if t in market.prices]
         w = (1.0 - cfg.portfolio.min_cash) / len(names) if names else 0.0
@@ -307,19 +351,24 @@ def _report_or_none(r: pd.Series, bench: pd.Series, n_trials: int) -> Performanc
     return performance_report(r, bench.reindex(r.index), n_trials=n_trials)
 
 
-def _count_trials(path: Path, fingerprint: str, mode: str) -> int:
-    """Distinct (fingerprint, mode) pairs in the trial ledger, including this one."""
-    pairs = {(fingerprint, mode)}
+def _count_trials(path: Path, fingerprint: str, mode: str, start: str, end: str) -> int:
+    """Distinct (fingerprint, mode, start, end) trials in the trial ledger, including this one.
+
+    The backtest window is part of the trial: re-running one configuration over many
+    windows and keeping the best is the same selection DSR corrects for. Re-running the
+    identical (configuration, mode, window) is not a new trial. Every ledger row carries
+    its window, so older rows count correctly too."""
+    trials = {(fingerprint, mode, start, end)}
     if path.exists():
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
             try:
                 entry = json.loads(line)
-                pairs.add((str(entry["fingerprint"]), str(entry["mode"])))
+                trials.add((str(entry["fingerprint"]), str(entry["mode"]), str(entry["start"]), str(entry["end"])))
             except (json.JSONDecodeError, KeyError, TypeError):
                 log.warning("%s line %d is not a valid trial record; skipped", path, n)
-    return len(pairs)
+    return len(trials)
 
 
 def _append_trial(path: Path, entry: dict) -> None:
@@ -350,7 +399,9 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     through ``end``. The loaders default to the live SEC / FRED sources (point-in-time);
     inject them to run offline. Rebalances happen every ``cfg.process.rebalance_every_days``
     trading days starting at the first trading day on or after ``start``.
-    Artifacts (ledger, forecasts, lessons) go to ``<runs_dir>/backtests/<run_id>/``.
+    Artifacts (ledger, forecasts, lessons) go to ``<runs_dir>/backtests/<run_id>/`` and the
+    trial ledger to ``<runs_dir>/trials.jsonl``, with ``runs_dir`` resolved by
+    :meth:`FirmConfig.runs_path` (relative to the config file, not the working directory).
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -375,7 +426,7 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
 
     fingerprint = cfg.fingerprint()
     run_id = run_id or f"bt-{time.strftime('%Y%m%dT%H%M%S')}-{mode}-{secrets.token_hex(3)}"
-    run_dir = Path(cfg.runs_dir) / "backtests" / run_id
+    run_dir = cfg.runs_path() / "backtests" / run_id
     loaders = {"fundamentals_loader": fundamentals_loader, "macro_loader": macro_loader,
                "filings_loader": filings_loader}
 
@@ -386,8 +437,9 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     sim, card = policy.run(prices, days, rebalance_days, end_s)
     warnings = list(policy.warnings)
 
-    # baselines through the same engine
-    bench_ret = prices.adj_close[bench].reindex(days).pct_change(fill_method=None).iloc[1:].fillna(0.0)
+    # baselines through the same engine; the benchmark uses the same total-return accounting as
+    # the books (raw closes + implied dividends, missing prints forward-filled)
+    bench_ret = _total_returns(prices, bench, days)
     ew = _simulate(prices, cfg, days, rebalance_days, _equal_weight_policy(cfg, prices))
     baseline_returns = {"benchmark": bench_ret, "equal_weight": ew.nav.pct_change().iloc[1:]}
     baseline_sims = {"equal_weight": ew}
@@ -399,8 +451,8 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
         baseline_sims["quant_only"] = q_sim
 
     returns = sim.nav.pct_change().iloc[1:]
-    trials_path = Path(cfg.runs_dir) / TRIALS_FILE
-    n_trials = _count_trials(trials_path, fingerprint, mode)
+    trials_path = cfg.runs_path() / TRIALS_FILE
+    n_trials = _count_trials(trials_path, fingerprint, mode, start_s, end_s)
     reports = {"strategy": performance_report(returns, bench_ret, sim.turnover, sim.costs, n_trials=n_trials),
                "benchmark": performance_report(bench_ret, bench_ret)}
     for name, s in baseline_sims.items():
@@ -427,4 +479,5 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
         pre_cutoff_report=pre, post_cutoff_report=post, model_cutoff=cutoff, n_trials=n_trials, scorecard=card,
         usage=strat_llm.usage.summary() if strat_llm is not None else {},
         costs_usd={"commission": sim.commission_usd, "slippage": sim.slippage_usd}, warnings=warnings,
+        dividends_usd=sim.dividends_usd,
     )

@@ -8,6 +8,12 @@ Why it can only reduce (P1, P9): the reviewer outputs per-name multipliers in [0
 an optional halt; :func:`apply_risk_review` clamps them, so no wording can raise or
 reverse a position. The deterministic risk engine runs afterwards regardless.
 
+What a halt means (the schema, the prompt and the code say the same thing): **no trades
+this cycle**. Every position and the passive core stay at their current weights; nothing
+is bought or sold because of the review. A halt is the brake for broken data or a
+systemic problem, where any trade could be wrong, so it must not itself trigger a wave of
+sales. To cut risk, the reviewer uses multipliers (0 removes a position).
+
 Failure handling: a failed review returns ``None`` and leaves the target unchanged. The
 review is an extra layer that can only reduce risk; an API outage should not by itself
 liquidate the book, and the invariant risk engine still applies its hard limits.
@@ -15,12 +21,14 @@ liquidate the book, and the invariant risk engine still applies its hard limits.
 
 from __future__ import annotations
 
+import math
 import re
+from typing import Mapping
 
 from ..config import FirmConfig
 from ..data.factsheet import FactSheet
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
-from ..schemas import RiskReview, TargetPortfolio, clamp
+from ..schemas import RiskReview, TargetPortfolio, TargetPosition, clamp
 from .analysts import EVIDENCE_RULES, blind_factsheet, fact_section
 
 PORTFOLIO_TICKER = "PORTFOLIO"
@@ -32,7 +40,7 @@ You are the portfolio risk reviewer of an equity fund. Code built the target por
 YOUR AUTHORITY
 - You can only reduce risk. For each position you want to change, give a multiplier between 0 and 1: 1 = no change, about 0.75 = modest trim, about 0.5 = serious concern, 0 = remove. You cannot increase a position, add a name or change a direction.
 - Use ticker "{PORTFOLIO_TICKER}" for a book-level concern; its multiplier scales every active position.
-- halt_trading=true sets every active position to zero this cycle (the passive core is unaffected). Use it only for obviously broken data or a systemic problem, never to express a market view.
+- halt_trading=true halts ALL trading this cycle: every position, and the passive core, stays at its current weight; nothing is bought or sold. It does not liquidate anything. Use it only for obviously broken data or a systemic problem that makes any trade unsafe, never to express a market view. To cut or remove positions, use multipliers instead.
 - Never propose weights, share counts or dollar amounts.
 
 WHAT TO LOOK FOR
@@ -120,33 +128,67 @@ def review_portfolio(llm: LLM, target: TargetPortfolio, factsheets: dict[str, Fa
     return review
 
 
-def apply_risk_review(target: TargetPortfolio, review: RiskReview | None) -> TargetPortfolio:
-    """Scale positions down by the review's multipliers (clamped to [0, 1]); a halt sets all
-    active weights to 0. Several concerns on one name use the smallest multiplier; a
-    PORTFOLIO concern multiplies every name. Freed weight goes to cash. Returns a copy."""
+def _halt_target(target: TargetPortfolio, review: RiskReview, current_weights: Mapping[str, float],
+                 benchmark: str | None) -> TargetPortfolio:
+    """The current book, unchanged: a halt means no trades this cycle. ``benchmark`` names the
+    passive-core leg of ``current_weights``; if it is not given, current legs that are not
+    active positions of ``target`` are taken to be the core (the construction engine lists
+    every held active name among the target's positions)."""
+    current = {t: float(w) for t, w in current_weights.items() if math.isfinite(float(w))}
+    out = target.model_copy(deep=True)
+    listed = {p.ticker for p in out.positions}
+    core_legs = ({benchmark} if benchmark else set(current) - listed) - listed
+    for t in sorted(set(current) - listed - core_legs):
+        if current[t] != 0.0:
+            out.positions.append(TargetPosition(ticker=t, weight=current[t], prob_outperform=0.5,
+                                                expected_excess_return_pct=0.0, rationale=""))
+    for p in out.positions:
+        new_weight = current.get(p.ticker, 0.0)
+        if new_weight != p.weight:
+            p.constraints_hit.append("risk_review_halt")
+        p.weight = new_weight
+    out.core_weight = sum(current.get(t, 0.0) for t in core_legs)
+    out.cash_weight = 1.0 - out.core_weight - sum(p.weight for p in out.positions)
+    out.notes.append(f"risk review halt: no trades this cycle, every weight kept at its current value ({review.summary})")
+    return out
+
+
+def apply_risk_review(target: TargetPortfolio, review: RiskReview | None,
+                      current_weights: Mapping[str, float] | None = None,
+                      benchmark: str | None = None) -> TargetPortfolio:
+    """Scale positions down by the review's multipliers (clamped to [0, 1]). Several
+    concerns on one name use the smallest multiplier; a PORTFOLIO concern multiplies every
+    name. Freed weight goes to cash. Returns a copy.
+
+    A halt means **no trades this cycle**: with ``current_weights`` (fractions of NAV per
+    ticker, including the ``benchmark`` core leg) the result is the current book, so the
+    review causes no sale and no purchase. A halt without ``current_weights`` raises
+    ``ValueError``: the current book is unknown, and any guess would be a trade (zeroing the
+    sleeve would liquidate it, which the reviewer is told a halt never does). In
+    :func:`aifirm.pipeline.decide` an error stops the cycle with no orders."""
     out = target.model_copy(deep=True)
     if review is None:
         return out
     if review.halt_trading:
-        mults = {p.ticker: 0.0 for p in out.positions}
-        out.notes.append(f"risk review halt: all active weights set to 0 ({review.summary})")
-    else:
-        book = min((clamp(c.multiplier, 0.0, 1.0) for c in review.concerns
-                    if c.ticker.strip().upper() == PORTFOLIO_TICKER), default=1.0)
-        per_name: dict[str, float] = {}
-        reasons: dict[str, list[str]] = {}
-        for c in review.concerns:
-            t = c.ticker.strip().upper()
-            if t != PORTFOLIO_TICKER:
-                per_name[t] = min(per_name.get(t, 1.0), clamp(c.multiplier, 0.0, 1.0))
-                reasons.setdefault(t, []).append(c.concern)
-        mults = {p.ticker: book * per_name.get(p.ticker.upper(), 1.0) for p in out.positions}
-        if book < 1.0:
-            out.notes.append(f"risk review: book-level multiplier {book:.2f}")
-        for p in out.positions:
-            if p.weight != 0 and mults[p.ticker] < 1.0 and p.ticker.upper() in reasons:
-                out.notes.append(f"risk review: {p.ticker} x{per_name[p.ticker.upper()]:.2f} "
-                                 f"({'; '.join(reasons[p.ticker.upper()])})")
+        if current_weights is None:
+            raise ValueError("a risk-review halt keeps the current book: pass current_weights to apply_risk_review")
+        return _halt_target(target, review, current_weights, benchmark)
+    book = min((clamp(c.multiplier, 0.0, 1.0) for c in review.concerns
+                if c.ticker.strip().upper() == PORTFOLIO_TICKER), default=1.0)
+    per_name: dict[str, float] = {}
+    reasons: dict[str, list[str]] = {}
+    for c in review.concerns:
+        t = c.ticker.strip().upper()
+        if t != PORTFOLIO_TICKER:
+            per_name[t] = min(per_name.get(t, 1.0), clamp(c.multiplier, 0.0, 1.0))
+            reasons.setdefault(t, []).append(c.concern)
+    mults = {p.ticker: book * per_name.get(p.ticker.upper(), 1.0) for p in out.positions}
+    if book < 1.0:
+        out.notes.append(f"risk review: book-level multiplier {book:.2f}")
+    for p in out.positions:
+        if p.weight != 0 and mults[p.ticker] < 1.0 and p.ticker.upper() in reasons:
+            out.notes.append(f"risk review: {p.ticker} x{per_name[p.ticker.upper()]:.2f} "
+                             f"({'; '.join(reasons[p.ticker.upper()])})")
     freed = 0.0
     for p in out.positions:
         m = mults[p.ticker]
