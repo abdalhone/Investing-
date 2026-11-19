@@ -30,12 +30,17 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   its weight is capped at ``0.5 * |ideal_weight|``. Halving the incoming target instead
   would compound with partial rebalancing (the target is a step from a book that was
   already halved last cycle), selling into the drawdown every cycle toward about a third of
-  the ideal. A *deliberate hold* (:data:`HOLD_LABELS`: an LLM-outage hold, a held name
-  whose memo failed, a held name with no view, a risk-review halt) is halved only on the
-  cycle the de-risk triggers, when the held book is still full size; on every later cycle
-  of the episode it keeps its weight, because that weight is already the de-risked one and
-  an LLM outage must never force a sale. A leg without an ``ideal_weight`` (a hand-built
-  target) is halved.
+  the ideal. The plan includes the LLM risk reviewer's cut: a reviewer multiplier ``m``
+  scales ``ideal_weight`` too (:func:`aifirm.agents.risk_review.apply_risk_review`), so a
+  reviewed leg is capped at ``0.5 * m * |ideal|``, half of the reviewed plan. A *deliberate
+  hold* (:data:`HOLD_LABELS`: an LLM-outage hold, a held name whose memo failed, a held name
+  with no view, a risk-review halt) is halved on the cycle the de-risk triggers, when the
+  held book is still full size. The weight the de-risk sets for every leg is recorded in
+  ``state.derisk_caps``; on every later cycle of the episode a hold keeps its current weight
+  up to that recorded level (an LLM outage must never force a sale, and a hold is never sold
+  below it), and is cut to it only when the earlier sale did not execute (an order blocked
+  for a missing price or ADV, or rejected). The record is cleared on re-risk, on a freeze
+  and on a human reset. A leg without an ``ideal_weight`` (a hand-built target) is halved.
 * **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
   may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
 * **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more on *any*
@@ -64,7 +69,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..config import FirmConfig
@@ -88,8 +93,10 @@ class RiskState:
     the book freezes and kept after a human clears ``frozen``, which is how the next cycle
     recognises the human reset (see the module docstring). ``trough_nav``: the lowest NAV
     mark since the last peak (:func:`update_risk_state`); ``derisked``: the drawdown
-    de-risk is in force until half of the drawdown is recovered. Both default so that a
-    state saved before they existed loads unchanged."""
+    de-risk is in force until half of the drawdown is recovered; ``derisk_caps``: during a
+    de-risk episode, the absolute weight the de-risk last set for each leg (a deliberate
+    hold is never kept above it). They default so that a state saved before they existed
+    loads unchanged."""
 
     peak_nav: float
     frozen: bool = False
@@ -98,6 +105,7 @@ class RiskState:
     frozen_at_nav: float | None = None
     trough_nav: float | None = None
     derisked: bool = False
+    derisk_caps: dict[str, float] = field(default_factory=dict)
 
 
 def _valid_positive(x: object) -> bool:
@@ -222,6 +230,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         state.frozen_at_nav = None
         state.trough_nav = float(nav)
         state.derisked = False
+        state.derisk_caps = {}
 
     # Drawdown: freeze (sticky) or de-risk.
     peak = max(float(state.peak_nav), float(nav))
@@ -239,6 +248,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             if weights[t] != 0.0:
                 hits[t].append("risk:drawdown_freeze")
             weights[t] = 0.0
+        state.derisk_caps = {}
     else:
         trough = min(float(state.trough_nav), float(nav)) if _valid_positive(state.trough_nav) else float(nav)
         recovery = trough + 0.5 * (peak - trough)        # half of the peak-to-trough drawdown recovered
@@ -248,41 +258,62 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             halve = True
             newly = not state.derisked
             state.derisked = True
-            msgs.append(f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights "
-                        f"halved until half of the drawdown is recovered")
+            why = (f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights capped at "
+                   f"half of the un-derisked plan until half of the drawdown is recovered")
         elif state.derisked and float(nav) < recovery and float(nav) < peak:
             halve = True
-            msgs.append(f"drawdown de-risk still in force: {drawdown:.1%} from peak, but less than half of the "
-                        f"drawdown from {peak:,.2f} to the trough {trough:,.2f} is recovered (full gross at NAV "
-                        f">= {recovery:,.2f}); active weights halved")
+            why = (f"drawdown de-risk still in force: {drawdown:.1%} from peak, but less than half of the drawdown "
+                   f"from {peak:,.2f} to the trough {trough:,.2f} is recovered (full gross at NAV >= {recovery:,.2f}); "
+                   f"active weights capped at half of the un-derisked plan")
         elif state.derisked:
             state.derisked = False
+            state.derisk_caps = {}
             msgs.append(f"re-risk: half of the drawdown from {peak:,.2f} to the trough {trough:,.2f} recovered (NAV "
                         f"{float(nav):,.2f}); full gross restored")
         if halve:
             by_ticker = {p.ticker: p for p in target.positions}
-            kept = []
+            caps = {} if newly else dict(state.derisk_caps)   # rebound, never mutated: copies of the state share it
+            cut, kept, finished = [], [], []
             for t in weights:
                 if weights[t] == 0.0:
                     continue
                 pos = by_ticker[t]
                 ideal = pos.ideal_weight
                 if HOLD_LABELS.intersection(pos.constraints_hit):
-                    if not newly:          # already halved when the episode began: never sell a hold again
+                    if newly:          # the held book is still full size: halve it once
+                        new_w = weights[t] * DERISK_FACTOR
+                    elif t in caps and abs(weights[t]) - caps[t] >= max(pc.no_trade_band, CAP_NOISE):
+                        # the level the de-risk set earlier in the episode was not reached (the sale did
+                        # not execute): finish it, but never sell a hold below that level. A gap under
+                        # the no-trade band (share rounding, a small drift) would not trade anyway.
+                        new_w = math.copysign(caps[t], weights[t])
+                        finished.append(t)
+                    else:
+                        new_w = weights[t]
                         kept.append(t)
-                        continue
-                    new_w = weights[t] * DERISK_FACTOR
                 elif ideal is not None and math.isfinite(float(ideal)):
                     cap = DERISK_FACTOR * abs(float(ideal))
                     new_w = math.copysign(min(abs(weights[t]), cap), weights[t])
                 else:
                     new_w = weights[t] * DERISK_FACTOR
+                if t in kept:
+                    caps.setdefault(t, abs(new_w))     # a hold's drift never moves the recorded level
+                else:
+                    caps[t] = abs(new_w)
                 if new_w != weights[t]:
                     weights[t] = new_w
                     hits[t].append("risk:drawdown_derisk")
+                    cut.append(t)
+            state.derisk_caps = caps
+            msgs.append(why + (f"; cut: {', '.join(sorted(cut))}" if cut else
+                               "; no leg is above its de-risk level, nothing cut"))
             if kept:
                 msgs.append(f"drawdown de-risk: deliberate hold(s) {', '.join(sorted(kept))} kept at the current "
-                            "weight (already halved when the de-risk began; a hold is never sold again)")
+                            "weight (not above the level the de-risk set, give or take the no-trade band; a hold is never "
+                            "sold below that level)")
+            if finished:
+                msgs.append(f"drawdown de-risk: deliberate hold(s) {', '.join(sorted(finished))} cut to the level the "
+                            "de-risk set earlier in this episode (that sale did not execute)")
 
     # Restricted list and minimum price.
     restricted = {x.upper() for x in rc.restricted}

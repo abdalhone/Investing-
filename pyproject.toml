@@ -10,6 +10,7 @@ dependencies = [
   "numpy>=1.26",
   "pydantic>=2.7",
   "requests>=2.31",
+  "idna>=3.4",                 # browser-style (UTS #46) host encoding for news links; requests needs it too
   "yfinance>=0.2.50",
   "scipy>=1.11",
 ]

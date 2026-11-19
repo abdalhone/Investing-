@@ -402,3 +402,120 @@ def test_derisk_without_an_ideal_weight_still_halves(tmp_path):
     ideal.positions[0].ideal_weight = 0.08                            # a partial step toward 0.08: cap 0.04
     out, _, _ = _apply(tmp_path, ideal, nav=89.0)
     assert _w(out) == pytest.approx({"AAA": 0.04})
+
+
+# ----------------------------------------------------------------------------- the reviewer's cut is part of the plan
+
+
+def _book_cycle(tmp_path, fraction, mult, nav, cycles=6, names=("AAA", "BBB", "CCC")):
+    """construct -> LLM risk review (a PORTFOLIO multiplier every cycle) -> risk engine, from a
+    full book at the plan (0.08 per name). Returns the gross path and the last messages."""
+    from aifirm.agents.risk_review import apply_risk_review
+    from aifirm.portfolio.construct import construct_portfolio
+    from aifirm.schemas import AggregatedView, RiskConcern, RiskReview
+    aggs = {t: AggregatedView(ticker=t, prob_outperform=0.6, prob_equal_weight=0.6, expected_excess_return_pct=3.0,
+                              dispersion=0.0, n_views=3, n_abstained=0) for t in names}
+    sheets = _construct_sheets(names)
+    cfg = _cfg(tmp_path, rebalance_fraction=fraction)
+    cur = {t: 0.08 for t in names}
+    state = RiskState(peak_nav=100.0, trough_nav=min(100.0, nav))
+    path, msgs = [], []
+    for _ in range(cycles):
+        tgt = construct_portfolio(aggs, {}, sheets, cur, cfg, AS_OF, {})
+        review = RiskReview(summary="cautious", hidden_concentrations=[], halt_trading=False,
+                            concerns=[RiskConcern(ticker="PORTFOLIO", concern="drawdown regime", multiplier=mult)])
+        tgt = apply_risk_review(tgt, review, current_weights={**cur, "SPY": 0.5}, benchmark="SPY")
+        final, msgs = apply_risk_limits(tgt, state, nav, None, cur, cfg, sheets, str(tmp_path))
+        cur = {p.ticker: p.weight for p in final.positions if p.weight}
+        path.append(round(sum(cur.values()), 6))
+    return path, msgs, final
+
+
+@pytest.mark.parametrize("fraction", [1.0, 0.5])
+@pytest.mark.parametrize("mult", [0.75, 0.5, 0.3])
+def test_a_standing_reviewer_cut_neither_ratchets_nor_hides_from_the_derisk(tmp_path, fraction, mult):
+    """Regressions: (1) a reviewer multiplier applied to the partial step every cycle ratcheted
+    the book down (x0.5 at rebalance_fraction 0.5 settled at 1/3 of the plan, 0.08 gross, not
+    1/2); (2) the de-risk capped at half of the *un-reviewed* plan, so after a reviewer x0.5
+    it cut nothing while the ledger said 'halved'. The multiplier now scales the plan."""
+    plan = 0.24
+    path, _, _ = _book_cycle(tmp_path, fraction, mult, nav=100.0)
+    assert path == [pytest.approx(mult * plan)] * 6
+    path, msgs, final = _book_cycle(tmp_path, fraction, mult, nav=88.0)
+    assert path == [pytest.approx(0.5 * mult * plan)] * 6
+    assert all(p.ideal_weight == pytest.approx(mult * 0.08) for p in final.positions)
+    assert any(m.startswith("drawdown de-risk") for m in msgs)
+
+
+def test_reviewer_x05_then_derisk_at_full_rebalancing_gives_a_quarter(tmp_path):
+    """The reviewer's own example: plan 0.08 per name, reviewer x0.5 -> 0.04, 12% drawdown ->
+    0.02 per name, with a de-risk label and a message naming the legs cut."""
+    from aifirm.agents.risk_review import apply_risk_review
+    from aifirm.portfolio.construct import construct_portfolio
+    from aifirm.schemas import AggregatedView, RiskConcern, RiskReview
+    names = ("AAA", "BBB", "CCC")
+    aggs = {t: AggregatedView(ticker=t, prob_outperform=0.6, prob_equal_weight=0.6, expected_excess_return_pct=3.0,
+                              dispersion=0.0, n_views=3, n_abstained=0) for t in names}
+    sheets = _construct_sheets(names)
+    cfg = _cfg(tmp_path, rebalance_fraction=1.0)
+    cur = {t: 0.08 for t in names}
+    tgt = construct_portfolio(aggs, {}, sheets, cur, cfg, AS_OF, {})
+    review = RiskReview(summary="", hidden_concentrations=[], halt_trading=False,
+                        concerns=[RiskConcern(ticker="PORTFOLIO", concern="regime", multiplier=0.5)])
+    reviewed = apply_risk_review(tgt, review, current_weights={**cur, "SPY": 0.5}, benchmark="SPY")
+    assert _w(reviewed) == pytest.approx({t: 0.04 for t in names})
+    out, msgs = apply_risk_limits(reviewed, RiskState(peak_nav=100.0, trough_nav=88.0), 88.0, None, cur, cfg,
+                                  sheets, str(tmp_path))
+    assert _w(out) == pytest.approx({t: 0.02 for t in names})
+    assert all("risk:drawdown_derisk" in p.constraints_hit for p in out.positions)
+    assert any("cut: AAA, BBB, CCC" in m for m in msgs)
+
+
+def test_derisk_message_does_not_claim_a_cut_that_did_not_happen(tmp_path):
+    ideal = _target({"AAA": 0.02})
+    ideal.positions[0].ideal_weight = 0.08                     # a step already under half the plan
+    out, msgs, _ = _apply(tmp_path, ideal, nav=89.0)
+    assert _w(out) == pytest.approx({"AAA": 0.02})
+    assert any("nothing cut" in m for m in msgs) and not any("cut: AAA" in m for m in msgs)
+
+
+def test_a_hold_finishes_a_derisk_sale_that_did_not_execute(tmp_path):
+    """Regression: the hold branch fired only on the trigger cycle. When the trigger's halving
+    order was blocked (no ADV, no price, a rejection), every later hold cycle of the episode
+    kept the un-halved weight. The level the de-risk set is recorded and later holds are cut
+    to it, never below it; drift within the no-trade band does not trade."""
+    from aifirm.pipeline import _hold_target
+    cfg = _cfg(tmp_path)
+    fss = _fss({t: 100.0 for t in "ABC"})
+    state = RiskState(peak_nav=100.0)
+    state = update_risk_state(state, 88.0)
+    cur = {t: 0.08 for t in "ABC"}
+    out, _ = apply_risk_limits(_hold_target(cur, "SPY", AS_OF, "LLM OUTAGE"), state, 88.0, None, cur, cfg, fss,
+                               str(tmp_path))
+    assert _w(out) == pytest.approx({t: 0.04 for t in "ABC"}) and state.derisk_caps == pytest.approx(
+        {t: 0.04 for t in "ABC"})
+    cur = {"A": 0.08, "B": 0.04, "C": 0.043}                  # A's sale was blocked; C drifted up 0.3% (< band)
+    for _ in range(3):
+        out, msgs = apply_risk_limits(_hold_target(cur, "SPY", AS_OF, "LLM OUTAGE"), state, 88.0, None, cur, cfg,
+                                      fss, str(tmp_path))
+        assert _w(out) == pytest.approx({"A": 0.04, "B": cur["B"], "C": 0.043})
+        assert any("A cut to the level the de-risk set earlier" in m for m in msgs)
+        cur = {**cur, "B": 0.03}                              # a price fall: a hold is never sold below its level
+    out, _ = apply_risk_limits(_hold_target({"B": 0.035}, "SPY", AS_OF, "x"), state, 88.0, None, {"B": 0.035}, cfg,
+                               fss, str(tmp_path))
+    assert _w(out) == pytest.approx({"B": 0.035})             # recovered toward 0.04: still under the level, kept
+    state = update_risk_state(state, 96.0)                    # half of the drawdown recovered: re-risk
+    apply_risk_limits(_hold_target(cur, "SPY", AS_OF, "x"), state, 96.0, None, cur, cfg, fss, str(tmp_path))
+    assert not state.derisked and state.derisk_caps == {}
+
+
+def test_risk_state_with_derisk_caps_round_trips_and_old_files_load(tmp_path):
+    import json
+    from dataclasses import asdict
+    from aifirm.books import load_risk_state
+    p = tmp_path / "risk_state.json"
+    p.write_text(json.dumps({"peak_nav": 100.0, "frozen": False, "derisked": True}))       # saved before the field
+    assert load_risk_state(p, 1.0).derisk_caps == {}
+    s = RiskState(peak_nav=100.0, derisked=True, derisk_caps={"A": 0.04})
+    p.write_text(json.dumps(asdict(s)))
+    assert load_risk_state(p, 1.0) == s

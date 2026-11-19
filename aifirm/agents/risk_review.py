@@ -29,6 +29,7 @@ from ..config import FirmConfig
 from ..data.factsheet import FactSheet
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
 from ..schemas import RiskReview, TargetPortfolio, TargetPosition, clamp
+from ..portfolio.risk_engine import HOLD_LABELS
 from .analysts import EVIDENCE_RULES, blind_factsheet, fact_section
 
 PORTFOLIO_TICKER = "PORTFOLIO"
@@ -158,7 +159,10 @@ def apply_risk_review(target: TargetPortfolio, review: RiskReview | None,
                       benchmark: str | None = None) -> TargetPortfolio:
     """Scale positions down by the review's multipliers (clamped to [0, 1]). Several
     concerns on one name use the smallest multiplier; a PORTFOLIO concern multiplies every
-    name. Freed weight goes to cash. Returns a copy.
+    name. A multiplier scales the leg's plan (:func:`reviewed_weight`; ``ideal_weight`` is
+    scaled too, so the drawdown de-risk halves the reviewed plan), so a concern repeated
+    every cycle does not ratchet the book down under partial rebalancing. Freed weight goes
+    to cash. Returns a copy.
 
     A halt means **no trades this cycle**: with ``current_weights`` (fractions of NAV per
     ticker, including the ``benchmark`` core leg) the result is the current book, so the
@@ -184,18 +188,41 @@ def apply_risk_review(target: TargetPortfolio, review: RiskReview | None,
             reasons.setdefault(t, []).append(c.concern)
     mults = {p.ticker: book * per_name.get(p.ticker.upper(), 1.0) for p in out.positions}
     if book < 1.0:
-        out.notes.append(f"risk review: book-level multiplier {book:.2f}")
-    for p in out.positions:
-        if p.weight != 0 and mults[p.ticker] < 1.0 and p.ticker.upper() in reasons:
-            out.notes.append(f"risk review: {p.ticker} x{per_name[p.ticker.upper()]:.2f} "
-                             f"({'; '.join(reasons[p.ticker.upper()])})")
+        out.notes.append(f"risk review: book-level multiplier {book:.2f} on the plan")
     freed = 0.0
     for p in out.positions:
         m = mults[p.ticker]
-        if p.weight != 0 and m < 1.0:
-            new_weight = p.weight * m
-            freed += p.weight - new_weight
-            p.weight = new_weight
-            p.constraints_hit.append("risk_review")
+        if p.weight == 0 or m >= 1.0:
+            continue
+        before = p.weight
+        new_weight = reviewed_weight(p, m)
+        if p.ideal_weight is not None and math.isfinite(float(p.ideal_weight)):
+            p.ideal_weight = float(p.ideal_weight) * m          # the plan the drawdown de-risk halves
+        freed += p.weight - new_weight
+        p.weight = new_weight
+        p.constraints_hit.append("risk_review")
+        if p.ticker.upper() in reasons:
+            out.notes.append(f"risk review: {p.ticker} x{per_name[p.ticker.upper()]:.2f} "
+                             f"({'; '.join(reasons[p.ticker.upper()])}): {before:.2%} -> {new_weight:.2%}")
     out.cash_weight += freed
     return out
+
+
+def reviewed_weight(p: TargetPosition, m: float) -> float:
+    """The weight of target leg ``p`` after a reviewer multiplier ``m`` in [0, 1).
+
+    The multiplier scales the **plan**, not the partial step. A leg built by construction
+    carries its ``ideal_weight``; with partial rebalancing its weight is a step from the
+    current book toward that plan, and multiplying the step every cycle would compound
+    (a book cut last cycle steps up again and is cut again: ``rebalance_fraction`` 0.5 and a
+    standing x0.5 settle at a third of the plan, not a half). The leg is therefore held to
+    ``m * max(|ideal|, |step|)``: at or above its plan (a reduction or an exit) that is ``m``
+    times the step, as before; while it is still building toward the plan it is capped at
+    ``m`` times the plan, so a concern repeated every cycle converges to ``m * ideal``.
+    A deliberate hold (no plan: kept at the current weight) and a hand-built leg without an
+    ideal weight are multiplied directly. Never raises the magnitude or flips the sign."""
+    w = float(p.weight)
+    ideal = p.ideal_weight
+    if (HOLD_LABELS.intersection(p.constraints_hit) or ideal is None or not math.isfinite(float(ideal))):
+        return w * m
+    return math.copysign(min(abs(w), m * max(abs(w), abs(float(ideal)))), w)

@@ -377,7 +377,14 @@ def make_offline_llm() -> OfflineLLM
 ```
 
 * The risk reviewer's multipliers are clamped to [0, 1]; several concerns on one name use
-  the smallest; a portfolio-level concern multiplies every name. **A halt means no trades
+  the smallest; a portfolio-level concern multiplies every name. A multiplier `m` scales
+  the leg's **plan**, not the partial step (`reviewed_weight`): `ideal_weight` becomes
+  `m × ideal` and the leg is held to `m × max(|ideal|, |step|)`. On a leg at or above its
+  plan (a reduction, an exit) that is `m` times the step; on a leg still building toward
+  its plan it caps the leg at `m` times the plan. Multiplying the step every cycle
+  compounded with partial rebalancing: a standing x0.5 at `rebalance_fraction` 0.5 settled
+  at a third of the plan instead of a half. Holds and hand-built legs are multiplied
+  directly. The ledger note shows each leg's weight before and after. **A halt means no trades
   this cycle**: given `current_weights`, the result is the current book. A halt without
   `current_weights` raises (any guess would be a trade).
 * Lessons are written for the most informative newly resolved forecasts of LLM analysts
@@ -548,6 +555,7 @@ class RiskState:
     frozen_at_nav: float | None = None     # marks a freeze, so a human reset can be recognised
     trough_nav: float | None = None        # lowest NAV since the last peak
     derisked: bool = False                 # the de-risk episode is in force
+    derisk_caps: dict[str, float] = {}     # per leg: the |weight| the de-risk last set in this episode
 def update_risk_state(state, nav) -> RiskState
 def apply_risk_limits(target, state, nav, prev_nav, current_weights, cfg, factsheets, runs_dir, *,
                       worst_day_return=None) -> tuple[TargetPortfolio, list[str]]
@@ -572,10 +580,17 @@ Rules, in order:
    target before the band, partial rebalancing and turnover cap) and is capped at
    `0.5 × |ideal_weight|`; halving the incoming target instead compounded with partial
    rebalancing (a step from a book already halved last cycle) and sold every cycle toward
-   a third of the ideal. A deliberate hold (`pipeline:hold` on an LLM outage,
-   `unreviewed_hold`, `no_view_hold`, `risk_review_halt`) is halved once, on the cycle the
-   de-risk triggers, and kept on every later cycle of the episode: an LLM outage never
-   forces a sale. A hand-built target without `ideal_weight` is halved.
+   a third of the ideal. The plan includes the risk reviewer's cut (it scales
+   `ideal_weight` by its multiplier), so a reviewed leg is capped at half of the reviewed
+   plan. A deliberate hold (`pipeline:hold` on an LLM outage, `unreviewed_hold`,
+   `no_view_hold`, `risk_review_halt`) is halved on the cycle the de-risk triggers. The
+   weight the de-risk sets for each leg is recorded in `derisk_caps`; on every later cycle
+   of the episode a hold keeps its current weight up to that level (an LLM outage never
+   forces a sale, and a hold is never sold below it) and is cut to it only when the earlier
+   sale did not execute (an order blocked for a missing price or ADV, or rejected) by at
+   least the no-trade band. The record is cleared on re-risk, a freeze or a human reset. A
+   hand-built target without `ideal_weight` is halved. The ledger message names the legs
+   actually cut ("nothing cut" when every leg is already within its de-risk level).
 6. Restricted tickers and prices below `min_price` go to 0. A name without a verifiable
    price may not grow.
 7. **Daily-loss halt.** If any one-day NAV loss since the previous cycle
@@ -853,8 +868,10 @@ Matching trusts the **link host** over the free-text publisher name:
 The link host is the one a browser would load (`link_host`): a backslash is a path
 separator in an http(s) URL, as in the WHATWG URL standard (so
 `https://evil.example\@www.reuters.com/x` is on `evil.example`, not Reuters, although
-`urllib.parse.urlsplit` alone reads `reuters.com`), userinfo is not the host, and a host
-that is not a plain DNS name after IDNA encoding is tier C.
+`urllib.parse.urlsplit` alone reads `reuters.com`), userinfo is not the host, a non-ASCII
+host is encoded as a browser encodes it (UTS #46 non-transitional, with the `idna` package:
+`busineßwire.com` is `xn--businewire-b4a.com`, not Business Wire, and a zero-width joiner
+makes a host invalid), and a host that is not a plain DNS name after encoding is tier C.
 
 This simplifies the research's rule (RESEARCH 5.5): there, tier B needs two
 upstream-independent outlets, and newswires carry a known hoax risk. Here one established
@@ -863,29 +880,41 @@ outlet is tier B and newswires are tier A. There is no corroboration and no tier
 **Tier gate** (`agents/tier_gate.py`). It applies only to sheets with news content. A view
 is *bullish* if its probability is above 0.5 **or its expected excess return is above 0**
 (a 0.5 view with a large positive excess feeds the pooled excess and so the size). The
-question is what the view would be without the unverified news. A bullish sealed LLM view
-passes only if at least one **positive** evidence item
+question is what the view would be without the unverified news, and taint is judged on the
+**whole view**: an analyst can always put a rumor and an unrelated fact in two separate
+points, so a bullish sealed LLM view passes only if
 
-* cites no inadmissible event: no tier-C news fact, no news fact without metadata, no
-  event-like ID that is not on the sheet (an item mixing a rumor with another fact rests
-  partly on the rumor and does not count), and
-* cites at least one admissible fact on the sheet: a filing fact `TICKER.filing_N`, a news
-  fact `TICKER.news_N` of tier A or B, or (every role except `events`) a directional
-  non-event fact. Context levels are not directional and never count: the share price,
-  `vol_20d`, `vol_60d`, `adv_20d`, `shares_out`, `market_cap`, `MACRO.VIXCLS` and
-  `MKT.<benchmark>_vol_20d`. The `events` analyst's only non-event facts are the price, the
-  1-month return and the 20-day volatility, which any rumor-based view could cite, so its
-  bullish view needs a filing or a tier A/B news event.
+* **no positive or neutral evidence item** cites an inadmissible event: a tier-C news fact,
+  a news fact without metadata, an event-like ID that is not on the sheet (in any letter
+  case), or a wildcard citation that matches a tier-C news fact. Only a *negative* item
+  (a point against outperformance) may cite unverified news without capping the view; and
+* at least one **positive** item cites an admissible fact on the sheet: an *informative*
+  filing fact `TICKER.filing_N` (an 8-K reporting results, item 2.02, a material agreement,
+  1.01, or a completed acquisition or disposition, 2.01, or an activist SC 13D stake), a
+  news fact `TICKER.news_N` of tier A or B, or (every role except `events`) a directional
+  non-event fact. A routine filing (a 10-Q or 10-K, a proxy, the Form 4 count, an officer
+  change, a passive 13G) only says that something was filed, so it never counts; an SEC
+  filing never taints either. Context levels are not directional and never count: the
+  share price, `vol_20d`, `vol_60d`, `adv_20d`, `shares_out`, `market_cap`, `MACRO.VIXCLS`
+  and `MKT.<benchmark>_vol_20d`. The `events` analyst's only non-event facts are the price,
+  the 1-month return and the 20-day volatility, which any rumor-based view could cite, so
+  its bullish view needs an informative filing or a tier A/B news event.
 
 A **revision** that raises the probability or the excess above the gated sealed values,
-and is bullish, passes only if the IDs the reviser cited as new evidence
+and is bullish, passes only if (1) the challenge it answered did not lean on unverified
+news: none of the IDs cited by the challenge's positive or neutral items
+(`ViewRecord.challenge_fact_ids`, stored by the committee for every reviser) taints,
+whatever the reviser itself cited; and (2) the IDs the reviser cited as new evidence
 (`ViewRecord.revision_fact_ids`, stored when the committee accepts the revision) contain
-admissible support and no inadmissible event; otherwise the revised values are capped at
-`max(gated sealed p, 0.5)` and `max(gated sealed excess, 0)`. Otherwise a capped copy is
-pooled: probabilities `min(p, 0.5)` and expected excess returns `min(x, 0)`. The gate never
-raises a probability, and in the overlay a capped view at 0.5 tilts the quant core by 0.
-The prompts tell the analysts that tier-C news is an unconfirmed claim but do not spell out
-what the gate accepts. The quant is never gated.
+admissible support and no inadmissible event. Otherwise the revised values are capped at
+`max(gated sealed p, 0.5)` and `max(gated sealed excess, 0)`. A capped sealed view is pooled
+as a copy: probabilities `min(p, 0.5)` and expected excess returns `min(x, 0)`. The gate
+never raises a probability, and in the overlay a capped view at 0.5 tilts the quant core
+by 0. The prompts tell the analysts that tier-C news is an unconfirmed claim but do not
+spell out what the gate accepts. The quant is never gated. What the gate cannot see: a
+view that is swayed by a rumor but cites only an informative filing (an earnings 8-K is in
+most windows) still passes; the gate removes the cheap laundering paths, not a model that
+hides its reasons.
 
 ### 3.15 Re-identification harness (`agents/reid.py`, `aifirm reid-probe`)
 

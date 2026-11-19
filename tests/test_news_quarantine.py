@@ -274,5 +274,10 @@ def test_red_team_tier_a_event_does_support_a_bullish_view(market):
     responders = dict(make_offline_llm().responders)
     responders["analyst.events"] = credulous_events_analyst
     rec = run_analyst(OfflineLLM(responders), "events", fsq, cfg, "m")
+    out, note = tier_gate(rec, fsq)       # it also cites the tier-C events as positive points: the view leans on them
+    assert out.view.prob_outperform == 0.5 and "capped" in note
+    fsq.attach_news_events([e for e in fsq.news_events.values() if e.tier in ("A", "B")])
+    rec = run_analyst(OfflineLLM(responders), "events", fsq, cfg, "m")
+    assert rec.view.evidence and all(fsq.news_tier(i) == "A" for e in rec.view.evidence for i in e.fact_ids)
     out, note = tier_gate(rec, fsq)                         # the Business Wire release is tier A
     assert out is rec and note == ""

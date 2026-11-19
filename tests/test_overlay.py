@@ -299,6 +299,32 @@ def test_committee_caps_a_revision_raised_on_tier_c_news_from_the_challenge():
                    for n in res.tier_gate_notes) is capped
 
 
+
+def test_committee_caps_a_raise_citing_only_the_revisers_own_slice_after_a_tier_c_challenge():
+    """Regression (revision hole, round 3): the reviser raises to 0.9 because of the reported
+    takeover but cites only AAA.ret_3m from its own slice. The challenge's tier-C citation is
+    stored on the reviser's record and the gate caps the raise whatever the reviser cited."""
+    from test_committee import challenge_obj
+    from aifirm.schemas import Revision
+    rumor_challenge = challenge_obj()
+    rumor_challenge.evidence = [EvidenceItem(point="A takeover at a large premium was reported.",
+                                             fact_ids=["AAA.news_1"], direction="positive")]
+    revisions = {"technical": Revision(ticker="AAA", prob_outperform=0.9, expected_excess_return_pct=8.0,
+                                       changed=True, reason="The reported takeover.",
+                                       new_evidence_fact_ids=["AAA.ret_3m"])}
+    probs = {"fundamental": 0.50, "technical": 0.53, "macro": 0.50, "events": 0.42}
+    llm = ScriptedLLM(probs, revisions=revisions)
+    llm.register("challenge", lambda role, s, u, schema: rumor_challenge)
+    cfg = _cfg(challenge_enabled=True, challenge_dispersion_threshold=0.0)
+    for tier, capped in (("C", True), ("A", False)):
+        res = _run(llm, cfg, fs=_news_sheet(tier))
+        tech = next(v for v in res.views if v.agent == "technical")
+        assert tech.revision_fact_ids == ["AAA.ret_3m"] and tech.challenge_fact_ids == ["AAA.news_1"]
+        pooled = next(v for v in res.pool_views if v.agent == "technical")
+        assert pooled.revised_prob == pytest.approx(0.53 if capped else 0.9)
+        assert any("the challenge it answered cites unverified news" in n for n in res.tier_gate_notes) is capped
+
+
 def test_a_deep_dive_narrower_than_the_ic_minimum_is_reported_not_awaited():
     """Regression: with 2-3 deep-dive names per date every date was skipped and the bound said
     '0 resolved dates < 12' for ever, as if waiting would help. The skipped dates are now

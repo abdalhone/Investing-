@@ -230,6 +230,28 @@ def normalize_publisher(name: str) -> str:
 _HOST_CHARS = re.compile(r"[a-z0-9.-]+")
 
 
+def _browser_ascii_host(host: str) -> str:
+    """The ASCII form of ``host`` a browser would load, or "" when there is none.
+
+    Browsers follow UTS #46 *non-transitional* processing (WHATWG URL standard): "ß" stays
+    "ß" (``busineßwire.com`` loads ``xn--businewire-b4a.com``, not ``businesswire.com``) and
+    a zero-width joiner or non-joiner between letters makes the host invalid. Python's
+    built-in ``"idna"`` codec is IDNA 2003 with transitional mapping, which maps "ß" to "ss"
+    and drops the joiners, so a look-alike host could borrow a trusted outlet's tier. A
+    non-ASCII host is therefore encoded with the ``idna`` package (a dependency of
+    ``requests``) in non-transitional UTS #46 mode, and any error, or a missing package,
+    returns "" (tier C: unverifiable)."""
+    if not host:
+        return ""
+    if host.isascii():
+        return host.lower()
+    try:
+        import idna
+        return idna.encode(host, uts46=True, transitional=False).decode("ascii").lower()
+    except (ImportError, UnicodeError, ValueError):     # idna.IDNAError subclasses UnicodeError
+        return ""
+
+
 def link_host(link: str) -> str:
     """Lower-case host of an http(s) link without "www." or a trailing dot; "" for anything
     else (no link, another scheme, unparseable, or a host that is not a plain DNS name).
@@ -239,8 +261,10 @@ def link_host(link: str) -> str:
     :func:`urllib.parse.urlsplit`: a backslash in an http(s) URL is a path separator, so
     ``https://evil.example\\@www.reuters.com/x`` is on ``evil.example`` (urlsplit alone reads
     ``reuters.com``) and ``https://evil.io\\.reuters.com/x`` is on ``evil.io``; userinfo is
-    not the host (``https://reuters.com@evil.io/x`` -> "evil.io"). After IDNA encoding the
-    host may contain only ``[a-z0-9.-]``; anything else returns "" (tier C: unverifiable)."""
+    not the host (``https://reuters.com@evil.io/x`` -> "evil.io"). A non-ASCII host is
+    encoded the way a browser does (:func:`_browser_ascii_host`: ``busineßwire.com`` is
+    ``xn--businewire-b4a.com``, not Business Wire). After encoding the host may contain only
+    ``[a-z0-9.-]``; anything else returns "" (tier C: unverifiable)."""
     if not link or not isinstance(link, str):
         return ""
     text = link.strip().replace("\\", "/")
@@ -251,11 +275,7 @@ def link_host(link: str) -> str:
         return ""
     if parts.scheme.lower() not in ("http", "https"):
         return ""
-    host = host.strip().rstrip(".")
-    try:
-        host = host.encode("idna").decode("ascii").lower() if host else ""
-    except (UnicodeError, ValueError):
-        return ""
+    host = _browser_ascii_host(host.strip().rstrip("."))
     if not host or not _HOST_CHARS.fullmatch(host) or ".." in host or host.startswith((".", "-")):
         return ""
     return host[4:] if host.startswith("www.") else host

@@ -143,6 +143,10 @@ class ViewRecord(BaseModel):
     # The fact IDs an accepted revision cited as new evidence (resolved, unblinded). The tier
     # gate checks a revision that raises the view against these, not against the sealed evidence.
     revision_fact_ids: list[str] = []
+    # The fact IDs cited by the positive and neutral evidence items of the challenge this view's
+    # analyst answered (resolved, unblinded; empty without a challenge). A raised revision is
+    # capped when any of them is unverified news, whatever the reviser itself cited.
+    challenge_fact_ids: list[str] = []
 
 
 class AggregatedView(BaseModel):

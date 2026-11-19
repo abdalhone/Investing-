@@ -77,7 +77,7 @@ from .analysts import (BLIND_ALIAS, EVIDENCE_RULES, NEUTRALITY, blind_factsheet,
                        horizon_phrase, render_slice, run_analyst, served_model, shown_sheet, unblind_id)
 from .grounding import resolve_fact_id
 from .roles import ROLES
-from .tier_gate import tier_gate
+from .tier_gate import TAINTING_DIRECTIONS, tier_gate
 
 QUANT_AGENT = "quant"
 PROB_FLOOR = 0.02                       # same floor as schemas.sanitize_view
@@ -579,8 +579,14 @@ def _run_revisions(llm: LLM, fs: FactSheet, cfg: FirmConfig, views: list[ViewRec
     for v in active:                      # default: everyone keeps the sealed view (challenger and quant included)
         v.revised_prob, v.revised_excess_pct = v.view.prob_outperform, v.view.expected_excess_return_pct
         v.revision_fact_ids = []
+        v.challenge_fact_ids = []
     revisers = [v for v in active if v.agent in ROLES and v.agent != challenger.agent]
     challenge_ids = {i for e in challenge.evidence for i in e.fact_ids}
+    # what the challenge leaned on: the tier gate caps a raised revision when any of these is unverified news
+    leaned_on = list(dict.fromkeys(i for e in challenge.evidence if e.direction in TAINTING_DIRECTIONS
+                                   for i in e.fact_ids))
+    for v in revisers:
+        v.challenge_fact_ids = list(leaned_on)
 
     def run(v: ViewRecord) -> _CallResult:
         return _call(llm, Revision, role=f"revision.{v.agent}", model=v.model, system=REVISION_SYSTEM,

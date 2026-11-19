@@ -352,6 +352,30 @@ def test_apply_risk_review_only_scales_down():
     assert t.weights()["AAA"] == pytest.approx(0.10)          # input not mutated
 
 
+@pytest.mark.parametrize("weight, ideal, labels, m, expected", [
+    (0.12, 0.24, [], 0.5, 0.12),                 # building toward the plan: capped at m * plan (already there)
+    (0.18, 0.24, [], 0.5, 0.12),                 # a step above m * plan is cut to it
+    (0.24, 0.24, [], 0.5, 0.12),                 # at the plan: m times the step
+    (0.20, 0.16, [], 0.5, 0.10),                 # above the plan (a reduction): m times the step, as before
+    (0.04, 0.0, [], 0.5, 0.02),                  # an exit in progress: m times the step, not a full sale
+    (0.08, 0.0, ["no_view_hold"], 0.5, 0.04),    # a hold has no plan: multiplied directly
+    (0.08, None, [], 0.75, 0.06),                # hand-built leg without an ideal weight
+    (-0.06, -0.10, [], 0.5, -0.05),              # a short leg keeps its sign
+])
+def test_a_reviewer_multiplier_scales_the_plan_not_the_step(weight, ideal, labels, m, expected):
+    from aifirm.agents.risk_review import reviewed_weight
+    p = TargetPosition(ticker="AAA", weight=weight, prob_outperform=0.6, expected_excess_return_pct=1.0,
+                       rationale="r", constraints_hit=list(labels), ideal_weight=ideal)
+    assert reviewed_weight(p, m) == pytest.approx(expected)
+    t = TargetPortfolio(as_of="2025-03-21", core_weight=0.0, cash_weight=1.0 - weight, positions=[p])
+    out = apply_risk_review(t, RiskReview(summary="s", hidden_concentrations=[], halt_trading=False,
+                                          concerns=[RiskConcern(ticker="AAA", concern="theme", multiplier=m)]))
+    assert out.positions[0].weight == pytest.approx(expected)
+    assert out.positions[0].ideal_weight == (None if ideal is None else pytest.approx(ideal * m))
+    assert out.cash_weight == pytest.approx(1.0 - expected)
+    assert any(f"{weight:.2%} -> {expected:.2%}" in n for n in out.notes)
+
+
 def test_apply_risk_review_portfolio_level_and_halt():
     review = RiskReview(summary="s", hidden_concentrations=[], halt_trading=False, concerns=[
         RiskConcern(ticker="PORTFOLIO", concern="all momentum", multiplier=0.5),

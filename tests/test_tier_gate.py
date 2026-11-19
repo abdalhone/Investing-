@@ -54,9 +54,71 @@ def test_bullish_view_resting_only_on_tier_c_news_is_capped():
                                    ["news_2"], ["[AAA.ret_3m]"]])
 def test_admissible_support_lets_a_bullish_view_through(cited):
     fs = sheet()
-    v = view(0.7, ("positive", ["AAA.news_3"]), ("positive", cited))     # the rumor point is separate
+    v = view(0.7, ("positive", cited), ("negative", ["AAA.news_3"]))     # a rumor cited only as a risk
     out, note = tier_gate(v, fs)
     assert out is v and note == "" and supporting_fact_ids(v, fs)
+
+
+@pytest.mark.parametrize("rumor_direction", ["positive", "neutral"])
+@pytest.mark.parametrize("cited", [["AAA.news_1"], ["AAA.news_2"], ["AAA.filing_1"], ["AAA.ret_3m"], ["MACRO.DGS10"]])
+def test_a_rumor_in_a_separate_point_caps_the_whole_view(cited, rumor_direction):
+    """Regression (gate bypass, round 3): taint was judged item by item, so a view could put
+    the tier-C rumor and an admissible fact in two separate positive points and pass. A
+    bullish view that leans on unverified news anywhere (a positive or neutral point) is now
+    capped, whatever else it cites."""
+    fs = sheet()
+    v = view(0.92, (rumor_direction, ["AAA.news_3"]), ("positive", cited), excess=12.0)
+    out, note = tier_gate(v, fs)
+    assert out.prob_outperform == 0.5 and out.expected_excess_return_pct == 0.0 and "capped" in note
+    assert supporting_fact_ids(v, fs) == []
+    rec = ViewRecord(agent="events", model="m", view=v)
+    assert tier_gate(rec, fs)[0].view.prob_outperform == 0.5
+
+
+@pytest.mark.parametrize("filing", [
+    "2026-03-02: 10-Q filed", "2026-03-02: 10-K filed", "2026-03-02: DEF 14A filed", "2026-03-02: SC 13G filed",
+    "2026-03-02: S-3 filed", "3 insider transaction reports (Form 4) filed in the window (direction not parsed)",
+    "2026-03-02: 8-K - director/officer departure or appointment", "2026-03-02: 8-K - shareholder vote results",
+    "2026-03-02: 8-K - other events", "2026-03-02: 8-K", "2026-03-02: 4 - statement of changes in beneficial ownership",
+    "2026-03-02: SC 13G/A - beneficial ownership report",
+])
+def test_a_routine_filing_cannot_carry_a_bullish_events_view(filing):
+    """Regression (gate bypass, round 3): the events analyst could pass the gate by citing the
+    routine 10-Q (or the Form 4 count) that every sheet carries. A filing that only says
+    something was filed is not directional support."""
+    fs = sheet(tiers=("C",), events=(filing,))
+    for v in (view(0.9, ("positive", ["AAA.filing_1"]), excess=8.0),
+              view(0.9, ("positive", ["AAA.filing_1"]), ("negative", ["AAA.news_1"]), excess=8.0)):
+        out, note = tier_gate(ViewRecord(agent="events", model="m", view=v), fs)
+        assert out.view.prob_outperform == 0.5 and note, filing
+
+
+@pytest.mark.parametrize("filing", [
+    "2026-03-02: 8-K - results of operations (earnings release)", "2026-03-02: 8-K - results of operations",
+    "2026-03-02: 8-K - entry into a material agreement", "2026-03-02: 8-K - completion of acquisition or disposition",
+    "2026-03-02: 8-K - director/officer departure or appointment; results of operations (earnings release)",
+    "2026-03-02: 8-K - item 2.02", "2026-03-02: 8-K/A - results of operations (earnings release)",
+    "2026-03-02: SC 13D filed",
+])
+def test_an_informative_filing_can_carry_a_bullish_events_view(filing):
+    from aifirm.agents.tier_gate import informative_filing
+    assert informative_filing(filing)
+    fs = sheet(tiers=("C",), events=(filing,))
+    rec = ViewRecord(agent="events", model="m", view=view(0.7, ("positive", ["AAA.filing_1"])))
+    assert tier_gate(rec, fs) == (rec, "")
+
+
+@pytest.mark.parametrize("cited", [["AAA.NEWS_9", "AAA.ret_3m"], ["aaa.News_9"], ["*", "AAA.ret_3m"],
+                                   ["AAA.*", "AAA.ret_3m"], ["n*_3", "AAA.ret_3m"], ["AAA.<id>", "AAA.ret_3m"]])
+def test_forged_ids_in_any_case_and_wildcards_matching_a_rumor_taint(cited):
+    """Regression: an upper-case forged news ID not on the sheet, and a wildcard that also
+    names the tier-C event, used to pass beside an admissible fact."""
+    fs = sheet()
+    out, _ = tier_gate(view(0.8, ("positive", cited), ("positive", ["AAA.ret_3m"])), fs)
+    assert out.prob_outperform == 0.5
+    clean = sheet(tiers=("A", "B"))                 # no rumor on the sheet: a wildcard names nothing unverified
+    v = view(0.8, ("positive", ["*", "AAA.ret_3m"]))
+    assert tier_gate(v, clean) == (v, "")
 
 
 @pytest.mark.parametrize("cited", [["AAA.news_1"], ["AAA.filing_1"], ["AAA.ret_3m"], ["MACRO.DGS10"]])
@@ -87,7 +149,7 @@ def test_events_analyst_needs_a_filing_or_a_trusted_news_event():
     fs.add(Fact("AAA.ret_1m", "Return, 1 month", 4.0, "%", AS_OF, "prices"))
     for cited, passes in ((["AAA.ret_1m"], False), (["AAA.ret_3m"], False), (["AAA.filing_1"], True),
                           (["AAA.news_2"], True), (["AAA.ret_1m", "AAA.filing_1"], True)):
-        rec = ViewRecord(agent="events", model="m", view=view(0.9, ("positive", ["AAA.news_3"]), ("positive", cited)))
+        rec = ViewRecord(agent="events", model="m", view=view(0.9, ("negative", ["AAA.news_3"]), ("positive", cited)))
         out, note = tier_gate(rec, fs)
         assert (out is rec and note == "") is passes, cited
         assert tier_gate(rec.view, fs, role="events")[0].prob_outperform == (0.9 if passes else 0.5)
@@ -160,6 +222,24 @@ def test_a_raised_revision_needs_admissible_new_evidence():
         assert tier_gate(ok, fs) == (ok, "")
     lower = rumor.model_copy(update={"revised_prob": 0.55, "revised_excess_pct": 0.5, "revision_fact_ids": []})
     assert tier_gate(lower, fs) == (lower, "")                          # a revision down is never gated
+
+
+@pytest.mark.parametrize("challenge_ids, capped", [(["AAA.news_3"], True), (["news_3", "AAA.ret_3m"], True),
+                                                   (["AAA.NEWS_7"], True), (["AAA.news_1"], False),
+                                                   (["AAA.ret_3m"], False), ([], False)])
+def test_a_raise_answering_a_challenge_that_leans_on_unverified_news_is_capped(challenge_ids, capped):
+    """Regression (revision hole, round 3): the challenger cites a tier-C takeover report and
+    the reviser raises to 0.9 citing only a fact from its own slice. Whatever the reviser
+    cites, a raise answering a challenge that leaned on unverified news is capped."""
+    fs = sheet()
+    rec = ViewRecord(agent="technical", model="m", view=view(0.53, ("positive", ["AAA.ret_3m"]), excess=1.0),
+                     revised_prob=0.9, revised_excess_pct=8.0, revision_fact_ids=["AAA.ret_3m"],
+                     challenge_fact_ids=challenge_ids)
+    out, note = tier_gate(rec, fs)
+    assert (out.revised_prob, out.revised_excess_pct) == ((0.53, 1.0) if capped else (0.9, 8.0))
+    assert ("the challenge it answered cites unverified news" in note) is capped
+    down = rec.model_copy(update={"revised_prob": 0.4, "revised_excess_pct": -1.0})
+    assert tier_gate(down, fs) == (down, "")                             # a revision down is never gated
 
 
 @pytest.mark.parametrize("items", [

@@ -184,12 +184,25 @@ def test_link_host_normalisation():
     ("http://evil.io\\reuters.com", "evil.io"),
     ("https://reu_ters.com/x", ""),                                     # not a plain DNS name: unverifiable
     ("https://b\u00fccher.de/x", "xn--bcher-kva.de"),                    # IDNA
+    # UTS #46 non-transitional, as browsers: "ß" is kept (not "ss"), joiners make the host invalid
+    ("https://www.busine\u00dfwire.com/news/home/x", "xn--businewire-b4a.com"),
+    ("https://reu\u200dters.com/markets/x", ""),
+    ("https://reu\u200cters.com/markets/x", ""),
+    ("https://\uff52\uff45\uff55\uff54\uff45\uff52\uff53.com/x", "reuters.com"),   # full-width letters: what a browser loads
     ("https://www.reuters.com/x", "reuters.com"),
 ])
 def test_link_host_follows_browser_parsing(link, host):
     """Regression: urlsplit read 'https://evil.example\\@www.reuters.com/x' as reuters.com, so a
     story on any host could be tiered B 'Reuters' and read in the trusted reader call."""
     assert link_host(link) == host
+
+
+def test_a_sharp_s_look_alike_of_a_newswire_is_not_tier_a():
+    """Regression: Python's IDNA 2003 codec maps 'ß' to 'ss', so busineßwire.com (a browser
+    loads xn--businewire-b4a.com, a different domain) was tiered A 'Business Wire'."""
+    t = source_tier("Business Wire", "https://www.busine\u00dfwire.com/news/home/20261119005000/en/x")
+    assert t.tier == "C" and t.link_host == "xn--businewire-b4a.com"
+    assert source_tier("Reuters", "https://reu\u200dters.com/markets/x").tier == "C"
 
 
 # --------------------------------------------------------------------------- hostile-text helpers
