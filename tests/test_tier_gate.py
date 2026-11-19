@@ -242,6 +242,24 @@ def test_a_raise_answering_a_challenge_that_leans_on_unverified_news_is_capped(c
     assert tier_gate(down, fs) == (down, "")                             # a revision down is never gated
 
 
+@pytest.mark.parametrize("rumor_direction, capped", [("positive", True), ("neutral", True), ("negative", False)])
+def test_a_reviser_whose_own_sealed_view_leaned_on_a_rumor_cannot_raise(rumor_direction, capped):
+    """Regression (revision hole, round 4): the events analyst's sealed view cited a tier-C
+    rumor and was capped, but after a clean challenge a token revision citing only the
+    earnings 8-K from its own slice restored the bullish view (p_final 0.478 -> 0.525,
+    weight 0 -> 2.5%). A reviser that has already leaned on unverified news cannot raise."""
+    fs = sheet()
+    sealed = view(0.92, (rumor_direction, ["AAA.news_3"]), ("positive", ["AAA.filing_1"]), excess=12.0)
+    rec = ViewRecord(agent="events", model="m", view=sealed, revised_prob=0.9, revised_excess_pct=10.0,
+                     revision_fact_ids=["AAA.filing_1"], challenge_fact_ids=["AAA.ret_3m"])
+    out, note = tier_gate(rec, fs)
+    if capped:
+        assert (out.view.prob_outperform, out.revised_prob, out.revised_excess_pct) == (0.5, 0.5, 0.0)
+        assert "own sealed view cites unverified news" in note
+    else:                                    # the rumor was cited only as a risk: the revision stands
+        assert (out.revised_prob, out.revised_excess_pct) == (0.9, 10.0) and note == ""
+
+
 @pytest.mark.parametrize("items", [
     (("negative", ["AAA.ret_3m"]), ("positive", ["AAA.news_3"])),     # admissible fact only on the other side
     (("neutral", ["AAA.ret_3m"]), ("positive", ["AAA.news_3"])),      # context does not carry a bullish view

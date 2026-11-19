@@ -596,11 +596,14 @@ Rules, in order:
    `ideal_weight` by its multiplier), so a reviewed leg is capped at half of the reviewed
    plan. A deliberate hold (`pipeline:hold` on an LLM outage, `unreviewed_hold`,
    `no_view_hold`, `risk_review_halt`) is halved on the cycle the de-risk triggers. The
-   weight the de-risk sets for each leg is recorded in `derisk_caps`; on every later cycle
-   of the episode a hold keeps its current weight up to that level (an LLM outage never
-   forces a sale, and a hold is never sold below it) and is cut to it only when the earlier
-   sale did not execute (an order blocked for a missing price or ADV, or rejected) by at
-   least the no-trade band. The record is cleared on re-risk, a freeze or a human reset. A
+   weight the de-risk sets for each leg is recorded in `derisk_caps`, and the same level as
+   a share count in `derisk_shares`; on every later cycle of the episode a hold keeps its
+   current weight (an LLM outage never forces a sale, and a hold is never sold below the
+   recorded shares) and is cut back to the recorded shares only when it holds more shares
+   than that by at least the no-trade band, i.e. the earlier sale did not execute (an order
+   blocked for a missing price or ADV, or rejected). Judging in shares means a hold whose
+   price rose after the sale (same shares, higher weight) is kept; without a price the hold
+   is kept. The record is cleared on re-risk, a freeze or a human reset. A
    hand-built target without `ideal_weight` is halved. The ledger message names the legs
    actually cut ("nothing cut" when every leg is already within its de-risk level).
 6. Restricted tickers and prices below `min_price` go to 0. A name without a verifiable
@@ -923,8 +926,10 @@ points, so a bullish sealed LLM view passes only if
   its bullish view needs an informative filing or a tier A/B news event.
 
 A **revision** that raises the probability or the excess above the gated sealed values,
-and is bullish, passes only if (1) the challenge it answered did not lean on unverified
-news: none of the IDs cited by the challenge's positive or neutral items
+and is bullish, passes only if (0) the reviser's own sealed view did not lean on
+unverified news (no positive or neutral item of it taints: the reviser has read the rumor,
+so a token revision citing another fact from its slice could still rest on it); (1) the
+challenge it answered did not lean on unverified news: none of the IDs cited by the challenge's positive or neutral items
 (`ViewRecord.challenge_fact_ids`, stored by the committee for every reviser) taints,
 whatever the reviser itself cited; and (2) the IDs the reviser cited as new evidence
 (`ViewRecord.revision_fact_ids`, stored when the committee accepts the revision) contain

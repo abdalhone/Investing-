@@ -58,6 +58,9 @@ supported, and even when the reviser cites only a fact from its own slice. A bul
 revision that raises the probability or the excess above the gated sealed values passes
 only if
 
+* the reviser's own sealed view carried no unverified news: no positive or neutral item of
+  the sealed view taints (the reviser has already read the rumor, so a token revision that
+  cites some other admissible fact from its slice could still rest on it); and
 * the challenge it answered carried no unverified news: none of the IDs cited by the
   challenge's positive or neutral evidence items (``ViewRecord.challenge_fact_ids``,
   stored by the committee for every reviser) taints; and
@@ -273,7 +276,9 @@ def tier_gate(view: V, fs: FactSheet, role: str | None = None) -> tuple[V, str]:
         rp, rx = view.revised_prob, view.revised_excess_pct
         raises = (rp is not None and rp > gated_p) or (rx is not None and rx > gated_x)
         if _is_bullish(rp, rx) and raises:
-            if any(taints_support(fid, fs) for fid in view.challenge_fact_ids):
+            if _tainted(av.evidence, fs):
+                revision_why = "the reviser's own sealed view cites unverified news as supporting evidence"
+            elif any(taints_support(fid, fs) for fid in view.challenge_fact_ids):
                 revision_why = "the challenge it answered cites unverified news as supporting evidence"
             elif not _supported_by(view.revision_fact_ids, fs, role):
                 revision_why = "its new evidence has no admissible support"

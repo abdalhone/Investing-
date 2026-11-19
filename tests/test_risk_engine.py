@@ -519,3 +519,31 @@ def test_risk_state_with_derisk_caps_round_trips_and_old_files_load(tmp_path):
     s = RiskState(peak_nav=100.0, derisked=True, derisk_caps={"A": 0.04})
     p.write_text(json.dumps(asdict(s)))
     assert load_risk_state(p, 1.0) == s
+
+
+def test_a_hold_whose_price_rose_after_the_derisk_sale_is_not_sold_again(tmp_path):
+    """Regression (round 4): the 'finish the sale' branch compared weights, so a hold whose
+    halving sale filled but whose price then rose 20% (0.04 -> 0.0476, above the band) was
+    sold again during an LLM outage, with a ledger line saying the sale had not executed.
+    The de-risk level is now a share count: same shares at a higher price are kept; more
+    shares than recorded (a blocked sale) are cut back to the recorded count."""
+    from aifirm.pipeline import _hold_target
+    cfg = _cfg(tmp_path)
+    state = update_risk_state(RiskState(peak_nav=100.0), 88.0)
+    cur = {t: 0.08 for t in "ABC"}
+    out, _ = apply_risk_limits(_hold_target(cur, "SPY", AS_OF, "LLM OUTAGE"), state, 88.0, None, cur, cfg,
+                               _fss({t: 100.0 for t in "ABC"}), str(tmp_path))
+    assert _w(out) == pytest.approx({t: 0.04 for t in "ABC"})
+    assert state.derisk_shares == pytest.approx({t: 0.04 * 88.0 / 100.0 for t in "ABC"})
+    # A's sale filled and A then rose 20%; B's sale was blocked and B also rose 20%; C is flat.
+    prices = {"A": 120.0, "B": 120.0, "C": 100.0}
+    cur = {"A": 0.048, "B": 0.096, "C": 0.04}
+    out, msgs = apply_risk_limits(_hold_target(cur, "SPY", AS_OF, "LLM OUTAGE"), state, 88.0, None, cur, cfg,
+                                  _fss(prices), str(tmp_path))
+    assert _w(out) == pytest.approx({"A": 0.048, "B": 0.048, "C": 0.04})   # B back to its recorded shares
+    assert any("B cut to the level the de-risk set earlier" in m for m in msgs)
+    assert not any("A cut" in m or "A, B cut" in m for m in msgs)
+    # Without a price the hold is kept: an outage never forces a sale on a guess.
+    out, _ = apply_risk_limits(_hold_target({"B": 0.096}, "SPY", AS_OF, "x"), state, 88.0, None, {"B": 0.096},
+                               cfg, {}, str(tmp_path))
+    assert _w(out) == pytest.approx({"B": 0.096})

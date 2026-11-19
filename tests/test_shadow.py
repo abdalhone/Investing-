@@ -599,3 +599,22 @@ def test_shadow_holdings_outside_the_live_prices_are_fetched_on_the_same_dates(p
         shadow._covering_prices(base, ["FFF"], as_of, None)
     with pytest.raises(BookError, match="no prices for shadow holding"):
         shadow._covering_prices(base, ["ZZZ"], as_of, lambda t, s, e: _window(prices, ["FFF"], s, e))
+
+
+def test_with_no_common_session_the_spend_of_a_failed_live_cycle_is_shown(tmp_path):
+    """Regression (round 4): the live book's only cycle since inception failed after spending
+    $9.50 while the shadow decided. compare returned before adding up spend, so $9.50 appeared
+    nowhere, yet the note said the failed spend 'is counted'."""
+    cfg = make_config(str(tmp_path))
+    book = tmp_path / "book"
+    _ledger(book / "ledger.jsonl", [
+        ("cycle_start", {"as_of": "2024-02-01", "nav": 100_000.0}),
+        ("cycle_error", {"as_of": "2024-02-01", "error": "BudgetExceeded", "usage": {"cost_usd": 9.5}})])
+    _ledger(book / "shadow" / "ledger.jsonl", [
+        ("shadow_inception", {"as_of": "2024-02-01", "nav": 100_000.0}),
+        ("cycle_start", {"as_of": "2024-02-01", "nav": 100_000.0}), ("cycle_end", {"as_of": "2024-02-01"})])
+    c = shadow.compare_books(cfg, book, [])
+    assert c.status == "no_common_decision" and c.live_failed == ["2024-02-01"]
+    assert c.llm_spend_pending_usd == pytest.approx(9.5)
+    text = "\n".join(c.lines())
+    assert "$9.50" in text and "compared session" not in text

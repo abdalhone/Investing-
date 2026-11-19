@@ -483,7 +483,8 @@ def ic_verdict(n_dates: int, min_dates: int, mean_diff: float | None, t_stat: fl
 def _live_failed_note(failed: list[str], last: str | None = None) -> str:
     shown = ", ".join(failed[:5]) + (", ..." if len(failed) > 5 else "")
     after = [d for d in failed if last is None or d >= last]
-    tail = (" The spend of failed attempts is counted: in the LLM spend when it lies before the compared session, "
+    tail = (" Their LLM spend is in the spend shown above, not yet in any compared NAV." if last is None else
+            " The spend of failed attempts is counted: in the LLM spend when it lies before the compared session, "
             "else as spend not yet in the compared NAVs." if after else
             " The LLM spend of the failed attempts is counted.")
     return f"The live cycle failed and was not decided on {len(failed)} session(s) ({shown}).{tail}"
@@ -532,8 +533,28 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out = BookComparison(status="no_common_decision", as_of=as_of_s, verdict="", inception_as_of=inc_day,
                          inception_nav=inc_nav, step_days=step, ic_lags=lags, min_dates=min_dates)
     out.live_failed = [d for d in live_failed if d >= inc_day and (as_of_s is None or d <= as_of_s)]
+    def spend(before: str | None) -> tuple[float, float]:
+        """(spend on sessions before ``before``, spend on ``before`` and later), failed attempts included."""
+        done = pending = 0.0
+        for event in ("cycle_end", "cycle_error"):          # a failed attempt spent money too
+            for e in ledger_events(Path(book) / LEDGER_FILE, event):
+                p = e.get("payload") or {}
+                d = _day(p["as_of"]) if p.get("as_of") else None
+                cost = (p.get("usage") or {}).get("cost_usd", 0.0)
+                if d is None or not _finite(cost) or d < inc_day or (as_of_s is not None and d > as_of_s):
+                    continue
+                if before is not None and d < before:
+                    done += float(cost)                    # every cycle's spend, a forced re-decision's too
+                else:   # `before` and any later attempt (a failed latest cycle too): not in the compared NAVs yet
+                    pending += float(cost)
+        return done, pending
+
     if not common:
         out.verdict = f"The live book and its shadow (inception {inc_day}) have no decided session in common yet."
+        _, out.llm_spend_pending_usd = spend(None)
+        if out.llm_spend_pending_usd:
+            out.notes.append(f"LLM spend since the shadow's inception: {_usd(out.llm_spend_pending_usd)} (failed "
+                             "attempts included), not yet in any compared NAV.")
         if out.live_failed:
             out.notes.append(_live_failed_note(out.live_failed))
         return out
@@ -543,17 +564,7 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out.shadow_return_pct = (out.shadow_nav / inc_nav - 1.0) * 100.0
     out.difference_usd = out.live_nav - out.shadow_nav
     out.difference_pp = out.live_return_pct - out.shadow_return_pct
-    for event in ("cycle_end", "cycle_error"):              # a failed attempt spent money too
-        for e in ledger_events(Path(book) / LEDGER_FILE, event):
-            p = e.get("payload") or {}
-            d = _day(p["as_of"]) if p.get("as_of") else None
-            cost = (p.get("usage") or {}).get("cost_usd", 0.0)
-            if d is None or not _finite(cost) or d < inc_day or (as_of_s is not None and d > as_of_s):
-                continue
-            if d < last:
-                out.llm_spend_usd += float(cost)           # every cycle's spend, a forced re-decision's too
-            else:   # `last` and any later attempt (a failed latest cycle too): not in the compared NAVs yet
-                out.llm_spend_pending_usd += float(cost)
+    out.llm_spend_usd, out.llm_spend_pending_usd = spend(last)
     out.value_added_usd = out.difference_usd - out.llm_spend_usd
     out.value_added_pct = out.value_added_usd / inc_nav * 100.0 if inc_nav > 0 else None
     upto = [d for d in in_window if d <= last]

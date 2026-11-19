@@ -191,6 +191,7 @@ def test_an_llm_backtest_without_credentials_fails_before_asking_to_spend(env, p
                      "--mode", "llm"]) == 1
     err = capsys.readouterr()
     assert "Anthropic credentials" in err.err and "--mode offline" in err.err and "LLM budget" not in err.out
+    assert "--offline" not in err.err.replace("--mode offline", "")     # backtest has no --offline flag
     assert not (env.runs / "backtests").exists()
 
 

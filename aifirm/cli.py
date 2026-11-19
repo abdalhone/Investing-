@@ -91,8 +91,10 @@ class CLIError(BookError):
 # --------------------------------------------------------------------------- helpers
 
 
-def credentials_problem() -> str | None:
+def credentials_problem(alternative: str = "add --offline to use the deterministic offline rules (not AI)") -> str | None:
     """None if the Anthropic SDK can find credentials, else a message saying how to fix it.
+    ``alternative`` is the command's own way to run without a model (commands differ: ``run``
+    takes ``--offline``, ``backtest`` takes ``--mode offline`` or ``--mode quant``).
 
     ``ANTHROPIC_API_KEY`` is accepted without further checks. Otherwise the SDK's own
     resolution chain decides (auth token, ``ANTHROPIC_PROFILE``, workload identity, or the
@@ -104,9 +106,9 @@ def credentials_problem() -> str | None:
         if default_credentials() is not None:
             return None
     except Exception as exc:  # a broken profile must surface, not silently fall through
-        return f"Anthropic credentials could not be loaded: {exc}"
+        return f"Anthropic credentials could not be loaded: {str(exc).rstrip('.')}. Fix that, or {alternative}."
     return ("No Anthropic credentials found. Set ANTHROPIC_API_KEY, or run `ant auth login` to create a profile, "
-            "or add --offline to use the deterministic offline rules (not AI).")
+            f"or {alternative}.")
 
 
 def _load_config(path: str | None) -> FirmConfig:
@@ -605,10 +607,10 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     end = _completed_session(args.end, "--end")
     llm = None
     if args.mode == "llm":
-        problem = credentials_problem()           # before the budget prompt: answering it must not be wasted
+        problem = credentials_problem(            # before the budget prompt: answering it must not be wasted
+            "use --mode quant (no model) or --mode offline (the plumbing with deterministic rules, not AI)")
         if problem:
-            raise CLIError(f"{problem} (--mode quant needs no model; --mode offline runs the plumbing with "
-                           "deterministic rules)")
+            raise CLIError(problem)
         cycles = len(pd.bdate_range(args.start, end)) // max(1, cfg.process.rebalance_every_days) + 1
         budget = cfg.process.max_llm_cost_usd_per_run * cycles
         print(f"LLM backtest: about {cycles} decision cycles, LLM budget up to ${budget:,.2f} "

@@ -39,7 +39,8 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   ``state.derisk_caps``; on every later cycle of the episode a hold keeps its current weight
   up to that recorded level (an LLM outage must never force a sale, and a hold is never sold
   below it), and is cut to it only when the earlier sale did not execute (an order blocked
-  for a missing price or ADV, or rejected). The record is cleared on re-risk, on a freeze
+  for a missing price or ADV, or rejected). That is judged in shares (``state.derisk_shares``),
+  not weight: a hold whose price rose holds the same shares at a higher weight and is kept. The record is cleared on re-risk, on a freeze
   and on a human reset. A leg without an ``ideal_weight`` (a hand-built target) is halved.
 * **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
   may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
@@ -94,8 +95,10 @@ class RiskState:
     recognises the human reset (see the module docstring). ``trough_nav``: the lowest NAV
     mark since the last peak (:func:`update_risk_state`); ``derisked``: the drawdown
     de-risk is in force until half of the drawdown is recovered; ``derisk_caps``: during a
-    de-risk episode, the absolute weight the de-risk last set for each leg (a deliberate
-    hold is never kept above it). They default so that a state saved before they existed
+    de-risk episode, the absolute weight the de-risk last set for each leg;
+    ``derisk_shares``: the same level as a share count (weight x NAV / price when it was
+    set), so a later cycle can tell a sale that did not execute (more shares than recorded)
+    from a hold whose price merely rose (same shares, higher weight). They default so that a state saved before they existed
     loads unchanged."""
 
     peak_nav: float
@@ -106,6 +109,17 @@ class RiskState:
     trough_nav: float | None = None
     derisked: bool = False
     derisk_caps: dict[str, float] = field(default_factory=dict)
+    derisk_shares: dict[str, float] = field(default_factory=dict)
+
+
+def _last_price(factsheets: dict[str, FactSheet], ticker: str) -> float:
+    """The ``TICKER.price`` fact as a positive float, else NaN."""
+    fs = factsheets.get(ticker)
+    fact = fs.get(f"{ticker}.price") if fs is not None else None
+    if fact is None or isinstance(fact.value, bool) or not isinstance(fact.value, (int, float)):
+        return math.nan
+    px = float(fact.value)
+    return px if math.isfinite(px) and px > 0 else math.nan
 
 
 def _valid_positive(x: object) -> bool:
@@ -231,6 +245,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         state.trough_nav = float(nav)
         state.derisked = False
         state.derisk_caps = {}
+        state.derisk_shares = {}
 
     # Drawdown: freeze (sticky) or de-risk.
     peak = max(float(state.peak_nav), float(nav))
@@ -249,6 +264,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                 hits[t].append("risk:drawdown_freeze")
             weights[t] = 0.0
         state.derisk_caps = {}
+        state.derisk_shares = {}
     else:
         trough = min(float(state.trough_nav), float(nav)) if _valid_positive(state.trough_nav) else float(nav)
         recovery = trough + 0.5 * (peak - trough)        # half of the peak-to-trough drawdown recovered
@@ -268,11 +284,13 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         elif state.derisked:
             state.derisked = False
             state.derisk_caps = {}
+            state.derisk_shares = {}
             msgs.append(f"re-risk: half of the drawdown from {peak:,.2f} to the trough {trough:,.2f} recovered (NAV "
                         f"{float(nav):,.2f}); full gross restored")
         if halve:
             by_ticker = {p.ticker: p for p in target.positions}
             caps = {} if newly else dict(state.derisk_caps)   # rebound, never mutated: copies of the state share it
+            shares = {} if newly else dict(state.derisk_shares)
             cut, kept, finished = [], [], []
             for t in weights:
                 if weights[t] == 0.0:
@@ -282,11 +300,14 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                 if HOLD_LABELS.intersection(pos.constraints_hit):
                     if newly:          # the held book is still full size: halve it once
                         new_w = weights[t] * DERISK_FACTOR
-                    elif t in caps and abs(weights[t]) - caps[t] >= max(pc.no_trade_band, CAP_NOISE):
-                        # the level the de-risk set earlier in the episode was not reached (the sale did
-                        # not execute): finish it, but never sell a hold below that level. A gap under
-                        # the no-trade band (share rounding, a small drift) would not trade anyway.
-                        new_w = math.copysign(caps[t], weights[t])
+                    elif (t in shares and math.isfinite(px := _last_price(factsheets, t))
+                          and abs(weights[t]) - shares[t] * px / float(nav) >= max(pc.no_trade_band, CAP_NOISE)):
+                        # the book holds more shares than the de-risk left (the sale did not execute):
+                        # finish it, back to the recorded share count, never below. Measured in shares,
+                        # so a hold whose price rose (same shares, higher weight) is not sold; without
+                        # a price or a recorded share count the hold is kept (an outage never forces a
+                        # sale on a guess). A gap under the no-trade band would not trade anyway.
+                        new_w = math.copysign(shares[t] * px / float(nav), weights[t])
                         finished.append(t)
                     else:
                         new_w = weights[t]
@@ -298,13 +319,21 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                     new_w = weights[t] * DERISK_FACTOR
                 if t in kept:
                     caps.setdefault(t, abs(new_w))     # a hold's drift never moves the recorded level
+                elif t in finished:
+                    caps[t] = abs(new_w)               # the recorded share count is unchanged
                 else:
                     caps[t] = abs(new_w)
+                    px = _last_price(factsheets, t)
+                    if math.isfinite(px):
+                        shares[t] = abs(new_w) * float(nav) / px
+                    else:
+                        shares.pop(t, None)
                 if new_w != weights[t]:
                     weights[t] = new_w
                     hits[t].append("risk:drawdown_derisk")
                     cut.append(t)
             state.derisk_caps = caps
+            state.derisk_shares = shares
             msgs.append(why + (f"; cut: {', '.join(sorted(cut))}" if cut else
                                "; no leg is above its de-risk level, nothing cut"))
             if kept:
