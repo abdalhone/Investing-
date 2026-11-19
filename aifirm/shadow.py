@@ -79,6 +79,7 @@ from .execution.broker import PaperBroker
 from .journal import (COMMITTEE_AGENT, SHADOW_AGENT, ForecastStore, Ledger, LessonStore, paired_rank_ic)
 from .pipeline import Decision, decide, needs_llm, quant_only_config
 from .portfolio import RiskState
+from .portfolio.overlay import thin_dates_note
 from .quant import QUANT_AGENT
 from .schemas import ForecastRecord
 
@@ -564,10 +565,8 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out.ic_live, out.ic_shadow = _nan_none(res.mean_a), _nan_none(res.mean_b)
     out.status, out.verdict = ic_verdict(res.n_dates, min_dates, out.ic_mean_diff, out.ic_t_stat, h)
     if res.n_thin:
-        out.notes.append(f"{res.n_thin} resolved decision date(s) were skipped because fewer than "
-                         f"{cfg.evaluation.ic_min_names} names had both a live and a shadow forecast: with a deep-dive "
-                         "band that narrow (universe.screen.deep_dive_top_n) the comparison can never become "
-                         "measurable, however long you wait.")
+        out.notes.append(thin_dates_note(cfg, res.n_thin, cfg.evaluation.ic_min_names)
+                         .replace("had both forecasts", "had both a live and a shadow forecast") + ".")
     if out.status == "not_measurable":
         out.notes.append("A NAV gap over a short window is mostly noise; the ranking comparison is the test, and it "
                          f"needs about {FORWARD_MIN_YEARS:g} years of decisions at this cadence ({min_dates} dates "

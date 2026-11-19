@@ -91,6 +91,7 @@ _SUMMARY_ALLOWED = re.compile(r"[^\w\s.,;'&()/-]", re.UNICODE)
 _IGNORABLE_EXTRA = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F, 0x3164, 0xFFA0})
 _DELETED_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cn", "Cs"})
 _SPACE_CONTROLS = frozenset("\t\n\r\x0b\x0c\x1c\x1d\x1e\x1f\x85")
+_BIDI_CONTROLS = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 
 
 def _invisible(ch: str) -> bool:
@@ -120,12 +121,55 @@ def _plain(text: str) -> str:
     return "".join(out)
 
 
+def _plain_spaced(text: str) -> str:
+    """:func:`_plain`, but every invisible character becomes a space instead of nothing."""
+    out: list[str] = []
+    for ch in unicodedata.normalize("NFKC", text or ""):
+        if ch in _SPACE_CONTROLS or unicodedata.category(ch) in ("Zl", "Zp") or _invisible(ch):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def hides_invisible_separator(text: str) -> bool:
+    """True if an invisible character (:func:`_invisible`) sits between two letters or digits.
+
+    Ordinary headlines never need one, but it defeats both readings of the text: deleted,
+    "Ignore<ZWSP>all<ZWSP>previous<ZWSP>instructions" becomes one run-together word that no
+    pattern matches (a model still reads it), and spaced, "dis<ZWSP>regard" becomes two.
+    Such text is treated as a suspected injection (fail closed: tier C, never read). The
+    rare honest uses (a soft hyphen inside a word, a joiner in some scripts) only cost the
+    headline its tier."""
+    run_after_alnum = False
+    prev_alnum = False
+    for ch in unicodedata.normalize("NFKC", text or ""):
+        if _invisible(ch) and ch not in _SPACE_CONTROLS:
+            run_after_alnum = run_after_alnum or prev_alnum
+            prev_alnum = False
+            continue
+        if run_after_alnum and ch.isalnum():
+            return True
+        run_after_alnum = False
+        prev_alnum = ch.isalnum()
+    return False
+
+
 def looks_like_instruction(text: str) -> bool:
     """True if ``text`` contains phrasing addressed to a model (instructions, role markers,
     fake system prompts, JSON or markup) rather than news. Deliberately broad: a false
-    positive only demotes a headline to tier C."""
-    t = _plain(text)
-    return any(p.search(t) for p in _INSTRUCTION_PATTERNS)
+    positive only demotes a headline to tier C.
+
+    The patterns are matched against the text with invisible characters deleted *and* with
+    them replaced by spaces (an attacker may use them inside words or in place of the
+    spaces between words), and an invisible character between two letters or digits is
+    itself treated as a suspected injection (:func:`hides_invisible_separator`), as is any
+    bidi embedding, override or isolate control (U+202A-202E, U+2066-2069: they can show a
+    model reversed or reordered text that no pattern sees)."""
+    if hides_invisible_separator(text) or any(ch in _BIDI_CONTROLS for ch in text or ""):
+        return True
+    variants = {_plain(text), " ".join(_plain_spaced(text).split())}
+    return any(p.search(t) for t in variants for p in _INSTRUCTION_PATTERNS)
 
 
 def sanitize_summary(summary: str, max_words: int = MAX_SUMMARY_WORDS) -> tuple[str, list[str]]:

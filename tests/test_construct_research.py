@@ -87,6 +87,27 @@ def test_exits_shrink_in_halves_until_the_remainder_is_below_the_band():
     assert _w(_build(no_edge, {"AAA": 0.009})) == {}                    # 0.0045 left would be dust: exit fully
 
 
+@pytest.mark.parametrize("start", [0.0049, 0.003, 0.0001])
+def test_an_exit_remainder_that_drifted_under_the_band_is_sold(start):
+    """Regression: with the default 0.5% band, an exit that a price drop left at 0.49% had
+    |delta| < band, so the band kept it for ever (a deep dive every cycle on a name the firm
+    wants out of). The remainder of an exit (ideal exactly 0) is now completed, outside the
+    band and the turnover cap; a non-zero ideal inside the band still is not traded."""
+    from aifirm.portfolio.risk_engine import orders_from_target
+    no_edge = {"AAA": _agg("AAA", p=0.40, excess=-1.0)}
+    tp = _build(no_edge, {"AAA": start})
+    pos = next(p for p in tp.positions if p.ticker == "AAA")
+    assert pos.weight == 0.0 and pos.ideal_weight == 0.0 and "exit_completed" in pos.constraints_hit
+    assert "no_trade_band" not in pos.constraints_hit
+    nav = 1_000_000.0
+    orders, _ = orders_from_target(tp, {"AAA": start * nav / 100.0}, {"AAA": 100.0, "SPY": 100.0}, nav,
+                                   {"AAA": 1e12, "SPY": 1e12}, FirmConfig(), "SPY")
+    assert any(o.ticker == "AAA" and o.side == "sell" for o in orders)
+    aggs = {"AAA": _agg("AAA")}
+    stay = next(p for p in _build(aggs, {"AAA": 0.078}).positions if p.ticker == "AAA")
+    assert stay.weight == pytest.approx(0.078) and "no_trade_band" in stay.constraints_hit
+
+
 def test_forced_exits_go_all_the_way_and_unchanged_holds_are_not_traded():
     tp = _build({"BBB": _agg("BBB")}, {"GONE": 0.07})                    # held, no longer covered
     assert "GONE" not in _w(tp) and _w(tp)["BBB"] == pytest.approx(0.04)

@@ -616,7 +616,10 @@ def _skill_section(r: BacktestResult) -> list[str]:
                 f"that date); every book "
                 f"pays the strategy's realised {rb.cost_rate_bps:.1f} bps per dollar traded. The strategy is valued "
                 f"the same way ({_pp(rb.strategy_total_return_pct)} here vs {_pp(rb.engine_total_return_pct)} in the "
-                "engine).", "",
+                + ("engine)." if rb.engine_period_start is None else
+                   f"engine over the same clean period, from the close of {rb.engine_period_start}; the engine enters "
+                   "that period with the book it already held, the valuation here from cash, so the two differ by "
+                   "more than rounding)."), "",
                 *_table(["", "Strategy", "Random 5th pct", "Random median", "Random 95th pct", "Strategy percentile",
                          "p (one-sided)"],
                         [("Total return", _pp(rb.strategy_total_return_pct),

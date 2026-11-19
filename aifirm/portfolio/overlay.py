@@ -171,6 +171,33 @@ def _overlap_lags(horizon_days: int, step_days: int) -> int:
     return max(0, math.ceil(horizon_days / max(1, step_days)) - 1)
 
 
+def thin_dates_note(cfg: FirmConfig, n_thin: int, min_names: int) -> str:
+    """Why ``n_thin`` resolved decision dates were skipped (fewer than ``min_names`` names had
+    both forecasts), naming a setting only when it really caps the count.
+
+    The deep dive takes at most ``universe.screen.deep_dive_top_n`` names, and only those with
+    quant P above 0.5, so on a weak day it can hold fewer names than the cap; that is not a
+    configuration problem. Only a cap below ``min_names`` (screen on), or a universe smaller
+    than ``min_names``, makes the comparison impossible however long one waits."""
+    if n_thin <= 0:
+        return ""
+    head = f"{n_thin} resolved decision date(s) were skipped because fewer than {min_names} names had both forecasts"
+    scr = cfg.universe.screen
+    if scr.enabled and scr.deep_dive_top_n < min_names:
+        return (f"{head}: the deep-dive band (universe.screen.deep_dive_top_n = {scr.deep_dive_top_n}) is narrower "
+                f"than {min_names} names, so this can never become measurable, however long you wait; widen it")
+    try:
+        n_universe = len(cfg.investable_tickers())
+    except (KeyError, OSError):
+        n_universe = None
+    if n_universe is not None and n_universe < min_names:
+        return (f"{head}: the universe holds only {n_universe} name(s), fewer than {min_names}, so this can never "
+                "become measurable, however long you wait; add names")
+    why = (f"typically too few names with quant P above 0.5 that day for the top-{scr.deep_dive_top_n} deep dive"
+           if scr.enabled else "typically analysts abstaining or names without a forecast that day")
+    return f"{head} ({why})"
+
+
 def adaptive_bound(records: Iterable[ForecastRecord], as_of: str, cfg: FirmConfig, *,
                    include_pre_cutoff: bool = False, min_names: int = IC_MIN_NAMES) -> OverlayBound:
     """The overlay bound for a decision at the close of ``as_of`` (module docstring).
@@ -187,9 +214,7 @@ def adaptive_bound(records: Iterable[ForecastRecord], as_of: str, cfg: FirmConfi
                  mean_ic_llm=_nan_none(res.mean_a), mean_ic_quant=_nan_none(res.mean_b), lags=lags,
                  min_dates=min_dates, n_thin_dates=res.n_thin)
     if res.n_dates < min_dates:
-        thin = (f"; {res.n_thin} resolved date(s) skipped because fewer than {min_names} names had both forecasts "
-                f"(a deep-dive band narrower than {min_names} names can never measure this: widen "
-                "universe.screen.deep_dive_top_n)" if res.n_thin else "")
+        thin = f"; {thin_dates_note(cfg, res.n_thin, min_names)}" if res.n_thin else ""
         return OverlayBound(configured, configured, f"{res.n_dates} resolved dates with both an LLM-pool and a quant "
                                                     f"forecast on at least {min_names} common names < {min_dates}"
                                                     f"{thin}: the configured bound applies", **stats)

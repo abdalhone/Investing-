@@ -531,6 +531,9 @@ w       = sign(kelly) · min(max_position, |kelly|) · m · d,   kelly = kelly_f
   Turnover is **one-way**: `0.5 · Σ|w_target − w_current|` over every leg, core included.
 * **Forced exits.** A held name absent from `aggs` (no longer covered) is sold in full: it
   skips the band, partial rebalancing and the turnover cap, and its turnover is spent first.
+  The remainder of an ordinary exit (ideal weight exactly 0) that has drifted under the
+  band is completed the same way (`exit_completed`); the band would otherwise keep it for
+  ever.
 * **No information, no trade.** A held name with `n_views == 0` keeps its current weight. So
   does a name in `keep_current` (a held name whose memo failed). Only a hard limit can cut
   them.
@@ -840,7 +843,11 @@ Every other sheet with headlines (outside the deep dive, reader disabled, no LLM
   hyphen, the Unicode tag characters used for "ASCII smuggling"), private-use, unassigned
   and the other default-ignorable code points (U+034F, variation selectors, Hangul
   fillers). Deleting rather than spacing them keeps "dis​regard" detectable as
-  "disregard".
+  "disregard". The detector also matches a spaced reading, and an invisible character
+  between two letters or digits (used in place of the spaces between words, it would make
+  "Ignoreallpreviousinstructions" one word no pattern sees) or any bidi embedding,
+  override or isolate control is itself a suspected injection: the headline is withheld
+  from the reader and recorded as tier C.
 * **Point-in-time close.** The cutoff is the session's real close
   (`aifirm.data.calendar.session_close_time`): 13:00 on the scheduled half days (the day
   after Thanksgiving, Christmas Eve and 3 July from Monday to Thursday), else 16:00. The

@@ -437,6 +437,15 @@ def test_skill_evidence_uses_only_decisions_after_the_contaminated_period(prices
     assert ev.factors is not None and ev.factors.n_obs < len(r.returns)
     md = render_backtest_report(r)
     assert "**Clean decisions only.**" in md and "contaminated decisions included (for reference only" in md
+    # Regression: the clean-only schedule's return was printed next to the WHOLE-run engine return
+    # under 'valued the same way'. The engine figure now covers the same clean period.
+    rb = ev.random_books
+    first = clean[0]["as_of"]
+    nav = r.nav
+    expected = (nav.iloc[-1] / nav[nav.index <= pd.Timestamp(first)].iloc[-1] - 1.0) * 100.0
+    assert rb.engine_period_start == first and rb.engine_total_return_pct == pytest.approx(expected)
+    assert rb.engine_total_return_pct != pytest.approx((nav.iloc[-1] / nav.iloc[0] - 1.0) * 100.0)
+    assert f"in the engine over the same clean period, from the close of {first}" in md
 
 
 def test_replaying_the_recorded_decisions_reproduces_the_run_and_doubling_costs_lowers_returns(quant_result,

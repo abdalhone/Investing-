@@ -51,7 +51,9 @@ Why each piece:
    would leave a residual gap smaller than the no-trade band, or than
    ``MIN_RESIDUAL_GAP`` (0.25% of NAV) when the band is smaller, is completed (such a gap
    could never be traded, or would take dozens of cycles of ever smaller orders, so a sale
-   would otherwise leave dust behind for ever). Turnover
+   would otherwise leave dust behind for ever). Likewise a holding the firm wants out of
+   (ideal weight exactly 0) whose remainder has drifted under the band is sold in full,
+   outside the band and the turnover cap (label ``exit_completed``). Turnover
    is **one-way**: ``0.5 * sum(|w_target - w_current|)`` over every leg, core included
    (buying 10% with the proceeds of selling 10% is 10% turnover), and ``max_turnover``
    caps that number.
@@ -420,7 +422,9 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
     in the module docstring.
 
     ``forced``: held legs that must be exited in full (no longer covered); they skip the
-    band, partial rebalancing and the turnover cap, and their turnover is spent first.
+    band, partial rebalancing and the turnover cap, and their turnover is spent first. The
+    remainder of an exit (ideal exactly 0) that is smaller than the band is completed the
+    same way (label ``exit_completed``): under the band it could never be sold.
     ``hold``: held legs to keep this cycle (ticker -> the constraint label recorded, e.g.
     ``no_view_hold``); their trade is 0, like a band, unless a hard limit forces a cut
     (their ideal weight is 0, so a repair only ever moves them toward 0). Every other trade
@@ -429,6 +433,7 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
     hold = hold or {}
     legs = sorted(set(ideal) | set(current))
     delta = {t: ideal.get(t, 0.0) - current.get(t, 0.0) for t in legs}
+    unscaled = set(forced)      # trades the turnover cap never scales: forced exits, sub-band exit remainders
     for t in legs:
         if delta[t] == 0.0:
             continue
@@ -437,6 +442,12 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
         elif t in hold:
             delta[t] = 0.0
             hits[t].append(hold[t])
+        elif abs(delta[t]) < pc.no_trade_band and ideal.get(t, 0.0) == 0.0:
+            # The rest of an exit (the firm wants out: ideal exactly 0) that has drifted under the
+            # band: the band would keep it for ever (and the name would get a deep dive every
+            # cycle as a holding), so the exit is completed.
+            hits[t].append("exit_completed")
+            unscaled.add(t)
         elif abs(delta[t]) < pc.no_trade_band:
             delta[t] = 0.0
             hits[t].append("no_trade_band")
@@ -445,8 +456,8 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
             if step != delta[t]:
                 delta[t] = step
                 hits[t].append("partial_rebalance")
-    forced_turnover = 0.5 * sum(abs(delta[t]) for t in legs if t in forced)
-    free = [t for t in legs if t not in forced and delta[t] != 0.0]
+    forced_turnover = 0.5 * sum(abs(delta[t]) for t in legs if t in unscaled)
+    free = [t for t in legs if t not in unscaled and delta[t] != 0.0]
     free_turnover = 0.5 * sum(abs(delta[t]) for t in free)
     budget = max(0.0, pc.max_turnover - forced_turnover)
     if free_turnover > budget:
@@ -454,7 +465,7 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
         for t in free:
             delta[t] *= s
             hits[t].append("turnover_cap")
-        forced_note = f"; forced exits ({forced_turnover:.3f}) are not scaled and were counted first" \
+        forced_note = f"; forced and sub-band exits ({forced_turnover:.3f}) are not scaled and were counted first" \
             if forced_turnover else ""
         notes.append(f"turnover cap: one-way turnover 0.5*sum|dw| {free_turnover + forced_turnover:.3f} -> "
                      f"{max(pc.max_turnover, forced_turnover):.3f} (discretionary trades scaled by {s:.3f}"

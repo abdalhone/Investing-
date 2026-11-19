@@ -263,7 +263,7 @@ class RandomBooksResult:
     n_rebalances: int
     strategy_total_return_pct: float        # the strategy's own book in the null's accounting
     strategy_sharpe: float
-    engine_total_return_pct: float          # the engine's figure, for reference
+    engine_total_return_pct: float          # the engine's figure over the same period, for reference
     percentile_return: float                # 0-100
     p_value_return: float
     percentile_sharpe: float
@@ -275,6 +275,10 @@ class RandomBooksResult:
     avg_eligible: float
     min_distinct_books: float               # fewest distinct name sets at a rebalance with an active name
     notes: list[str] = field(default_factory=list)
+    # None: the engine figure is the whole run. A date: the schedule holds only the decisions
+    # from that date on (the clean ones), and the engine figure is its NAV return from that
+    # date's close to the end, the same period (the engine enters it with the book it held).
+    engine_period_start: str | None = None
 
     @property
     def distinguishable(self) -> bool:
@@ -290,9 +294,12 @@ class RandomBooksResult:
 
 
 def random_books(schedule: BookSchedule, prices: PriceData, n_books: int, seed: int, cost_rate: float,
-                 engine_total_return_pct: float, sector_matched: bool = False) -> RandomBooksResult:
+                 engine_total_return_pct: float, sector_matched: bool = False,
+                 engine_period_start: str | None = None) -> RandomBooksResult:
     """Simulate ``n_books`` composition-matched random books and the strategy's own book
     through the same vectorised accounting and place the strategy in the distribution.
+    ``engine_total_return_pct`` is the engine's NAV return over the period the schedule
+    covers, from ``engine_period_start`` (None: the whole run), shown for reference.
     Raises ``ValueError`` when there is nothing to compare (no rebalance, ``n_books < 1``)."""
     if n_books < 1:
         raise ValueError("n_books must be at least 1")
@@ -337,7 +344,7 @@ def random_books(schedule: BookSchedule, prices: PriceData, n_books: int, seed: 
         return_quantiles_pct={f"p{x}": float(np.percentile(b_ret, x) * 100) for x in q},
         sharpe_quantiles={f"p{x}": float(np.percentile(b_sh, x)) for x in q},
         avg_names_held=float(held.mean()), avg_eligible=float(n_elig.mean()),
-        min_distinct_books=float(distinct), notes=notes)
+        min_distinct_books=float(distinct), notes=notes, engine_period_start=engine_period_start)
 
 
 def realised_cost_rate(decisions: Sequence[Mapping]) -> float:

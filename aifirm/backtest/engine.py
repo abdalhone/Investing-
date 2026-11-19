@@ -619,9 +619,17 @@ def _evaluate(*, cfg: FirmConfig, strat_cfg: FirmConfig, prices: PriceData, days
         sectors: dict[str, str] = {}
         for rec in sim.decisions:
             sectors.update(rec.get("sectors") or {})
+        # The schedule holds the clean decisions only: compare it with the engine over the same
+        # period (from the first clean decision's close), not with the whole contaminated run.
+        rb_engine, rb_from = engine_total, None
+        if len(decisions) < len(sim.decisions):
+            before = sim.nav[sim.nav.index <= pd.Timestamp(decisions[0]["as_of"])]
+            if len(before):
+                rb_engine, rb_from = float((sim.nav.iloc[-1] / before.iloc[-1] - 1.0) * 100.0), decisions[0]["as_of"]
         out.random_books = _guarded("random books", notes, lambda: random_books(
             build_schedule(decisions, prices, days, names, bench, sectors), prices, ev.n_random_books,
-            ev.random_seed, rate, engine_total, sector_matched=ev.random_books_sector_matched))
+            ev.random_seed, rate, rb_engine, sector_matched=ev.random_books_sector_matched,
+            engine_period_start=rb_from))
 
     markets: dict[tuple[str, frozenset[str]], MarketSnapshot] = {}
     q_markets: dict[tuple[str, frozenset[str]], MarketSnapshot] = {}
