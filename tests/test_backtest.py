@@ -633,3 +633,31 @@ def test_a_prompt_edit_is_a_new_trial_for_llm_stages_only(tmp_path):
     assert _count_trials(path, "f", "quant", "2024-01-01", "2024-06-30", "p2") == 2     # quant sends no prompt
     d = prompt_digest()
     assert len(d) == 16 and d == prompt_digest()
+
+
+def test_report_reads_no_direction_into_a_handful_of_clean_dates(quant_result):
+    """Regression: 2 clean dates with a paired IC difference of +0.009 (t = 2.34, 1 degree of
+    freedom) were read as 'positive (t >= 2)' and 'The LLM committee ranked stocks better than
+    the quant-only model'. Below MIN_VERDICT_DATES the readings say 'anecdotal', and above it
+    the paired test uses the same bar as the pool IC (t >= 3 once more than 20 trials)."""
+    import copy
+    from aifirm.backtest.ic import POOL, QUANT_ONLY, ICDifference
+    from aifirm.report import MIN_VERDICT_DATES
+    r = copy.deepcopy(quant_result)
+    ev = r.evaluation
+    diff = ICDifference(a=POOL, b=QUANT_ONLY, n_dates=2, mean_diff=0.009, std=0.005, t_stat=2.34, lags=0,
+                        per_date=pd.Series([0.005, 0.013]))
+    ev.ic_differences = [diff]
+    for s in ev.ic.values():
+        s.n_dates, s.t_stat, s.mean = 2, -19.25, -0.2
+    md = render_backtest_report(r)
+    assert "ranked stocks better" not in md and "positive (t >= 2)" not in md and "negative (t <= -2)" not in md
+    assert f"anecdotal: 2 date(s) < {MIN_VERDICT_DATES}" in md
+    assert "Anecdotal: the LLM committee's ranking was compared with the quant-only model's on only 2" in md
+    diff.n_dates, diff.t_stat = 30, 2.5
+    r.n_trials = 25                                         # more than 20 trials: the bar is t >= 3
+    md = render_backtest_report(r)
+    assert "ranked stocks better" not in md and "not distinguishable from the quant-only model's" in md
+    r.n_trials = 1
+    md = render_backtest_report(r)
+    assert "The LLM committee ranked stocks better than the quant-only model" in md and "positive (t >= 2)" in md

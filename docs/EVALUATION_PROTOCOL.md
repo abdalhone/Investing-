@@ -32,8 +32,9 @@ Read the stages in order. A later stage means nothing if an earlier one failed.
   random. They are the null for stock selection.
 * **Breakeven multiplier.** The factor by which every modelled cost must be multiplied
   for the strategy's excess return to reach zero.
-* **Trial.** One distinct (config fingerprint, mode, start, end) in
-  `<runs_dir>/trials.jsonl`. The trial count feeds the DSR.
+* **Trial.** One distinct (config fingerprint, mode, start, end, prompts digest) in
+  `<runs_dir>/trials.jsonl` (the prompts digest is empty for quant runs). The trial count
+  feeds the DSR.
 
 ## Summary
 
@@ -107,8 +108,9 @@ clean window should start at the later of the two dates plus one month (RESEARCH
 
 **Not automated.** Measuring a model's effective cutoff. If you measure one that is later
 than the vendor date, put the later date in `MODEL_TRAINING_CUTOFFS` by hand (a code
-change). The `pre_cutoff` flag on forecast records uses the raw cutoff without the 31-day
-buffer, so the scorecard's "pre-cutoff" column ends 31 days earlier than the backtest split.
+change). The `pre_cutoff` flag on forecast records uses the same cutoff plus
+`evaluation.cutoff_buffer_days` as the backtest split, so the scorecard's "pre-cutoff"
+column, calibration and the overlay bound treat the buffer as contaminated too.
 
 **Pass.** Every decision you count as evidence lies after `contamination_end`.
 
@@ -216,9 +218,9 @@ the six lines):
 
 | Research criterion | Report field | Threshold the code applies |
 |---|---|---|
-| Paired IC test against the simpler design | Paired table: "Committee pool minus Quant-only baseline" (mean difference, t-stat, reading). The interpretation repeats it. | Reading "positive (t >= 2)"; otherwise "default to the simpler design" |
-| Weighted versus equal-weight pool | Paired table: weighted minus equal-weight pool | t ≥ 2 |
-| IC significance, corrected for trials | IC table, pool row; the interpretation | t ≥ 2, or t ≥ 3 when more than 20 trials are recorded |
+| Paired IC test against the simpler design | Paired table: "Firm's final probability (traded) minus Quant-only baseline" (mean difference, t-stat, reading). The interpretation repeats it. | Reading "positive (t >= 2)" (t >= 3 when more than 20 trials are recorded); otherwise "default to the simpler design". Fewer than 12 dates: "anecdotal", no direction |
+| Weighted versus equal-weight pool | Paired table: "Firm's final probability (traded) minus Final probability, equal-weight pool" | t ≥ 2 (t ≥ 3 above 20 trials), at least 12 dates |
+| IC significance, corrected for trials | IC table, "Firm's final probability (traded)" row; the interpretation | t ≥ 2, or t ≥ 3 when more than 20 trials are recorded; fewer than 12 dates: "anecdotal" |
 | DSR ≥ 0.95 | Line 5 of the six lines; "Statistical significance" | DSR ≥ 0.95 (not computed with a single trial: PSR is shown instead) |
 | Factor alpha t ≥ 2 | "Factor attribution (ETF proxies)": alpha and its HAC t-stat (the T-bill rate is charged only on the invested fraction, because the simulator pays no interest on cash; the cash drag is shown on its own line) | t ≥ 2 |
 | 95th percentile against random books | Line 6 of the six lines; random-books table | percentile ≥ 95 ("its stock selection beat random picks") |

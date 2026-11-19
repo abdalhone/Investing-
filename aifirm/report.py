@@ -49,6 +49,10 @@ DSR_BAR = 0.95            # Bailey & Lopez de Prado: below this, skill is not di
 SHORT_SAMPLE_YEARS = 3.0
 LOW_EXPOSURE = 0.5        # below this average invested fraction, "beating the benchmark" is mostly cash timing
 BROAD_UNIVERSE = 50       # names per date from which a universe counts as broad for the power reading
+# Fewest resolved dates behind an IC (or a paired IC difference) before the report reads a
+# direction into it. With 2-3 dates a t-stat has 1-2 degrees of freedom and |t| >= 2 is
+# routine noise; the same minimum gates the adaptive overlay bound (process.overlay_min_dates).
+MIN_VERDICT_DATES = 12
 DISCLAIMER = ("Research software, not investment advice. Forecasts are probabilities, most of them close to a coin "
               "flip; past or simulated results do not predict future returns.")
 
@@ -511,17 +515,26 @@ def six_lines(r: BacktestResult) -> list[str]:
     ]
 
 
-def _ic_reading(t: object, mean: object) -> str:
+def _t_bar(r: BacktestResult) -> float:
+    """The t-stat a reading needs: 3 once more than 20 trials are recorded (research 7.4 S4), else 2."""
+    return 3.0 if r.n_trials > 20 else 2.0
+
+
+def _ic_reading(t: object, mean: object, n_dates: object = None, bar: float = 2.0) -> str:
+    """Table reading of an IC or a paired IC difference. No direction is read into fewer
+    than :data:`MIN_VERDICT_DATES` dates ("anecdotal"), and a direction needs ``|t| >= bar``."""
     if not _finite(mean):
         return "n/a"
     if mean == 0 and not _finite(t):
         return "identical"
     if not _finite(t):
         return "n/a"
-    if t >= 2:
-        return "positive (t >= 2)"
-    if t <= -2:
-        return "negative (t <= -2)"
+    if isinstance(n_dates, int) and n_dates < MIN_VERDICT_DATES:
+        return f"anecdotal: {n_dates} date(s) < {MIN_VERDICT_DATES}"
+    if t >= bar:
+        return f"positive (t >= {bar:g})"
+    if t <= -bar:
+        return f"negative (t <= -{bar:g})"
     return "not distinguishable from zero"
 
 
@@ -549,17 +562,20 @@ def _skill_section(r: BacktestResult) -> list[str]:
     if ev.ic:
         out += [*_table(["Signal", "Dates", "Mean IC", "IC std", "t-stat", "Hit rate", "Names per date", "Reading"],
                         [(label_name(k), s.n_dates, _num(s.mean, 3), _num(s.std, 3), _num(s.t_stat, 2),
-                          _pct(s.hit_rate, 0), _num(s.avg_names, 1), _ic_reading(s.t_stat, s.mean))
+                          _pct(s.hit_rate, 0), _num(s.avg_names, 1),
+                          _ic_reading(s.t_stat, s.mean, s.n_dates, _t_bar(r)))
                          for k, s in ev.ic.items()]), ""]
     else:
         out += ["No IC could be computed (no decision date had a forecast window that ended within the backtest).",
                 ""]
     if ev.ic_differences:
         out += ["Paired per-date IC differences (the test for \"does A rank stocks better than B\"; research 7.4 "
-                "asks for t >= 2 with a consistent sign before preferring the more complex design):", "",
+                f"asks for t >= {_t_bar(r):g} with a consistent sign before preferring the more complex design, and "
+                f"no direction is read into fewer than {MIN_VERDICT_DATES} dates):", "",
                 *_table(["A minus B", "Dates", "Mean difference", "t-stat", "Reading"],
                         [(f"{label_name(d.a)} minus {label_name(d.b)}", d.n_dates, _num(d.mean_diff, 3),
-                          _num(d.t_stat, 2), _ic_reading(d.t_stat, d.mean_diff)) for d in ev.ic_differences]), ""]
+                          _num(d.t_stat, 2), _ic_reading(d.t_stat, d.mean_diff, d.n_dates, _t_bar(r)))
+                         for d in ev.ic_differences]), ""]
 
     if ev.contaminated_ic:
         out += ["Whole window, contaminated decisions included (for reference only: NOT evidence of skill):", "",
@@ -695,7 +711,7 @@ def _overlay_value_section(r: BacktestResult) -> list[str]:
         out.append(f"- Ranking{' (clean dates only)' if ev is not None and ev.clean_after else ''}: the committee "
                    f"pool's per-date IC minus the quant-only baseline's is "
                    f"{_num(diff.mean_diff, 3)} on average over {diff.n_dates} dates (t = {_num(diff.t_stat, 2)}, "
-                   f"{diff.method}): {_ic_reading(diff.t_stat, diff.mean_diff)}.")
+                   f"{diff.method}): {_ic_reading(diff.t_stat, diff.mean_diff, diff.n_dates, _t_bar(r))}.")
     who = "the offline rules standing in for the language models" if ov.offline else "the language models"
     verdict = (f"{who} added value net of their cost in this backtest" if ov.value_added_usd > 0 else
                f"{who} did not pay for themselves in this backtest")
@@ -716,7 +732,8 @@ def _evaluation_interpretation(r: BacktestResult) -> list[str]:
 
     out: list[str] = []
     pool = ev.ic.get(POOL)
-    bar = 3.0 if r.n_trials > 20 else 2.0      # research 7.4 S4: t >= 3 for a pick from more than 20 trials
+    bar = _t_bar(r)                             # research 7.4 S4: t >= 3 for a pick from more than 20 trials
+    clean = "clean " if ev.clean_after is not None else ""
     if ev.clean_after is not None and ev.n_clean_decisions == 0:
         out.append(f"No decision was made after {ev.clean_after} (the models' training cutoff plus buffer), so no "
                    "clean evidence of ranking skill exists in this backtest; the whole-window IC, random books and "
@@ -725,26 +742,35 @@ def _evaluation_interpretation(r: BacktestResult) -> list[str]:
         out.append("No signal IC could be computed" + (f" on the clean decisions after {ev.clean_after}"
                                                        if ev.clean_after is not None else "")
                    + ", so the ranking skill of the forecasts is unmeasured.")
+    elif pool.n_dates < MIN_VERDICT_DATES:
+        out.append(f"The committee's ranking had a mean IC of {_num(pool.mean, 3)} over only {pool.n_dates} "
+                   f"{clean}date(s) (t = {_num(pool.t_stat, 2)}): anecdotal. No verdict on ranking skill is read into "
+                   f"fewer than {MIN_VERDICT_DATES} dates.")
     elif _finite(pool.t_stat) and pool.t_stat >= bar:
         out.append(f"The committee's ranking had a mean IC of {pool.mean:+.3f} over {pool.n_dates} "
-                   f"{'clean ' if ev.clean_after is not None else ''}dates (t = "
+                   f"{clean}dates (t = "
                    f"{pool.t_stat:.2f}, {pool.method}), above the t >= {bar:g} bar for {r.n_trials} recorded "
                    "configuration(s).")
     else:
         out.append(f"The committee's ranking had a mean IC of {_num(pool.mean, 3)} over {pool.n_dates} "
-                   f"{'clean ' if ev.clean_after is not None else ''}dates (t = "
+                   f"{clean}dates (t = "
                    f"{_num(pool.t_stat, 2)}, {pool.method}): not distinguishable from no skill (bar: t >= {bar:g}).")
     for d in ev.ic_differences:
         if d.a == POOL and d.b == QUANT_ONLY:
-            if _finite(d.t_stat) and abs(d.t_stat) >= 2:
+            if d.n_dates < MIN_VERDICT_DATES:
+                out.append(f"Anecdotal: the LLM committee's ranking was compared with the quant-only model's on only "
+                           f"{d.n_dates} {clean}date(s) (mean IC difference {_num(d.mean_diff, 3)}, t = "
+                           f"{_num(d.t_stat, 2)}); no verdict is read into fewer than {MIN_VERDICT_DATES} dates, so by "
+                           "research 7.4 default to the simpler design.")
+            elif _finite(d.t_stat) and abs(d.t_stat) >= bar:
                 better = "better" if d.mean_diff > 0 else "worse"
                 out.append(f"The LLM committee ranked stocks {better} than the quant-only model (mean IC difference "
-                           f"{d.mean_diff:+.3f}, t = {d.t_stat:.2f} over {d.n_dates} "
-                           f"{'clean ' if ev.clean_after is not None else ''}dates).")
+                           f"{d.mean_diff:+.3f}, t = {d.t_stat:.2f} over {d.n_dates} {clean}dates; bar t >= "
+                           f"{bar:g}).")
             else:
                 out.append(f"The LLM committee's ranking is not distinguishable from the quant-only model's (mean IC "
-                           f"difference {_num(d.mean_diff, 3)}, t = {_num(d.t_stat, 2)}); by research 7.4 default to "
-                           "the simpler design.")
+                           f"difference {_num(d.mean_diff, 3)}, t = {_num(d.t_stat, 2)}, bar t >= {bar:g}); by "
+                           "research 7.4 default to the simpler design.")
     if ev.power is not None and ev.power.anecdotal:
         pw = ev.power
         if _finite(pw.dates_for_80pct):
