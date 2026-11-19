@@ -480,10 +480,11 @@ def ic_verdict(n_dates: int, min_dates: int, mean_diff: float | None, t_stat: fl
                              f"|t| >= {VERDICT_T:g}): by research 7.4, default to the simpler quant-only design.")
 
 
-def _live_failed_note(failed: list[str], last: str | None = None) -> str:
+def _live_failed_note(failed: list[str], last: str | None = None, spent: float = 0.0) -> str:
     shown = ", ".join(failed[:5]) + (", ..." if len(failed) > 5 else "")
     after = [d for d in failed if last is None or d >= last]
-    tail = (" Their LLM spend is in the spend shown above, not yet in any compared NAV." if last is None else
+    tail = ((" Their LLM spend is in the spend shown above, not yet in any compared NAV." if spent else
+             " No LLM spend was recorded for them.") if last is None else
             " The spend of failed attempts is counted: in the LLM spend when it lies before the compared session, "
             "else as spend not yet in the compared NAVs." if after else
             " The LLM spend of the failed attempts is counted.")
@@ -556,7 +557,7 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
             out.notes.append(f"LLM spend since the shadow's inception: {_usd(out.llm_spend_pending_usd)} (failed "
                              "attempts included), not yet in any compared NAV.")
         if out.live_failed:
-            out.notes.append(_live_failed_note(out.live_failed))
+            out.notes.append(_live_failed_note(out.live_failed, spent=out.llm_spend_pending_usd))
         return out
     last = common[-1]
     out.nav_date, out.live_nav, out.shadow_nav = last, live_nav[last], shadow_nav[last]

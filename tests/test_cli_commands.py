@@ -99,7 +99,7 @@ def test_reid_probe_refuses_without_credentials_unless_offline(env, prices, caps
     args = ["reid-probe", "--config", env.config, "--start", _day(prices, 300), "--end", _day(prices, 500), "--n", "12"]
     assert cli.main(args) == 1
     err = capsys.readouterr().err
-    assert "credentials" in err and "--offline runs the harness with a random guesser" in err
+    assert "credentials" in err and "add --offline to run the harness with a seeded random guesser" in err and "deterministic" not in err
     assert not env.runs.exists()
 
     assert cli.main([*args, "--offline"]) == 1                # 12 probes cannot pass a 400-probe gate

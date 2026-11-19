@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -98,7 +99,10 @@ class RiskState:
     de-risk episode, the absolute weight the de-risk last set for each leg;
     ``derisk_shares``: the same level as a share count (weight x NAV / price when it was
     set), so a later cycle can tell a sale that did not execute (more shares than recorded)
-    from a hold whose price merely rose (same shares, higher weight). They default so that a state saved before they existed
+    from a hold whose price merely rose (same shares, higher weight);
+    ``derisk_share_dates``: the as-of date each share count is on, so a stock split since
+    then is applied before comparing (a 10:1 split is ten times the shares, not a sale that
+    did not execute). They default so that a state saved before they existed
     loads unchanged."""
 
     peak_nav: float
@@ -110,6 +114,7 @@ class RiskState:
     derisked: bool = False
     derisk_caps: dict[str, float] = field(default_factory=dict)
     derisk_shares: dict[str, float] = field(default_factory=dict)
+    derisk_share_dates: dict[str, str] = field(default_factory=dict)
 
 
 def _last_price(factsheets: dict[str, FactSheet], ticker: str) -> float:
@@ -180,7 +185,8 @@ def _hold_current(target: TargetPortfolio, current_weights: dict[str, float], be
 
 def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, prev_nav: float | None,
                       current_weights: dict[str, float], cfg: FirmConfig, factsheets: dict[str, FactSheet],
-                      runs_dir: str, *, worst_day_return: float | None = None) -> tuple[TargetPortfolio, list[str]]:
+                      runs_dir: str, *, worst_day_return: float | None = None,
+                      split_ratio: Callable[[str, str], float] | None = None) -> tuple[TargetPortfolio, list[str]]:
     """Apply the invariant rules (module docstring) and return ``(target, messages)``.
 
     ``state.frozen`` / ``state.frozen_at_nav`` are set in place when the freeze triggers,
@@ -190,7 +196,10 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
     to :func:`update_risk_state` so the peak is the true high-water mark.
     ``worst_day_return`` is the worst one-day NAV return since the previous cycle (a
     fraction; None if unknown); the daily-loss halt triggers if it, or ``nav / prev_nav - 1``,
-    is a loss of ``daily_loss_halt`` or more. ``current_weights`` includes the benchmark
+    is a loss of ``daily_loss_halt`` or more. ``split_ratio(ticker, since)`` is the product of
+    the ticker's split ratios with ``since`` < ex-date <= this cycle's as-of date (the de-risk
+    share record is put on today's share basis with it); None means no splits are known, and a
+    non-finite or non-positive ratio keeps the hold. ``current_weights`` includes the benchmark
     (core) leg. Messages are also appended to the returned target's notes.
     """
     rc, pc = cfg.risk, cfg.portfolio
@@ -246,6 +255,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         state.derisked = False
         state.derisk_caps = {}
         state.derisk_shares = {}
+        state.derisk_share_dates = {}
 
     # Drawdown: freeze (sticky) or de-risk.
     peak = max(float(state.peak_nav), float(nav))
@@ -265,6 +275,7 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             weights[t] = 0.0
         state.derisk_caps = {}
         state.derisk_shares = {}
+        state.derisk_share_dates = {}
     else:
         trough = min(float(state.trough_nav), float(nav)) if _valid_positive(state.trough_nav) else float(nav)
         recovery = trough + 0.5 * (peak - trough)        # half of the peak-to-trough drawdown recovered
@@ -285,12 +296,29 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             state.derisked = False
             state.derisk_caps = {}
             state.derisk_shares = {}
+            state.derisk_share_dates = {}
             msgs.append(f"re-risk: half of the drawdown from {peak:,.2f} to the trough {trough:,.2f} recovered (NAV "
                         f"{float(nav):,.2f}); full gross restored")
         if halve:
             by_ticker = {p.ticker: p for p in target.positions}
             caps = {} if newly else dict(state.derisk_caps)   # rebound, never mutated: copies of the state share it
             shares = {} if newly else dict(state.derisk_shares)
+            share_dates = {} if newly else dict(state.derisk_share_dates)
+            today = str(target.as_of)
+
+            def recorded_shares(t: str) -> float:
+                """The recorded share count of ``t`` on today's share basis (splits since the
+                record applied), or NaN when there is no record or the ratio is unusable."""
+                if t not in shares:
+                    return math.nan
+                since = share_dates.get(t)
+                ratio = 1.0
+                if split_ratio is not None and since is not None and since < today:
+                    try:
+                        ratio = float(split_ratio(t, since))
+                    except Exception:   # split data that cannot be read must not force a sale
+                        ratio = math.nan
+                return shares[t] * ratio if math.isfinite(ratio) and ratio > 0 else math.nan
             cut, kept, finished = [], [], []
             for t in weights:
                 if weights[t] == 0.0:
@@ -300,14 +328,16 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                 if HOLD_LABELS.intersection(pos.constraints_hit):
                     if newly:          # the held book is still full size: halve it once
                         new_w = weights[t] * DERISK_FACTOR
-                    elif (t in shares and math.isfinite(px := _last_price(factsheets, t))
-                          and abs(weights[t]) - shares[t] * px / float(nav) >= max(pc.no_trade_band, CAP_NOISE)):
+                    elif (math.isfinite(rec := recorded_shares(t)) and math.isfinite(px := _last_price(factsheets, t))
+                          and abs(weights[t]) - rec * px / float(nav) >= max(pc.no_trade_band, CAP_NOISE)):
                         # the book holds more shares than the de-risk left (the sale did not execute):
                         # finish it, back to the recorded share count, never below. Measured in shares,
                         # so a hold whose price rose (same shares, higher weight) is not sold; without
                         # a price or a recorded share count the hold is kept (an outage never forces a
-                        # sale on a guess). A gap under the no-trade band would not trade anyway.
-                        new_w = math.copysign(shares[t] * px / float(nav), weights[t])
+                        # sale on a guess; nor do unreadable split data). A gap under the no-trade
+                        # band would not trade anyway.
+                        new_w = math.copysign(rec * px / float(nav), weights[t])
+                        shares[t], share_dates[t] = rec, today        # the same record on today's basis
                         finished.append(t)
                     else:
                         new_w = weights[t]
@@ -325,15 +355,17 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                     caps[t] = abs(new_w)
                     px = _last_price(factsheets, t)
                     if math.isfinite(px):
-                        shares[t] = abs(new_w) * float(nav) / px
+                        shares[t], share_dates[t] = abs(new_w) * float(nav) / px, today
                     else:
                         shares.pop(t, None)
+                        share_dates.pop(t, None)
                 if new_w != weights[t]:
                     weights[t] = new_w
                     hits[t].append("risk:drawdown_derisk")
                     cut.append(t)
             state.derisk_caps = caps
             state.derisk_shares = shares
+            state.derisk_share_dates = share_dates
             msgs.append(why + (f"; cut: {', '.join(sorted(cut))}" if cut else
                                "; no leg is above its de-risk level, nothing cut"))
             if kept:

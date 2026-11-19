@@ -603,7 +603,9 @@ Rules, in order:
    than that by at least the no-trade band, i.e. the earlier sale did not execute (an order
    blocked for a missing price or ADV, or rejected). Judging in shares means a hold whose
    price rose after the sale (same shares, higher weight) is kept; without a price the hold
-   is kept. The record is cleared on re-risk, a freeze or a human reset. A
+   is kept. Each share count carries its date (`derisk_share_dates`), and stock splits since
+   then are applied before the comparison (`split_ratio`, from the price data), so a 10:1
+   split is not read as an unexecuted sale; unreadable split data keeps the hold. The record is cleared on re-risk, a freeze or a human reset. A
    hand-built target without `ideal_weight` is halved. The ledger message names the legs
    actually cut ("nothing cut" when every leg is already within its de-risk level).
 6. Restricted tickers and prices below `min_price` go to 0. A name without a verifiable

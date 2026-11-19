@@ -91,6 +91,9 @@ class CLIError(BookError):
 # --------------------------------------------------------------------------- helpers
 
 
+BACKTEST_NO_MODEL = "use --mode quant (no model) or --mode offline (the plumbing with deterministic rules, not AI)"
+
+
 def credentials_problem(alternative: str = "add --offline to use the deterministic offline rules (not AI)") -> str | None:
     """None if the Anthropic SDK can find credentials, else a message saying how to fix it.
     ``alternative`` is the command's own way to run without a model (commands differ: ``run``
@@ -258,8 +261,8 @@ def _refuse_redecision(book: Path, as_of: str, last: str | None, force: bool) ->
                    "(the override is recorded in the ledger).")
 
 
-def _claude(cfg: FirmConfig, budget_usd: float) -> LLM:
-    problem = credentials_problem()
+def _claude(cfg: FirmConfig, budget_usd: float, alternative: str | None = None) -> LLM:
+    problem = credentials_problem(alternative) if alternative else credentials_problem()
     if problem:
         raise CLIError(problem)
     return ClaudeLLM(budget_usd=budget_usd, use_fallbacks=cfg.models.use_server_fallbacks)
@@ -607,8 +610,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     end = _completed_session(args.end, "--end")
     llm = None
     if args.mode == "llm":
-        problem = credentials_problem(            # before the budget prompt: answering it must not be wasted
-            "use --mode quant (no model) or --mode offline (the plumbing with deterministic rules, not AI)")
+        problem = credentials_problem(BACKTEST_NO_MODEL)   # before the budget prompt: answering it must not be wasted
         if problem:
             raise CLIError(problem)
         cycles = len(pd.bdate_range(args.start, end)) // max(1, cfg.process.rebalance_every_days) + 1
@@ -619,7 +621,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         if not args.yes and not _confirm("Continue?"):
             print("cancelled")
             return 1
-        llm = _claude(cfg, budget)
+        llm = _claude(cfg, budget, BACKTEST_NO_MODEL)
     print(f"backtest {args.mode} {args.start} to {end}: progress lines go to stderr (a 100-name screened run takes "
           "tens of minutes)", file=sys.stderr, flush=True)
     result = run_backtest(cfg, args.start, end, args.mode, llm=llm,
@@ -704,10 +706,9 @@ def cmd_reid_probe(args: argparse.Namespace) -> int:
         print("OFFLINE: a seeded random guesser stands in for the model. This tests the harness and shows chance "
               "levels; it says nothing about what a real model can re-identify.")
     else:
-        problem = credentials_problem()
+        problem = credentials_problem("add --offline to run the harness with a seeded random guesser (no model)")
         if problem:
-            raise CLIError(f"{problem} (reid-probe sends {args.n} calls to the model; --offline runs the harness "
-                           "with a random guesser)")
+            raise CLIError(f"{problem} (reid-probe sends {args.n} calls to the model)")
         budget = args.budget if args.budget is not None else cfg.process.max_llm_cost_usd_per_run
         print(f"re-identification probe: up to {args.n} calls to {model}, LLM budget ${budget:,.2f}")
         if not args.yes and not _confirm("Continue?"):

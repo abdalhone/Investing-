@@ -547,3 +547,37 @@ def test_a_hold_whose_price_rose_after_the_derisk_sale_is_not_sold_again(tmp_pat
     out, _ = apply_risk_limits(_hold_target({"B": 0.096}, "SPY", AS_OF, "x"), state, 88.0, None, {"B": 0.096},
                                cfg, {}, str(tmp_path))
     assert _w(out) == pytest.approx({"B": 0.096})
+
+
+def test_a_stock_split_during_a_derisk_episode_is_not_read_as_a_sale_that_did_not_execute(tmp_path):
+    """Regression (round 5): the de-risk share record was not split-adjusted. After a 10:1 split
+    the as-traded price fell tenfold while the record did not grow, so a hold during an LLM
+    outage was cut to a tenth of its value. The record now carries its date and the split ratio
+    since then is applied; a sale that really was blocked is still finished on the new basis."""
+    from aifirm.pipeline import _hold_target
+    cfg = _cfg(tmp_path)
+    state = update_risk_state(RiskState(peak_nav=100.0), 88.0)
+    cur = {t: 0.08 for t in "AB"}
+    target = _hold_target(cur, "SPY", "2024-07-15", "LLM OUTAGE")
+    apply_risk_limits(target, state, 88.0, None, cur, cfg, _fss({"A": 200.0, "B": 200.0}), str(tmp_path))
+    assert state.derisk_share_dates == {"A": "2024-07-15", "B": "2024-07-15"}
+    # Both split 10:1. A's halving sale filled (0.04 of NAV); B's was blocked (still 0.08).
+    splits = lambda t, since: 10.0 if since < "2024-07-20" else 1.0      # noqa: E731
+    cur = {"A": 0.04, "B": 0.08}
+    out, msgs = apply_risk_limits(_hold_target(cur, "SPY", "2024-07-29", "LLM OUTAGE"), state, 88.0, None, cur, cfg,
+                                  _fss({"A": 20.0, "B": 20.0}), str(tmp_path), split_ratio=splits)
+    assert _w(out) == pytest.approx({"A": 0.04, "B": 0.04})
+    assert any("B cut to the level the de-risk set earlier" in m for m in msgs)
+    assert state.derisk_shares["B"] == pytest.approx(10 * 0.04 * 88.0 / 200.0)
+    assert state.derisk_share_dates["B"] == "2024-07-29"
+    # Unreadable split data never forces a sale: B is back above its record (say a later fill
+    # failed), but with a NaN or raising split lookup the hold is kept, not cut.
+    def broken(t, since):
+        raise ValueError("bad splits table")
+    for lookup in (lambda t, since: math.nan, broken):
+        out, _ = apply_risk_limits(_hold_target({"B": 0.08}, "SPY", "2024-08-12", "x"), state, 88.0, None,
+                                   {"B": 0.08}, cfg, _fss({"B": 20.0}), str(tmp_path), split_ratio=lookup)
+        assert _w(out) == pytest.approx({"B": 0.08})
+    out, _ = apply_risk_limits(_hold_target({"B": 0.08}, "SPY", "2024-08-12", "x"), state, 88.0, None, {"B": 0.08},
+                               cfg, _fss({"B": 20.0}), str(tmp_path), split_ratio=lambda t, since: 1.0)
+    assert _w(out) == pytest.approx({"B": 0.04})          # readable, no split since: the blocked sale is finished

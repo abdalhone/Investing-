@@ -618,3 +618,13 @@ def test_with_no_common_session_the_spend_of_a_failed_live_cycle_is_shown(tmp_pa
     assert c.llm_spend_pending_usd == pytest.approx(9.5)
     text = "\n".join(c.lines())
     assert "$9.50" in text and "compared session" not in text
+
+
+def test_with_no_common_session_and_no_spend_the_failed_note_does_not_point_to_a_spend_line(tmp_path):
+    cfg = make_config(str(tmp_path))
+    book = tmp_path / "book"
+    _ledger(book / "ledger.jsonl", [("cycle_start", {"as_of": "2024-02-01", "nav": 100_000.0}),
+                                    ("cycle_error", {"as_of": "2024-02-01", "error": "x", "usage": {"cost_usd": 0.0}})])
+    _ledger(book / "shadow" / "ledger.jsonl", [("shadow_inception", {"as_of": "2024-02-01", "nav": 100_000.0})])
+    text = "\n".join(shadow.compare_books(cfg, book, []).lines())
+    assert "No LLM spend was recorded for them." in text and "spend shown above" not in text

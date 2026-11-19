@@ -885,7 +885,8 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     state = replace(update_risk_state(state, nav), last_as_of=as_of)
     worst_day = _worst_day_return([*path, nav]) if path else None
     final, risk_messages = apply_risk_limits(reviewed, state, nav, None if path else prev_nav, current_weights, cfg,
-                                             factsheets, runs_dir, worst_day_return=worst_day)
+                                             factsheets, runs_dir, worst_day_return=worst_day,
+                                             split_ratio=lambda t, since: p.split_ratio(t, since, as_of))
     log("risk_engine", {"messages": risk_messages, "target": final, "risk_state": state,
                         "nav_path_days": len(path), "worst_day_return": worst_day})
 
