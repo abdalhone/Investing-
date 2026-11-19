@@ -45,10 +45,38 @@ Why each piece:
 5. **Core-satellite.** ``core_weight`` of NAV sits passively in the benchmark. The agents
    manage the rest, so a bad committee can only lose relative to part of the book.
 6. **Book limits** (gross and cash floor), stated as fractions of total NAV.
-7. **Trade path.** A no-trade band and a turnover cap avoid paying costs for noise.
-   Turnover is **one-way**: ``0.5 * sum(|w_target - w_current|)`` over every leg, core
-   included (buying 10% with the proceeds of selling 10% is 10% turnover), and
-   ``max_turnover`` caps that number.
+7. **Trade path.** A no-trade band, partial rebalancing and a turnover cap avoid paying
+   costs for noise (RESEARCH 6.4, 6.5). Each rebalance moves ``rebalance_fraction`` of the
+   way from the current weight to the target (default half), except that a step which
+   would leave a residual gap smaller than the no-trade band is completed (such a gap
+   could never be traded, so a sale would otherwise leave dust behind for ever). Turnover
+   is **one-way**: ``0.5 * sum(|w_target - w_current|)`` over every leg, core included
+   (buying 10% with the proceeds of selling 10% is 10% turnover), and ``max_turnover``
+   caps that number.
+
+Two position caps (RESEARCH 6.4: "8% target, 10% hard cap"): sizing caps each name at
+``portfolio.max_position`` (the target), while the hard limits the final book must
+satisfy use ``risk.max_position_hard``. So a holding that drifted above the target but
+stays under the hard cap is not force-traded (the band and partial rebalancing decide),
+and only a breach of the hard cap is repaired at once.
+
+Exposure: why the book can be mostly cash
+-----------------------------------------
+Capital that no name earns stays in cash (or in the benchmark core when ``core_weight``
+is set): there is no forecast that says "the benchmark", and holding cash is the
+fail-closed default. Because quarter Kelly on any real edge at a one-month horizon is far
+above the per-name cap, sizing is cap-bound, so the active gross is roughly
+``(number of names that clear min_prob_to_hold) x max_position`` until the volatility
+target, the sector caps or the cash floor bind. The deterministic quant's probabilities
+are deliberately modest (``0.5 +/- 0.06``), so ``p >= 0.52`` needs a composite factor
+score about 0.35 standard deviations above the universe mean: in a six-name universe
+that is one or two names, i.e. 8-20% invested, which is what an earlier real-data
+backtest showed (about 9%). That is a property of a narrow universe, not of the sizing
+formula: on a broad screened universe the deep-dive band supplies enough qualifying
+names for the caps and the volatility target to set the exposure. The exposure is made
+visible instead of tuned away: every target carries an ``exposure:`` note (names held,
+active gross, core, cash, how many names cleared the threshold and what bound), and
+backtest reports show the average invested fraction.
 
 Exceptions on the trade path:
 
@@ -369,16 +397,25 @@ def _apply_book_limits(active: dict[str, float], core: float, pc: PortfolioConfi
     notes.append(f"book limits ({', '.join(binding)}): active sleeve scaled by {f:.3f}")
 
 
+def _partial_step(delta: float, fraction: float, band: float) -> float:
+    """``fraction`` of the trade ``delta``, unless the remaining gap would be smaller than the
+    no-trade band (it could never be traded), in which case the whole trade."""
+    step = delta * fraction
+    return delta if abs(delta - step) < band else step
+
+
 def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: PortfolioConfig, limits: _Limits,
                 hits: dict[str, list[str]], notes: list[str], forced: frozenset[str] = frozenset(),
                 hold: Mapping[str, str] | None = None) -> dict[str, float]:
-    """No-trade band, turnover cap, then the compliance repair described in the module docstring.
+    """No-trade band, partial rebalancing, turnover cap, then the compliance repair described
+    in the module docstring.
 
     ``forced``: held legs that must be exited in full (no longer covered); they skip the
-    band and the turnover cap, and their turnover is spent first. ``hold``: held legs to
-    keep this cycle (ticker -> the constraint label recorded, e.g. ``no_view_hold``);
-    their trade is 0, like a band, unless a hard limit forces a cut (their ideal weight is
-    0, so a repair only ever moves them toward 0). Turnover is one-way:
+    band, partial rebalancing and the turnover cap, and their turnover is spent first.
+    ``hold``: held legs to keep this cycle (ticker -> the constraint label recorded, e.g.
+    ``no_view_hold``); their trade is 0, like a band, unless a hard limit forces a cut
+    (their ideal weight is 0, so a repair only ever moves them toward 0). Every other trade
+    moves ``rebalance_fraction`` of the way (:func:`_partial_step`). Turnover is one-way:
     ``0.5 * sum|dw|`` over every leg, core included."""
     hold = hold or {}
     legs = sorted(set(ideal) | set(current))
@@ -394,6 +431,11 @@ def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: Portfoli
         elif abs(delta[t]) < pc.no_trade_band:
             delta[t] = 0.0
             hits[t].append("no_trade_band")
+        elif pc.rebalance_fraction < 1.0:
+            step = _partial_step(delta[t], pc.rebalance_fraction, pc.no_trade_band)
+            if step != delta[t]:
+                delta[t] = step
+                hits[t].append("partial_rebalance")
     forced_turnover = 0.5 * sum(abs(delta[t]) for t in legs if t in forced)
     free = [t for t in legs if t not in forced and delta[t] != 0.0]
     free_turnover = 0.5 * sum(abs(delta[t]) for t in free)
@@ -567,7 +609,8 @@ def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[
     ideal[bench] = core
 
     # 6. trade path: band, turnover, compliance
-    limits = _Limits(bench=bench, long_only=pc.long_only, max_position=pc.max_position, max_sector=pc.max_sector,
+    limits = _Limits(bench=bench, long_only=pc.long_only, max_position=max(pc.max_position, cfg.risk.max_position_hard),
+                     max_sector=pc.max_sector,
                      max_gross=pc.max_gross, min_cash=pc.min_cash, vol_cap=pc.target_vol * (1.0 - core),
                      sector_of=sector_of, cov=cov)
     final = _trade_path(ideal, current, pc, limits, hits, notes, frozenset(forced), hold)
@@ -587,5 +630,27 @@ def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[
             constraints_hit=list(dict.fromkeys(hits.get(t, []))),
         ))
     core_final = final.get(bench, 0.0)
+    if any(p.weight != 0.0 and "partial_rebalance" in p.constraints_hit for p in positions) or \
+            "partial_rebalance" in hits.get(bench, []):
+        notes.append(f"partial rebalancing: trades move {pc.rebalance_fraction:.0%} of the way to the target "
+                     "(a remaining gap below the no-trade band is closed; forced exits go all the way)")
+    notes.append(exposure_note(positions, core_final, 1.0 - sum(final.values()), aggs, pc, bench))
     return TargetPortfolio(as_of=as_of, positions=positions, core_weight=core_final,
                            cash_weight=1.0 - sum(final.values()), notes=notes)
+
+
+def exposure_note(positions: list[TargetPosition], core: float, cash: float, aggs: Mapping[str, AggregatedView],
+                  pc: PortfolioConfig, bench: str) -> str:
+    """One line explaining the book's exposure (module docstring, "Exposure"): names held,
+    active gross, core and cash, how many names cleared the hold threshold and which
+    book-level constraints bound. Starts with ``"exposure:"``."""
+    held = [p for p in positions if p.weight != 0.0]
+    gross = sum(abs(p.weight) for p in held)
+    cleared = sum(1 for t, a in aggs.items() if t != bench and a.prob_outperform >= pc.min_prob_to_hold)
+    capped = sum(1 for p in held if "max_position" in p.constraints_hit)
+    bound = sorted({h for p in held for h in p.constraints_hit
+                    if h in ("vol_target", "sector_cap", "max_gross", "min_cash", "turnover_cap", "partial_rebalance")})
+    return (f"exposure: {len(held)} name(s), active gross {gross:.1%}, core {core:.1%}, cash {cash:.1%}; "
+            f"{cleared} of {len(aggs)} name(s) cleared min_prob_to_hold {pc.min_prob_to_hold:g}; "
+            f"{capped} at the per-name cap {pc.max_position:g}"
+            + (f"; book-level bounds: {', '.join(bound)}" if bound else ""))

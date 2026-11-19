@@ -162,6 +162,15 @@ def _annual_vol_pct(fs: FactSheet) -> tuple[float, bool]:
     return (v, False) if v is not None else (FALLBACK_VOL_PCT, True)
 
 
+def horizon_sigma_pct(fs: FactSheet, horizon_days: int) -> float:
+    """The stock's volatility over ``horizon_days`` in percent, as the quant uses it:
+    ``vol_60d`` (or the 30% fallback) times ``sqrt(horizon_days / 252)``. The overlay uses
+    the same scale to turn a final probability into an expected excess return."""
+    if horizon_days <= 0:
+        raise ValueError(f"horizon_days must be positive, got {horizon_days}")
+    return _annual_vol_pct(fs)[0] * math.sqrt(horizon_days / TRADING_DAYS)
+
+
 def _direction(z: float) -> str:
     if z > NEUTRAL_Z:
         return "positive"
@@ -188,8 +197,8 @@ def _view(fs: FactSheet, s: _Scores, horizon_days: int, n_universe: int) -> Anal
     if s.composite is None:
         return _abstain(fs.ticker, n_universe)
     p = composite_probability(s.composite)
-    vol_pct, vol_fallback = _annual_vol_pct(fs)
-    sigma_h_pct = vol_pct * math.sqrt(horizon_days / TRADING_DAYS)
+    vol_fallback = _annual_vol_pct(fs)[1]
+    sigma_h_pct = horizon_sigma_pct(fs, horizon_days)
     excess = sigma_h_pct * float(norm.ppf(p))
     spread = _GH_SPREAD * sigma_h_pct
     scenarios = [

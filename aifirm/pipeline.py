@@ -7,9 +7,17 @@ backtest exercises exactly the code that would trade (P10). The cycle, in order:
    resolved from prices cut at ``as_of``; a few of the most informative ones get a
    process lesson. Believability weights and lessons are then read *point-in-time*:
    only outcomes resolved on or before ``as_of`` count.
-2. **Committee per ticker (P4, P5, P6).** The deterministic quant view is computed for the
-   whole universe at once (it is cross-sectional), then each ticker's committee runs
-   sequentially; inside a committee the analysts run concurrently.
+2. **Screen, news, committee (P4, P5, P6).** The deterministic quant view is computed for
+   the whole universe at once (it is cross-sectional). With ``universe.screen`` enabled it
+   ranks the broad universe and only the top band plus every held name go to the LLM
+   committee (:mod:`aifirm.quant.screen`); otherwise every universe name does. Live
+   headlines of those names are read by the quarantined news reader into tier-labelled
+   events (:mod:`aifirm.agents.news_reader`); no other agent ever sees raw headline text,
+   and headlines that are not read are withheld. Each ticker's committee then runs
+   sequentially (analysts concurrently inside it), with each LLM analyst's view passed
+   through the tier gate and its point-in-time calibration map before pooling, and the
+   quant core tilted by the bounded LLM overlay (``process.combination``), whose bound
+   shrinks when resolved forecasts show the LLM pool ranking worse than the quant.
 3. **Code sizes, LLMs may only shrink (P1, P8).** ``construct_portfolio`` turns pooled
    views into weights. The LLM risk review can only scale them down, and the
    deterministic risk engine (P9) has the last word before orders are generated.
@@ -28,6 +36,9 @@ Fail-closed rules specific to this module:
 * **A risk-review halt keeps the book.** ``apply_risk_review`` receives the current
   weights, so ``halt_trading`` means no trades from the committee this cycle (as the
   reviewer is told), never a sale of the active sleeve; the risk engine still applies.
+* **A news reader failure is a data gap, not an outage.** The sheet gets no news events
+  and a gap note; reader calls never count toward the outage rule, and with no events the
+  tier gate means news cannot raise exposure anyway.
 * **A data source that fails is a data gap, not a crash** (``gather_data``): the agents
   are told what is missing and must not fill it in from memory (P2). A missing
   benchmark is the exception: without it nothing can be resolved or compared, so the
@@ -50,6 +61,7 @@ into a decision by passing the full history (P3).
 
 from __future__ import annotations
 
+import copy
 import math
 import threading
 from collections import Counter
@@ -58,17 +70,21 @@ from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
-from .agents import CommitteeResult, apply_risk_review, llm_analysts, review_portfolio, run_committee, write_lesson
+from .agents import (CommitteeResult, apply_risk_review, llm_analysts, read_headlines, review_portfolio, run_committee,
+                     write_lesson)
 from .config import FirmConfig
 from .data.factsheet import FactSheet, build_factsheet
 from .data.fundamentals import Fundamentals, load_fundamentals, recent_filings
 from .data.macro import MacroValue, macro_snapshot
 from .data.news import Headline, recent_headlines
 from .data.prices import PriceData, load_prices
-from .journal import COMMITTEE_AGENT, ForecastStore, Ledger, LessonStore, believability_weights, make_forecast_records
+from .journal import (COMMITTEE_AGENT, Calibrator, ForecastStore, Ledger, LessonStore, believability_weights,
+                      fit_calibrators, make_forecast_records)
 from .llm.client import LLM, CallRecord, OfflineLLM
-from .portfolio import RiskState, apply_risk_limits, construct_portfolio, orders_from_target, update_risk_state
-from .quant import QUANT_AGENT, quant_views
+from .portfolio import (OverlayBound, RiskState, adaptive_bound, apply_risk_limits, construct_portfolio,
+                        orders_from_target, update_risk_state)
+from .quant import QUANT_AGENT, ScreenResult, quant_views, screen_universe
+from .universes import file_tickers, preset_tickers
 from .schemas import (AggregatedView, ForecastRecord, Lesson, Order, RiskReview, TargetPortfolio, TargetPosition,
                       ViewRecord)
 
@@ -105,10 +121,24 @@ def _short(exc: BaseException) -> str:
 
 def universe(cfg: FirmConfig) -> list[str]:
     """Investable tickers in config order: upper-cased, de-duplicated, benchmark excluded
-    (the benchmark is the passive core, never an active name)."""
+    (the benchmark is the passive core, never an active name).
+
+    With ``universe.screen`` enabled the list is ``universe.tickers`` followed by the
+    screen's sources: the bundled ``preset``, the tickers in ``file`` (relative to the
+    config file, :meth:`FirmConfig.screen_file_path`) and the inline ``tickers``. An
+    unknown preset raises ``KeyError`` and a missing file ``FileNotFoundError`` (fail
+    loudly: a silently empty universe would never trade and never say why)."""
     bench = cfg.universe.benchmark.upper()
+    sources = list(cfg.universe.tickers)
+    scr = cfg.universe.screen
+    if scr.enabled:
+        if scr.preset.strip():
+            sources += preset_tickers(scr.preset)
+        if scr.file.strip():
+            sources += file_tickers(cfg.screen_file_path())
+        sources += list(scr.tickers)
     out: list[str] = []
-    for t in cfg.universe.tickers:
+    for t in sources:
         u = t.strip().upper()
         if u and u != bench and u not in out:
             out.append(u)
@@ -327,12 +357,33 @@ class Decision:
     held_by_outage: bool = False
     ledger_head: str = ""
     lessons_used: dict[str, int] = field(default_factory=dict)
+    screen: ScreenResult | None = None                     # the broad-universe screen (None when disabled)
+    overlay_bound: OverlayBound | None = None              # the overlay bound in force (overlay mode)
+    calibrators: dict[str, Calibrator] = field(default_factory=dict)   # per LLM analyst (empty when disabled)
+    news: dict[str, dict] = field(default_factory=dict)    # ticker -> news reading summary (live news only)
+
+    def exposure(self) -> dict[str, float]:
+        """The final book's exposure: ``active_gross`` (sum of |active weights|), ``core``
+        (benchmark leg), ``cash`` and ``n_names`` (active names held), fractions of NAV."""
+        w = self.target_final.weights()
+        return {"active_gross": float(sum(abs(x) for x in w.values())), "core": float(self.target_final.core_weight),
+                "cash": float(self.target_final.cash_weight), "n_names": float(len(w))}
+
+    def final_probabilities(self) -> dict[str, float]:
+        """The probability the firm holds for every name it scored this cycle: the committee's
+        final probability for committee names, the quant's for screened names that were not
+        deep-dived (the probability that kept them out of the book)."""
+        out = dict(self.screen.quant_probs()) if self.screen is not None else {}
+        out.update({t: a.prob_outperform for t, a in self.aggregates.items()})
+        return out
 
 
 # --------------------------------------------------------------------------- helpers
 
 
-_EVENT_STAGE = {"view": 0, "aggregate": 1, "challenge": 2, "revision": 3, "memo": 5}   # revised aggregate: 4
+# Sealed stages, in order; the revised "pool_inputs" and "aggregate" (after a challenge) take 5 and 6.
+_EVENT_STAGE = {"view": 0, "pool_inputs": 1, "aggregate": 2, "challenge": 3, "revision": 4, "memo": 7}
+_REVISED_STAGE = {"pool_inputs": 5, "aggregate": 6}
 
 
 class _EventBuffer:
@@ -351,9 +402,10 @@ class _EventBuffer:
         def key(item: tuple[int, tuple[str, dict]]) -> tuple:
             i, (event, payload) = item
             if event == "revision":     # the only events emitted concurrently
-                return (3, str(payload.get("agent", "")), int(payload.get("sample", 0)), i)
-            stage = 4 if event == "aggregate" and payload.get("stage") == "revised" else _EVENT_STAGE.get(event, 6)
-            return (stage, "", 0, i)
+                return (_EVENT_STAGE["revision"], str(payload.get("agent", "")), int(payload.get("sample", 0)), i)
+            if payload.get("stage") == "revised" and event in _REVISED_STAGE:
+                return (_REVISED_STAGE[event], "", 0, i)
+            return (_EVENT_STAGE.get(event, 8), "", 0, i)
         return [e for _, e in sorted(enumerate(self.events), key=key)]
 
 
@@ -554,10 +606,70 @@ def _write_lessons(llm: LLM, resolved: list[ForecastRecord], cfg: FirmConfig, le
 
 
 def _factsheet_payload(fs: FactSheet) -> dict:
+    """The sheet as the agents were given it, for the ledger. Raw headline text appears only
+    under ``quarantined_headlines`` (audit) once the sheet is quarantined."""
     return {"ticker": fs.ticker, "name": fs.name, "sector": fs.sector,
             "facts": [{"id": f.id, "label": f.label, "value": f.value, "unit": f.unit, "as_of": f.as_of,
                        "source": f.source} for f in fs.facts],
-            "events": fs.events, "headlines": fs.headlines, "data_gaps": fs.data_gaps}
+            "events": fs.events, "headlines": fs.headlines, "data_gaps": fs.data_gaps,
+            "news_quarantined": fs.news_quarantined,
+            "news_events": {fid: ev.model_dump() for fid, ev in fs.news_events.items()},
+            "quarantined_headlines": fs.quarantined_headlines}
+
+
+def _quarantine_news(cfg: FirmConfig, llm: LLM | None, model: LLM, as_of: str, factsheets: Mapping[str, FactSheet],
+                     read_for: Iterable[str], log: Callable[[str, Mapping], None]) -> tuple[dict[str, FactSheet],
+                                                                                          dict[str, dict]]:
+    """Quarantine every sheet that carries raw headlines (RESEARCH 5.5, 9.3 item 3).
+
+    Sheets of ``read_for`` tickers are read by the news reader when it is enabled and a
+    language model is available: their headlines become tier-labelled event facts
+    (``FactSheet.attach_news_events``). Every other sheet with headlines gets no events and
+    a data-gap note, so raw headline text never reaches an analyst, the chair or the risk
+    reviewer. Any reader failure, including an unexpected exception, is the same: no
+    events and a gap (fail closed; it is not counted as an LLM outage). Sheets are copied
+    before they are changed: the caller's sheets are never modified. Returns the sheets
+    and a per-ticker summary of each reading."""
+    out = dict(factsheets)
+    summaries: dict[str, dict] = {}
+    wanted = set(read_for)
+    pc, mc = cfg.process, cfg.models
+    domains = cfg.universe.issuer_domain_map()
+    for t in sorted(factsheets):
+        fs = factsheets[t]
+        if not fs.headlines or fs.news_quarantined:
+            continue
+        fs = copy.deepcopy(fs)
+        if t not in wanted:
+            why = "not read: outside this cycle's deep-dive set"
+        elif not pc.news_reader_enabled:
+            why = "not read: the news reader is disabled (process.news_reader_enabled)"
+        elif llm is None:
+            why = "not read: no language model in this run"
+        else:
+            why = ""
+        if why:
+            fs.attach_news_events([], gaps=[f"Headlines withheld ({why}); no news events this cycle - do not "
+                                            "assume any news"])
+            summaries[t] = {"read": False, "reason": why, "n_headlines": len(fs.quarantined_headlines)}
+            out[t] = fs
+            continue
+        try:
+            res = read_headlines(model, t, fs.headlines, as_of, model=mc.news_reader_model,
+                                 effort=mc.news_reader_effort, issuer_domains=domains.get(t, ()),
+                                 max_headlines=pc.news_max_headlines, isolate_untrusted=pc.news_isolate_untrusted)
+            fs.attach_news_events(res.events, res.gaps)
+            payload = res.to_dict()
+        except Exception as exc:  # noqa: BLE001 - any reader error is a data gap, never a crash or a trade
+            reason = _short(exc)
+            fs.attach_news_events([], gaps=[f"News could not be read ({reason}); no news events this cycle - do not "
+                                            "assume any news"])
+            payload = {"ticker": t, "as_of": as_of, "events": [], "failed": True, "error": reason}
+        log("news_reading", payload)
+        summaries[t] = {"read": True, "failed": bool(payload.get("failed")), "n_events": len(payload["events"]),
+                        "tiers": dict(Counter(e["tier"] for e in payload["events"]))}
+        out[t] = fs
+    return out, summaries
 
 
 # --------------------------------------------------------------------------- the decision cycle
@@ -636,8 +748,32 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     missing = [t for t in universe(cfg) if t not in factsheets]
     if missing:
         warnings.append(f"no fact sheet (no price data) for: {', '.join(missing)}; no view this cycle")
+    held_names = {t for t, w in current_weights.items() if float(w) != 0.0 and t != bench}
+    overlay = cfg.process.combination == "overlay"
+    if overlay and QUANT_AGENT not in cfg.analysts.enabled:
+        warnings.append("process.combination is 'overlay' but the quant analyst is not enabled: every name's core is "
+                        "0.5, so the LLM pool can move probabilities by at most the overlay bound")
+
+    # 2a. the quant over the whole cross-section; the screen picks the deep-dive set (code, no LLM)
+    screen_on = cfg.universe.screen.enabled
+    want_quant = (QUANT_AGENT in cfg.analysts.enabled or screen_on) and bool(tickers)
+    qviews = quant_views([factsheets[t] for t in tickers], cfg.process.horizon_days) if want_quant else {}
+    screen: ScreenResult | None = None
+    if screen_on:
+        sc = cfg.universe.screen
+        screen = screen_universe({t: factsheets[t] for t in tickers}, qviews, p, as_of, top_n=sc.deep_dive_top_n,
+                                 min_dollar_volume=sc.min_dollar_volume, min_price=cfg.risk.min_price,
+                                 held=held_names)
+        committee_tickers = list(screen.deep_dive)
+    else:
+        committee_tickers = list(tickers)
+
+    # 2b. news: quarantined reader for the committee's names; every other headline is withheld
+    factsheets, news = _quarantine_news(cfg, llm, model, as_of, factsheets, committee_tickers, log)
     for t in tickers:
         log("factsheet", _factsheet_payload(factsheets[t]))
+    if screen is not None:
+        log("screen", screen.to_dict())
 
     # 1. resolve, learn, then read the track record point-in-time (P7, P3)
     resolved = forecast_store.resolve(p, as_of)
@@ -652,26 +788,42 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
             warnings.append(f"{n} due forecast(s) cannot be resolved yet: {why}")
     lessons_written = _write_lessons(llm, resolved, cfg, ledger, lesson_store, log) if llm is not None else []
     agents = list(dict.fromkeys(cfg.analysts.enabled))
+    records = forecast_store.all()
     # Deterministic rules (offline mode, the quant) cannot have memorised history, so their
     # forecasts count toward weights whatever their date; a real LLM's pre-cutoff ones do not (P10).
-    believability = believability_weights(forecast_store.all(), as_of, agents,
-                                          include_pre_cutoff=llm is None or llm.is_offline)
+    include_pre = llm is None or llm.is_offline
+    believability = believability_weights(records, as_of, agents, include_pre_cutoff=include_pre,
+                                          min_dates=cfg.process.believability_min_dates)
     readers = [*llm_analysts(cfg), COMMITTEE_AGENT]
     k = cfg.analysts.max_lessons_in_prompt
     lessons = {a: lesson_store.retrieve(a, as_of, k=k) for a in readers}
     log("believability", {"weights": believability, "lessons_retrieved": {a: len(v) for a, v in lessons.items()}})
+    calibrators: dict[str, Calibrator] = {}
+    if cfg.calibration.enabled and llm_analysts(cfg):
+        calibrators = fit_calibrators(records, as_of, llm_analysts(cfg), include_pre_cutoff=include_pre,
+                                      min_n=cfg.calibration.min_n, prior_strength=cfg.calibration.prior_strength,
+                                      models=cfg.models.analyst_models)
+    log("calibration", {"enabled": cfg.calibration.enabled,
+                        "calibrators": {a: c.to_dict() for a, c in calibrators.items()}})
+    bound: OverlayBound | None = None
+    if overlay:
+        bound = adaptive_bound(records, as_of, cfg, include_pre_cutoff=include_pre)
+        log("overlay_bound", bound.to_dict())
+        if bound.max_tilt < bound.configured:
+            warnings.append(f"overlay bound reduced to {bound.max_tilt:.3f} (configured {bound.configured:.3f}): "
+                            f"{bound.reason}")
 
-    # 2. committee per ticker (sequential over tickers; analysts are concurrent inside)
-    qviews = (quant_views([factsheets[t] for t in tickers], cfg.process.horizon_days)
-              if QUANT_AGENT in cfg.analysts.enabled and tickers else {})
+    # 2c. committee per deep-dive ticker (sequential over tickers; analysts are concurrent inside)
     committee: dict[str, CommitteeResult] = {}
     memo_total = memo_failed = 0
-    for t in tickers:
+    quant_seat = QUANT_AGENT in cfg.analysts.enabled
+    for t in committee_tickers:
         buffer = _EventBuffer()
         try:
-            committee[t] = run_committee(model, factsheets[t], cfg, quant_view=qviews.get(t),
+            committee[t] = run_committee(model, factsheets[t], cfg, quant_view=qviews.get(t) if quant_seat else None,
                                          believability=believability, lessons=lessons,
-                                         held=float(current_weights.get(t, 0.0)) != 0.0, log=buffer)
+                                         held=float(current_weights.get(t, 0.0)) != 0.0, log=buffer,
+                                         calibrators=calibrators, max_tilt=bound.max_tilt if bound else None)
         finally:   # the real ticker on every event (in blind mode an LLM may echo the alias)
             for event, payload in buffer.ordered():
                 log(event, {**payload, "ticker": t})
@@ -727,7 +879,7 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     # Every NAV since the previous decision updates the high-water mark, and the worst one-day
     # loss among them can halt buying (P9): a crash between rebalances must not go unseen.
     held = {t for t, w in current_weights.items() if float(w) != 0.0}
-    market = market_snapshot(p, as_of, {*tickers, bench, *held, *(positions or {})})
+    market = market_snapshot(p, as_of, {*committee_tickers, bench, *held, *(positions or {})})
     if positions is None:
         positions = {t: float(w) * nav / market.prices[t] for t, w in current_weights.items()
                      if float(w) != 0.0 and t in market.prices}
@@ -750,9 +902,22 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     log("orders", {"orders": orders, "messages": order_messages, "reference_prices": market.prices,
                    "adv": market.adv})
 
-    # 5. every non-abstaining view becomes a resolvable forecast (P7)
-    made = [rec for t in tickers for rec in
+    # 5. every non-abstaining view becomes a resolvable forecast (P7): the RAW stated views, the
+    # final probability ("committee") and the LLM pool ("llm_pool"); with the screen, also the
+    # quant's forecast for every screened name that was not deep-dived (breadth for IC tests).
+    made = [rec for t in committee for rec in
             make_forecast_records(run_id, as_of, committee[t].views, committee[t].aggregate, cfg, calendar)]
+    if screen is not None and quant_seat:     # the quant's own forecasts (it sits on the committee)
+        for t in tickers:
+            q = qviews.get(t)
+            if t in committee or q is None or q.view.abstain:
+                continue
+            solo = AggregatedView(ticker=t, prob_outperform=q.view.prob_outperform,
+                                  prob_equal_weight=q.view.prob_outperform,
+                                  expected_excess_return_pct=q.view.expected_excess_return_pct, dispersion=0.0,
+                                  n_views=1, n_abstained=0)
+            made += [r for r in make_forecast_records(run_id, as_of, [q], solo, cfg, calendar)
+                     if r.agent == QUANT_AGENT]
     forecasts = forecast_store.add(made)
     if len(forecasts) < len(made):     # a re-decision of a session already decided (run --force)
         warnings.append(f"{len(made) - len(forecasts)} forecast(s) were not stored: this session was already "
@@ -761,7 +926,7 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
                               "not_stored_repeats": len(made) - len(forecasts)})
 
     usage = _usage_summary(model.usage.calls[calls_before:])
-    data_gaps = {t: list(factsheets[t].data_gaps) for t in tickers if factsheets[t].data_gaps}
+    data_gaps = {t: list(factsheets[t].data_gaps) for t in committee if factsheets[t].data_gaps}
     log("cycle_end", {"n_orders": len(orders), "usage": usage, "warnings": warnings,
                       "held_by_outage": held_by_outage})
     return Decision(
@@ -771,5 +936,6 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
         risk_messages=risk_messages, orders=orders, order_messages=order_messages, market=market,
         forecasts=forecasts, resolved=resolved, lessons_written=lessons_written, risk_state=state,
         usage=usage, warnings=warnings, data_gaps=data_gaps, held_by_outage=held_by_outage,
-        ledger_head=ledger.head, lessons_used={a: len(v) for a, v in lessons.items()},
+        ledger_head=ledger.head, lessons_used={a: len(v) for a, v in lessons.items()}, screen=screen,
+        overlay_bound=bound, calibrators=calibrators, news=news,
     )

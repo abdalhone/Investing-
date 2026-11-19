@@ -118,6 +118,35 @@ class PaperBroker:
         self.dividends_through: str | None = None
         self.last_rejections: list[str] = []     # why orders in the last submit() did not (fully) fill
 
+    @classmethod
+    def from_snapshot(cls, cash: float, positions: Mapping[str, float], cfg: CostConfig,
+                      state_path: str | None = None, *, marks: Mapping[str, float] | None = None,
+                      dividends_through: str | None = None, allow_short: bool = False) -> "PaperBroker":
+        """A paper book holding ``positions`` (shares) and ``cash``, with no cost or dividend
+        history: a fork of another book's state (the quant-only shadow book starts this way).
+
+        ``marks`` seeds the stale-mark fallback of :meth:`nav`; ``dividends_through`` is the
+        last session whose dividends the source book had already settled (so they are not
+        credited again). Raises ``ValueError`` on negative or non-finite cash, a non-finite
+        share count, or a short position when ``allow_short`` is False. The state is saved
+        when ``state_path`` is given."""
+        broker = cls(cash, cfg, state_path, allow_short=allow_short)
+        shares = {}
+        for t, q in sorted(positions.items()):
+            v = float(q)
+            if not math.isfinite(v):
+                raise ValueError(f"share count for {t} is not finite: {q!r}")
+            if v < 0 and not allow_short:
+                raise ValueError(f"short position in {t} ({v:g} shares) but allow_short is False")
+            if abs(v) >= ZERO_SHARES:
+                shares[str(t)] = v
+        broker._positions = shares
+        broker._marks = {str(t): float(p) for t, p in (marks or {}).items() if _positive(p) is not None}
+        broker.dividends_through = str(dividends_through)[:10] if dividends_through else None
+        if state_path:
+            broker.save()
+        return broker
+
     # -- Broker protocol -------------------------------------------------------------
     def positions(self) -> dict[str, float]:
         return dict(self._positions)

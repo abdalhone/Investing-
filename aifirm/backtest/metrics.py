@@ -187,6 +187,91 @@ def performance_report(
     return rep
 
 
+def long_run_variance(x: np.ndarray | pd.Series, lags: int = 0) -> float:
+    """Newey-West (Bartlett kernel) long-run variance of a series about its mean.
+
+    ``Gamma_l = sum_{t>l} (x_t - mean)(x_{t-l} - mean) / (n - 1)`` and
+    ``LRV = Gamma_0 + 2 * sum_{l=1..L} (1 - l/(L+1)) * Gamma_l``. With ``lags = 0`` this is
+    exactly the sample variance (ddof=1), so a t-stat built on it reduces to the plain
+    ``mean / std * sqrt(n)``. Bartlett weights keep the estimate non-negative. NaNs are
+    dropped first; fewer than two values give NaN. ``lags`` is capped at ``n - 1``."""
+    v = np.asarray(pd.Series(x, dtype=float).dropna(), dtype=float)
+    n = v.size
+    if n < 2:
+        return float("nan")
+    if np.ptp(v) == 0:
+        return 0.0                         # identical values: exactly no variation (no rounding residue)
+    d = v - v.mean()
+    lags = max(0, min(int(lags), n - 1))
+    lrv = float(d @ d) / (n - 1)
+    for lag in range(1, lags + 1):
+        lrv += 2.0 * (1.0 - lag / (lags + 1.0)) * float(d[lag:] @ d[:-lag]) / (n - 1)
+    return max(lrv, 0.0)
+
+
+def mean_t_stat(x: np.ndarray | pd.Series, lags: int = 0) -> float:
+    """t-statistic of the mean of ``x``: ``mean / sqrt(LRV / n)`` with the Newey-West
+    long-run variance of :func:`long_run_variance` (``lags = 0``: the iid t-stat,
+    ``mean / std * sqrt(n)``). Use ``lags > 0`` when consecutive values overlap (for
+    example forecasts whose horizons are longer than the spacing between them). NaN when
+    there are fewer than two values or no variation."""
+    v = pd.Series(x, dtype=float).dropna()
+    lrv = long_run_variance(v, lags)
+    if not math.isfinite(lrv) or lrv <= 0:
+        return float("nan")
+    return float(v.mean() / math.sqrt(lrv / len(v)))
+
+
+def newey_west_lags(n: int) -> int:
+    """The usual automatic lag choice for daily data, ``floor(4 * (n / 100) ** (2/9))``."""
+    return math.floor(4.0 * (max(n, 1) / 100.0) ** (2.0 / 9.0))
+
+
+@dataclass
+class OLSResult:
+    """Ordinary least squares with heteroskedasticity- and autocorrelation-consistent
+    (Newey-West) standard errors. ``coef[0]`` is the intercept when the caller added one."""
+
+    coef: np.ndarray
+    se: np.ndarray
+    t: np.ndarray
+    r2: float
+    n: int
+    lags: int
+
+
+def ols_hac(y: np.ndarray, x: np.ndarray, lags: int) -> OLSResult:
+    """OLS of ``y`` (n,) on ``x`` (n, k; include a column of ones for an intercept) with
+    Newey-West HAC covariance ``(X'X)^-1 S (X'X)^-1``, ``S = sum_l w_l (G_l + G_l')`` with
+    Bartlett weights and ``G_l = sum_t e_t e_{t-l} x_t x_{t-l}'``, scaled by ``n / (n - k)``.
+    Raises ``ValueError`` when there are not more observations than regressors or ``X'X`` is
+    singular (a constant or duplicated factor), so a degenerate regression is never reported."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    n, k = x.shape
+    if n <= k or y.shape != (n,):
+        raise ValueError(f"need more observations than regressors (n={n}, k={k})")
+    xtx = x.T @ x
+    if np.linalg.matrix_rank(xtx) < k:
+        raise ValueError("regressors are collinear (a constant or duplicated factor)")
+    xtx_inv = np.linalg.inv(xtx)
+    beta = xtx_inv @ x.T @ y
+    e = y - x @ beta
+    xe = x * e[:, None]
+    lags = max(0, min(int(lags), n - 1))
+    s = xe.T @ xe
+    for lag in range(1, lags + 1):
+        g = xe[lag:].T @ xe[:-lag]
+        s += (1.0 - lag / (lags + 1.0)) * (g + g.T)
+    cov = xtx_inv @ s @ xtx_inv * n / (n - k)
+    se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(se > 0, beta / np.where(se > 0, se, 1.0), np.nan)
+    tss = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - float(e @ e) / tss if tss > 0 else float("nan")
+    return OLSResult(coef=beta, se=se, t=t, r2=r2, n=n, lags=lags)
+
+
 def brier_score(probs: list[float] | np.ndarray, outcomes: list[int] | np.ndarray) -> float:
     p = np.asarray(probs, dtype=float)
     o = np.asarray(outcomes, dtype=float)

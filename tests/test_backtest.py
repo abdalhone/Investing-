@@ -239,6 +239,7 @@ def _with_dividends(p, quarterly_yield=0.01, every=63):
 def _core_only_cfg(runs_dir):
     cfg = _cfg(runs_dir)
     cfg.portfolio.core_weight, cfg.portfolio.min_cash, cfg.portfolio.max_turnover = 1.0, 0.0, 5.0
+    cfg.portfolio.rebalance_fraction = 1.0       # buy the whole core at the first open (no partial steps)
     cfg.costs.commission_bps = cfg.costs.slippage_bps = cfg.costs.impact_coefficient = 0.0
     return cfg
 
@@ -373,3 +374,217 @@ def test_library_backtest_and_kill_switch_follow_the_config_file_not_the_cwd(tmp
                      lesson_store=LessonStore(tmp_path / "l.jsonl"), ledger=Ledger(tmp_path / "ledger.jsonl"),
                      run_id="r", trading_calendar=prices.close.index)
     assert dec.orders == [] and any("KILL SWITCH" in m for m in dec.risk_messages)
+
+
+# ----------------------------------------------------------------------------- evaluation: is there skill, and would we know?
+
+
+def test_decision_records_carry_every_signal_for_the_evaluation(offline_result):
+    r = offline_result
+    rec = r.decisions[0]
+    assert {"pooled_prob", "prob_equal_weight", "n_views", "agent_probs", "sectors"} <= set(rec)
+    agents = {a for by_agent in rec["agent_probs"].values() for a in by_agent}
+    assert {"fundamental", "technical", "macro", "events", "quant"} & agents
+    assert all(0.0 < p < 1.0 for by_agent in rec["agent_probs"].values() for p in by_agent.values())
+    assert rec["sectors"]["AAA"] == "Tech"
+
+
+def test_every_backtest_is_evaluated(quant_result, offline_result):
+    from aifirm.backtest.ic import POOL, QUANT_ONLY
+    for r in (quant_result, offline_result):
+        ev = r.evaluation
+        assert ev is not None and ev.horizon_days == 21 and ev.step_days == 21
+        assert ev.ic[POOL].n_dates > 0 and math.isfinite(ev.ic[POOL].mean) and ev.ic[POOL].method == "iid"
+        assert ev.power is not None and ev.power.n_dates == ev.ic[POOL].n_dates
+        assert ev.random_books is not None and ev.random_books.n_books == 1000
+        assert 0.0 <= ev.random_books.percentile_return <= 100.0 and 0.0 < ev.random_books.p_value_return <= 1.0
+        assert ev.costs is not None and ev.costs.replay_matches_engine
+        assert ev.factors is not None and ev.factors.factors == ["market"]     # synthetic data holds SPY only
+        assert any("size factor skipped" in n for n in ev.notes)
+    assert QUANT_ONLY not in quant_result.evaluation.ic and quant_result.evaluation.costs.quant_total_return_pct is None
+    off = offline_result.evaluation
+    assert QUANT_ONLY in off.ic and any((d.a, d.b) == (POOL, QUANT_ONLY) for d in off.ic_differences)
+    assert off.costs.quant_total_return_pct is not None and off.costs.vs_quant is not None
+    assert {"agent:technical", "agent:quant"} <= set(off.ic)
+    # the quant analyst inside the committee and the quant-only baseline forecast identically
+    assert off.ic["agent:quant"].mean == pytest.approx(off.ic[QUANT_ONLY].mean)
+
+
+def test_replaying_the_recorded_decisions_reproduces_the_run_and_doubling_costs_lowers_returns(quant_result,
+                                                                                                prices):
+    from aifirm.backtest.engine import replay_total_return
+    from aifirm.pipeline import quant_only_config
+    r = quant_result
+    c = r.evaluation.costs
+    assert c.multipliers == [0.0, 1.0, 2.0]
+    assert c.strategy_total_return_pct[1.0] == pytest.approx(r.reports["strategy"].total_return_pct, abs=1e-9)
+    assert c.strategy_total_return_pct[0.0] > c.strategy_total_return_pct[1.0] > c.strategy_total_return_pct[2.0]
+    assert c.excess_vs_benchmark(2.0) < c.excess_vs_benchmark(1.0)
+    assert c.realised_cost_bps > 5.0                                  # at least the 5 bps spread plus commission
+    cfg = quant_only_config(_cfg(Path(r.run_dir).parents[1]))
+    days = prices.close.index[START:END + 1]
+    rebal = set(days[::21])
+    assert replay_total_return(prices, cfg, days, rebal, r.decisions, 1.0) == pytest.approx(
+        r.reports["strategy"].total_return_pct, abs=1e-9)
+
+
+def test_engine_breakeven_is_where_the_replayed_excess_crosses_zero(quant_result, prices):
+    """Consistency of the bisection on the real re-simulation: against a benchmark whose
+    return equals the strategy's at 3x costs, the breakeven must come out at ~3x."""
+    from aifirm.backtest.engine import replay_total_return
+    from aifirm.backtest.evaluation import cost_sensitivity
+    from aifirm.pipeline import quant_only_config
+    r = quant_result
+    cfg = quant_only_config(_cfg(Path(r.run_dir).parents[1]))
+    days = prices.close.index[START:END + 1]
+    rebal = set(days[::21])
+    markets: dict = {}
+
+    def replay(k):
+        return replay_total_return(prices, cfg, days, rebal, r.decisions, k, markets)
+
+    target = replay(3.0)
+    cs = cost_sensitivity(replay, target, [0.0, 1.0, 2.0], 50.0, r.evaluation.costs.realised_cost_bps,
+                          r.reports["strategy"].total_return_pct)
+    assert cs.vs_benchmark.status == "found" and cs.vs_benchmark.multiplier == pytest.approx(3.0, abs=0.03)
+    assert cs.vs_benchmark.bps_one_way == pytest.approx(cs.vs_benchmark.multiplier * cs.realised_cost_bps)
+
+
+def test_contamination_buffer_extends_the_contaminated_period(prices, tmp_path, monkeypatch):
+    """Regression guard: vendor cutoffs are unreliable (research 7.2), so decisions within
+    cutoff_buffer_days after a model's training cutoff still count as contaminated."""
+    from aifirm import config
+    cutoff_i = 430
+    monkeypatch.setitem(config.MODEL_TRAINING_CUTOFFS, "claude-opus-5-5", _day(prices, cutoff_i))
+    cfg = _cfg(tmp_path / "a")
+    assert contamination_cutoff(cfg, "llm") == str((prices.close.index[cutoff_i] + pd.Timedelta(days=31)).date())
+    assert contamination_cutoff(cfg, "llm", buffer_days=0) == _day(prices, cutoff_i)
+    assert contamination_cutoff(cfg, "quant") is None
+    with pytest.raises(ValueError):
+        contamination_cutoff(cfg, "llm", buffer_days=-1)
+    cfg.evaluation.cutoff_buffer_days = 0
+    unbuffered = _bt(cfg, prices, mode="offline", start=380, end=500)
+    buffered_cfg = _cfg(tmp_path / "b")
+    buffered_cfg.evaluation.cutoff_buffer_days = 45
+    buffered = _bt(buffered_cfg, prices, mode="offline", start=380, end=500)
+    assert unbuffered.model_cutoff == buffered.model_cutoff == _day(prices, cutoff_i)
+    assert buffered.contamination_end > unbuffered.contamination_end == _day(prices, cutoff_i)
+    in_buffer = [d["as_of"] for d in buffered.decisions
+                 if unbuffered.contamination_end < d["as_of"] <= buffered.contamination_end]
+    assert in_buffer, "a decision must fall inside the buffer for this test to mean anything"
+    assert buffered.pre_cutoff_report.days > unbuffered.pre_cutoff_report.days
+    md = render_backtest_report(buffered)
+    assert "plus a 45-day buffer" in md and buffered.contamination_end in md
+    assert "the test straddles it" in md
+
+
+def test_a_failing_evaluation_part_is_reported_missing_not_fatal(prices, tmp_path, monkeypatch):
+    """Fail closed: a part that cannot be computed is None with a note, never a number, and
+    never sinks the backtest (whose decisions may have cost real LLM money)."""
+    from aifirm.backtest import engine
+
+    def broken(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(engine, "random_books", broken)
+    r = _bt(_cfg(tmp_path), prices, start=480, end=540)
+    assert r.evaluation.random_books is None
+    assert any(n.startswith("random books could not be computed (RuntimeError: boom)") for n in r.evaluation.notes)
+    md = render_backtest_report(r)
+    assert "composition-matched random books not computed" in md and "### Composition-matched random books" in md
+
+
+def test_factor_proxies_are_never_downloaded_when_prices_are_passed_in(prices, tmp_path, monkeypatch):
+    from aifirm.backtest import engine
+
+    def no_network(*a, **k):
+        raise AssertionError("load_prices must not be called when prices are passed in")
+
+    monkeypatch.setattr(engine, "load_prices", no_network)
+    p = make_prices()
+    r = _bt(_cfg(tmp_path / "a"), p, start=480, end=540)
+    assert r.evaluation.factors is not None                          # SPY (the benchmark) is a proxy itself
+    assert any("size factor skipped" in n for n in r.evaluation.notes)
+    # injected proxies are used as given
+    idx = p.close.index
+    rng = np.random.default_rng(0)
+    proxies = pd.DataFrame({t: 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, len(idx)))
+                            for t in ("SPY", "IWM", "IWD", "IWF", "MTUM", "QUAL", "USMV", "BIL")}, index=idx)
+    r2 = _bt(_cfg(tmp_path / "b"), p, start=480, end=540, factor_prices=from_frames(proxies))
+    assert r2.evaluation.factors.factors == ["market", "size", "value", "momentum", "quality", "low_volatility"]
+    assert r2.evaluation.factors.cash_proxy == "BIL"
+
+
+def test_report_states_the_six_lines_and_answers_whether_there_is_skill(offline_result):
+    md = render_backtest_report(offline_result)
+    six = md.split("## The six lines", 1)[1].split("## Performance vs baselines", 1)[0]
+    for i, needle in enumerate(("**Window and assets:**", "**Model and cutoff:**", "**Cost model and breakeven:**",
+                                "**Configurations tried:**", "**Deflated Sharpe at", "**Benchmark and null:**"),
+                               start=1):
+        assert f"{i}. {needle}" in six
+    assert "6 stocks plus the benchmark SPY" in six and "claude-opus-5-5" in six and "31-day buffer" in six
+    assert "the whole test lies before it" in six and "composition-matched random books" in six
+    for heading in ("## Is there skill, and would we know?", "### Signal: rank information coefficient (IC)",
+                    "### Power: how long until we would know", "### Composition-matched random books",
+                    "### Cost sensitivity and breakeven", "### Factor attribution (ETF proxies)"):
+        assert heading in md
+    assert "Quant-only baseline" in md and "minus Quant-only baseline" in md and "Excess vs quant-only" in md
+
+
+def test_report_says_plainly_when_skill_is_not_shown(quant_result):
+    """Plain-language verdicts: below the 95th percentile of random books the selection is
+    'not distinguishable from random books', and too few dates for 80% power is 'anecdotal'."""
+    import copy
+    r = copy.deepcopy(quant_result)
+    ev = r.evaluation
+    ev.random_books.percentile_return, ev.random_books.p_value_return = 62.0, 0.38
+    ev.power.dates_for_80pct, ev.power.dates_for_t2 = 4000.0, 2000.0
+    md = render_backtest_report(r)
+    assert "not distinguishable from random books" in md
+    assert "Anecdotal: fewer than 4,000 dates" in md
+    assert "at the 62nd percentile of 1,000 composition-matched random books" in md
+    ev.random_books.percentile_return, ev.random_books.p_value_return = 99.0, 0.004
+    assert "its stock selection beat random picks" in render_backtest_report(r)
+
+
+def test_a_downloading_backtest_fetches_the_factor_proxies_even_though_spy_is_the_benchmark(prices, tmp_path,
+                                                                                            monkeypatch):
+    """Regression: the benchmark SPY is itself a factor proxy, so "prices hold a proxy" must not
+    stop a run that downloads its own prices from fetching IWM, IWD, MTUM and the rest."""
+    from aifirm.backtest import engine
+    from aifirm.backtest.factors import PROXY_TICKERS
+    idx = prices.close.index
+    rng = np.random.default_rng(0)
+    proxies = from_frames(pd.DataFrame({t: 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, len(idx)))
+                                        for t in PROXY_TICKERS}, index=idx))
+    requested: list[list[str]] = []
+
+    def fake_load(tickers, start, end, cache=None):
+        requested.append(sorted(tickers))
+        return proxies if "IWM" in tickers else prices
+
+    monkeypatch.setattr(engine, "load_prices", fake_load)
+    r = run_backtest(_cfg(tmp_path), _day(prices, 480), _day(prices, 540), "quant", **LOADERS)
+    assert requested[0] == sorted([*NAMES, "SPY"]) and requested[1] == sorted(PROXY_TICKERS)
+    assert len(r.evaluation.factors.factors) == 6 and r.evaluation.factors.cash_proxy == "BIL"
+
+
+def test_interpretation_reads_the_evaluation_without_overclaiming(quant_result):
+    """Regressions from the real-data smoke: a significantly negative factor alpha was described
+    as "explained by exposure", "does not survive 2x costs" was said of a strategy with no edge
+    even at zero cost, and a non-positive IC produced a garbled anecdotal sentence."""
+    import copy
+    from aifirm.backtest.evaluation import Breakeven
+    r = copy.deepcopy(quant_result)
+    ev = r.evaluation
+    ev.factors.alpha_annual_pct, ev.factors.alpha_t = -4.0, -2.5
+    ev.costs.vs_benchmark = Breakeven("no_edge", 0.0, 50.0, 1)
+    ev.power.ic_mean, ev.power.dates_for_80pct, ev.power.dates_for_t2 = -0.05, math.inf, math.inf
+    md = render_backtest_report(r)
+    assert "Factor-adjusted alpha is negative (-4.0% a year, t = -2.50)" in md
+    assert "Even with zero trading costs the strategy did not beat the benchmark" in md
+    assert "does not survive" not in md
+    assert "is not positive, so no number of dates at this IC would show skill" in md
+    ev.costs.vs_benchmark = Breakeven("found", 1.5, 50.0, 8, 8.0)
+    ev.costs.strategy_total_return_pct[2.0] = ev.costs.benchmark_total_return_pct - 1.0
+    assert "The result does not survive 2x costs" in render_backtest_report(r)

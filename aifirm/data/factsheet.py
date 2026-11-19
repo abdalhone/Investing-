@@ -11,6 +11,7 @@ fact. This addresses the hallucinated-numbers failure mode and makes every claim
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -18,12 +19,39 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from ..schemas import NewsEvent
 from .fundamentals import EIGHT_K_ITEMS, Fundamentals
 from .macro import MacroValue
-from .news import Headline
+from .news import TIER_DESCRIPTIONS, Headline
 from .prices import PriceData
 
 TRADING_DAYS = 252
+
+# Event facts (only present once news events are attached, see FactSheet.attach_news_events):
+# ``TICKER.news_N`` = a reader-extracted, tier-labelled news event; ``TICKER.filing_N`` = a
+# dated SEC filing event made citable. Their value is text (unit EVENT_UNIT).
+NEWS_FACT_PREFIX = "news_"
+FILING_FACT_PREFIX = "filing_"
+EVENT_UNIT = "event"
+FILING_TIER = "A"            # SEC filings come from EDGAR: a primary source
+
+
+def fact_key(fact_id: str) -> str:
+    """The part of a fact ID after the first dot ("NVDA.news_1" -> "news_1")."""
+    return fact_id.split(".", 1)[-1]
+
+
+def is_news_fact_id(fact_id: str) -> bool:
+    return "." in fact_id and fact_key(fact_id).startswith(NEWS_FACT_PREFIX) and not fact_id.startswith(("MACRO.", "MKT."))
+
+
+def is_filing_fact_id(fact_id: str) -> bool:
+    return "." in fact_id and fact_key(fact_id).startswith(FILING_FACT_PREFIX) and not fact_id.startswith(("MACRO.", "MKT."))
+
+
+def is_event_fact_id(fact_id: str) -> bool:
+    """News-event or filing-event fact (text facts rendered in the events/news sections)."""
+    return is_news_fact_id(fact_id) or is_filing_fact_id(fact_id)
 
 
 @dataclass
@@ -61,6 +89,11 @@ class FactSheet:
     events: list[str] = field(default_factory=list)     # dated, point-in-time filing events
     headlines: list[Headline] = field(default_factory=list)
     data_gaps: list[str] = field(default_factory=list)  # what could not be loaded (told to agents)
+    # Quarantined news (see attach_news_events). Once ``news_quarantined`` is set, render()
+    # never prints raw headline text: analysts see only the reader-extracted event facts.
+    news_quarantined: bool = False
+    news_events: dict[str, NewsEvent] = field(default_factory=dict)        # news fact ID -> event (tier, provenance)
+    quarantined_headlines: list[Headline] = field(default_factory=list)    # raw headlines kept for audit; never rendered
 
     def add(self, fact: Fact) -> None:
         if isinstance(fact.value, float) and (math.isnan(fact.value) or math.isinf(fact.value)):
@@ -81,9 +114,14 @@ class FactSheet:
 
     def render(self, sections: tuple[str, ...] = ("price", "fund", "macro", "events", "news")) -> str:
         lines = [f"FACT SHEET: {self.ticker} ({self.name}) | sector: {self.sector or 'n/a'} | as of {self.as_of}"]
+
+        def ticker_key(f: Fact) -> str | None:
+            return f.id.split(".", 1)[1] if f.id.startswith(f"{self.ticker}.") and not is_event_fact_id(f.id) else None
+
         groups = {
-            "price": ("PRICE, TREND, RISK", lambda f: f.id.startswith(f"{self.ticker}.") and f.id.split(".")[1] in PRICE_KEYS),
-            "fund": ("FUNDAMENTALS (SEC filings, point-in-time) AND VALUATION", lambda f: f.id.startswith(f"{self.ticker}.") and f.id.split(".")[1] not in PRICE_KEYS),
+            "price": ("PRICE, TREND, RISK", lambda f: ticker_key(f) in PRICE_KEYS),
+            "fund": ("FUNDAMENTALS (SEC filings, point-in-time) AND VALUATION",
+                     lambda f: ticker_key(f) is not None and ticker_key(f) not in PRICE_KEYS),
             "macro": ("MACRO / MARKET REGIME", lambda f: f.id.startswith("MACRO.") or f.id.startswith("MKT.")),
         }
         for key in ("price", "fund", "macro"):
@@ -96,17 +134,84 @@ class FactSheet:
                 lines += [f.render() for f in sel]
         if "events" in sections:
             lines.append("\n## RECENT SEC FILING EVENTS (point-in-time)")
-            lines += [f"- {e}" for e in self.events] or ["- none in window"]
-        if "news" in sections:
-            lines.append("\n## RECENT HEADLINES")
-            if self.headlines:
-                lines += [f"- {h.published[:10]} | {h.publisher} | {h.title}" for h in self.headlines]
+            filing_facts = [f for f in self.facts if is_filing_fact_id(f.id)]
+            if filing_facts:   # citable form: "- [NVDA.filing_1] 2026-05-28: 8-K - ..."
+                lines += [f"- [{f.id}] {f.value}" for f in filing_facts]
             else:
-                lines.append("- no headlines available (historical mode or feed unavailable) - do not assume news you have not been shown")
+                lines += [f"- {e}" for e in self.events] or ["- none in window"]
+        if "news" in sections:
+            lines += self._render_news()
         if self.data_gaps:
             lines.append("\n## DATA GAPS (unknown - do not fill in from memory)")
             lines += [f"- {g}" for g in self.data_gaps]
         return "\n".join(lines)
+
+    def _render_news(self) -> list[str]:
+        """The news section. Quarantined: reader-extracted event facts only, never headline
+        text. Otherwise: raw headlines (legacy path, used when no reader ran)."""
+        news_facts = [f for f in self.facts if is_news_fact_id(f.id)]
+        if self.news_quarantined or news_facts:
+            out = ["\n## NEWS EVENTS (extracted from headlines by a quarantined reader; source tier set by code)",
+                   "Tier A = primary source (SEC filing, company release, official newswire); tier B = established "
+                   "news organisation; tier C = unverified (aggregators, blogs, unknown publishers, rumors). "
+                   "Raw headline text is withheld. Cite an event by its ID."]
+            out += [f.render() for f in news_facts] or ["- no reader-verified news events (see DATA GAPS if news could not be read)"]
+            return out
+        out = ["\n## RECENT HEADLINES"]
+        if self.headlines:
+            out += [f"- {h.published[:10]} | {h.publisher} | {h.title}" for h in self.headlines]
+        else:
+            out.append("- no headlines available (historical mode or feed unavailable) - do not assume news you have not been shown")
+        return out
+
+    def news_tier(self, fact_id: str) -> str | None:
+        """Source tier of an event fact on this sheet: the code-assigned tier of a news event
+        (tier C when its metadata is missing: unproven provenance is unverified), "A" for a
+        filing event, None for a non-event fact or an ID not on the sheet."""
+        if self.get(fact_id) is None:
+            return None
+        if is_filing_fact_id(fact_id):
+            return FILING_TIER
+        if is_news_fact_id(fact_id):
+            ev = self.news_events.get(fact_id)
+            return ev.tier if ev is not None else "C"
+        return None
+
+    def has_news_content(self) -> bool:
+        """True if the sheet carries anything that came from news: raw headlines or news-event facts."""
+        return bool(self.headlines) or any(is_news_fact_id(f.id) for f in self.facts)
+
+    def attach_news_events(self, events: list[NewsEvent], gaps: list[str] | tuple[str, ...] = (),
+                           cite_filings: bool = True) -> list[Fact]:
+        """Quarantine the news on this sheet: replace raw headlines with event facts.
+
+        * Each event becomes a citable fact ``TICKER.news_N`` (:func:`news_event_facts`),
+          and its record (tier, provenance) is kept in :attr:`news_events` by fact ID.
+        * Raw headlines move to :attr:`quarantined_headlines` (audit only) and
+          :attr:`news_quarantined` is set, so :meth:`render` never prints headline text
+          again, even if ``headlines`` is refilled later.
+        * ``gaps`` (e.g. a reader failure note) are added to the data gaps.
+        * ``cite_filings``: also make each filing event citable as ``TICKER.filing_N``
+          (tier A), so the tier gate can tell a filing-based view from a rumor-based one.
+        Calling it again replaces the previously attached event facts. Returns the facts added."""
+        self.facts = [f for f in self.facts if not is_event_fact_id(f.id)]
+        self.news_events = {}
+        self.quarantined_headlines = [*self.quarantined_headlines, *self.headlines]
+        self.headlines = []
+        self.news_quarantined = True
+        added: list[Fact] = []
+        for fct, ev in zip(news_event_facts(events, self.ticker), events_in_fact_order(events), strict=True):
+            self.add(fct)
+            self.news_events[fct.id] = ev
+            added.append(fct)
+        if cite_filings:
+            for fct in filing_event_facts(self.events, self.ticker):
+                self.add(fct)
+                added.append(fct)
+        for g in gaps:
+            if g and g not in self.data_gaps:
+                self.data_gaps.append(g)
+        return added
 
 
 PRICE_KEYS = {
@@ -368,6 +473,52 @@ def filing_events(filings: list[dict]) -> list[str]:
     if form4:
         events.append(f"{len(form4)} insider transaction reports (Form 4) filed in the window (direction not parsed)")
     return events
+
+
+# --------------------------------------------------------------------------- news and filing event facts
+
+_SUMMARY_UNSAFE = re.compile(r"[:\[\]{}<>`|\\]")
+
+
+def events_in_fact_order(events: list[NewsEvent]) -> list[NewsEvent]:
+    """Events in the order their fact IDs are numbered: by headline (newest first, as the
+    reader numbered them), then in the order the reader listed them (stable sort)."""
+    return sorted(events, key=lambda e: e.headline_index)
+
+
+def news_event_facts(events: list[NewsEvent], ticker: str | None = None) -> list[Fact]:
+    """Citable facts for news events: ``TICKER.news_1``, ``TICKER.news_2``... in
+    :func:`events_in_fact_order`. The label carries tier, type, direction and materiality,
+    the value is the sanitized reader summary, ``as_of`` the publish date and the source
+    the code-assigned source name and tier (never the raw publisher string, which is
+    attacker-controlled free text). Labels contain no numbers, so they never count as
+    grounding support. ``ticker`` defaults to the events' own ticker."""
+    out: list[Fact] = []
+    for k, ev in enumerate(events_in_fact_order(events), 1):
+        t = (ticker or ev.ticker).upper()
+        summary = _SUMMARY_UNSAFE.sub(" ", ev.summary)
+        summary = " ".join(summary.split()) or "no summary"
+        label = (f"News event (tier {ev.tier}, {ev.event_type}, {ev.direction}, "
+                 f"{ev.materiality} materiality)")
+        writer = "code" if ev.summary_by == "code" else "a quarantined reader"
+        source = (f"{ev.source_name}, tier {ev.tier} ({TIER_DESCRIPTIONS.get(ev.tier, 'unverified')}) "
+                  f"assigned by code; summary by {writer}")
+        out.append(Fact(f"{t}.{NEWS_FACT_PREFIX}{k}", label, summary, EVENT_UNIT, ev.published[:10] or "unknown", source))
+    return out
+
+
+_EVENT_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def filing_event_facts(events: list[str], ticker: str) -> list[Fact]:
+    """Citable facts ``TICKER.filing_N`` for the dated filing events of a sheet (tier A).
+    The value is the event text exactly as the events section shows it."""
+    out: list[Fact] = []
+    for k, e in enumerate(events, 1):
+        m = _EVENT_DATE.match(e)
+        out.append(Fact(f"{ticker.upper()}.{FILING_FACT_PREFIX}{k}", f"SEC filing event (tier {FILING_TIER}, primary source)",
+                        e, EVENT_UNIT, m.group(1) if m else "window", "SEC EDGAR filing index"))
+    return out
 
 
 def build_factsheet(

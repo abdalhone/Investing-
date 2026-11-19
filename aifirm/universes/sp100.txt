@@ -1,0 +1,115 @@
+# S&P 100 (OEX) constituents: approximately the CURRENT membership (late 2025), one ticker per line.
+#
+# SURVIVORSHIP BIAS WARNING. This is a list of TODAY's members. Companies that were in the
+# index during a backtest window but were later dropped, acquired or delisted are missing,
+# and companies that joined later because they had already done well are present. A
+# backtest on this list is therefore biased UPWARD (it only ever picks among survivors and
+# winners). Use it to exercise the machinery and to get cross-sectional breadth for IC
+# statistics; do not read its absolute returns as achievable. For research, use a
+# point-in-time membership list from a vendor that includes delisted names.
+#
+# Notes: share-class duplicates are dropped (GOOGL is kept, GOOG is not), so each company
+# appears once in cross-sectional rankings. Class B shares use Yahoo's dash form (BRK-B).
+# BK (Bank of New York Mellon) is left out: Yahoo returns no price history for that ticker, and a
+# download with a missing name is only cached briefly (it would be refetched on every run).
+# Lines starting with '#' and text after '#' are comments; blank lines are ignored.
+AAPL
+ABBV
+ABT
+ACN
+ADBE
+AIG
+AMD
+AMGN
+AMT
+AMZN
+AVGO
+AXP
+BA
+BAC
+BKNG
+BLK
+BMY
+BRK-B
+C
+CAT
+CL
+CMCSA
+COF
+COP
+COST
+CRM
+CSCO
+CVS
+CVX
+DE
+DHR
+DIS
+DUK
+EMR
+F
+FDX
+GD
+GE
+GILD
+GM
+GOOGL
+GS
+HD
+HON
+IBM
+INTC
+INTU
+ISRG
+JNJ
+JPM
+KO
+LIN
+LLY
+LMT
+LOW
+MA
+MCD
+MDLZ
+MDT
+MET
+META
+MMM
+MO
+MRK
+MS
+MSFT
+NEE
+NFLX
+NKE
+NOW
+NVDA
+ORCL
+PEP
+PFE
+PG
+PLTR
+PM
+PYPL
+QCOM
+RTX
+SBUX
+SCHW
+SO
+SPG
+T
+TGT
+TMO
+TMUS
+TSLA
+TXN
+UBER
+UNH
+UNP
+UPS
+USB
+V
+VZ
+WFC
+WMT
+XOM

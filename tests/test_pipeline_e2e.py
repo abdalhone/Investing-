@@ -101,9 +101,12 @@ def test_offline_cycle_runs_end_to_end_and_journals_everything(tmp_path, prices,
         assert o.notional <= cfg.risk.max_adv_participation * dec.market.adv[o.ticker] + 1e-6
         assert o.reference_price == pytest.approx(prices.close.loc[as_of, o.ticker])
 
-    # every non-abstaining view plus each committee pool became a stored forecast
-    n_expected = sum(sum(not v.view.abstain for v in r.views) + 1 for r in dec.committee.values())
+    # every non-abstaining view plus each committee pool (the final probability) and the LLM
+    # analysts' own pool ("llm_pool", scored separately from the overlay) became a stored forecast
+    n_expected = sum(sum(not v.view.abstain for v in r.views) + 1 + (r.aggregate.prob_llm is not None)
+                     for r in dec.committee.values())
     assert len(dec.forecasts) == n_expected == len(book.store.all())
+    assert {f.agent for f in dec.forecasts} >= {"committee", "llm_pool", "quant"}
     assert all(f.resolve_on > as_of for f in dec.forecasts)
 
     # the ledger holds every step and verifies
@@ -616,7 +619,7 @@ def test_cli_run_prints_kill_switch_and_freeze_messages(cli_env, prices, capsys)
     assert "risk: KILL SWITCH" in capsys.readouterr().out
     (runs / "KILL").unlink()
     book = runs / "offline"
-    (book / "risk_state.json").write_text(json.dumps({"peak_nav": 125_000.0, "frozen": False, "last_nav": 100_000.0,
+    (book / "risk_state.json").write_text(json.dumps({"peak_nav": 130_000.0, "frozen": False, "last_nav": 100_000.0,
                                                       "last_as_of": _day(prices, DAY)}))
     assert cli.main(["run", "--config", str(config), "--offline", "--as-of", _day(prices, DAY + 1)]) == 0
     out = capsys.readouterr().out

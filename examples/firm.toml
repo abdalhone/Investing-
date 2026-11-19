@@ -41,6 +41,27 @@ benchmark = "SPY"
 [universe.ciks]
 # FOO = 1234567          # a ticker -> its SEC CIK (digits; leading zeros optional)
 
+# Optional investor-relations domains per ticker: a headline linking there is a primary
+# source (tier A) for the quarantined news reader.
+[universe.issuer_domains]
+# NVDA = ["nvidia.com"]
+
+# Broad-universe screen (research 7.3, 9.3 item 1: breadth is what gives statistical power).
+# When enabled, the universe is the tickers above plus the preset, file and inline lists
+# below. Every cycle the deterministic quant ranks the whole universe (cheap fact sheets:
+# prices and SEC data, no news, no LLM), names pass point-in-time price and liquidity
+# filters, and only the top `deep_dive_top_n` by quant probability (above 0.5) plus every
+# held name go to the LLM committee. Other names get no new position.
+# SURVIVORSHIP: the bundled "sp100" lists TODAY's members, so backtests on it are biased
+# upward (dropped and delisted names are missing); reports say so.
+[universe.screen]
+enabled = false
+preset = ""                      # e.g. "sp100" (bundled with the package)
+file = ""                        # one ticker per line, '#' comments; relative to this file
+tickers = []                     # inline additions
+deep_dive_top_n = 12             # names sent to the LLM committee each cycle (plus held names)
+min_dollar_volume = 10000000.0   # minimum 20-day average daily dollar volume
+
 [models]
 # Analyst models. With several models listed, repeated samples rotate through them
 # (model diversity reduces correlated errors, P5).
@@ -52,6 +73,8 @@ committee_effort = "high"
 risk_model = "claude-opus-5-5"        # the LLM risk reviewer (can only scale positions down)
 risk_effort = "medium"
 use_server_fallbacks = true      # retry a refused request on a fallback model server-side
+news_reader_model = "claude-opus-5-5"   # the quarantined news reader (the only call that sees raw headlines)
+news_reader_effort = "low"
 max_tokens = 16000
 max_parallel_calls = 4           # concurrent analyst calls per ticker
 
@@ -75,26 +98,42 @@ risk_review_enabled = true
 blind_mode = false               # hide ticker, name and dates from LLMs (historical research)
 news_enabled = true              # live headlines (never used in backtests: not point-in-time)
 max_llm_cost_usd_per_run = 10.0  # hard budget per `aifirm run`; exhausted budget holds the book
+# How the quant core and the LLM analysts combine (research 6.6). "overlay": the LLM pool
+# may tilt the quant's probability by at most overlay_max_tilt (the tilt is halved, then
+# switched off, when resolved forecasts show the LLM pool ranking worse than the quant).
+# "pool": every analyst, the quant included, is one member of the log-odds pool.
+combination = "overlay"
+overlay_max_tilt = 0.05
+overlay_min_dates = 12           # resolved dates needed before the adaptive bound may act
+believability_min_dates = 20     # equal weights until an agent has this many resolved dates
+news_reader_enabled = true       # headlines -> typed, tier-labelled events; analysts never see raw text
+news_max_headlines = 20
+news_isolate_untrusted = true    # tier A/B and tier C headlines are read in separate calls
+tier_gate_enabled = true         # a bullish view resting only on unverified news is capped at 0.5
 
 [portfolio]
+# Research 6.4 defaults for a small long-only book (engineering defaults, not optimised values).
 core_weight = 0.0                # passive benchmark core (core-satellite); e.g. 0.5 = half passive
 long_only = true
-max_position = 0.10
-max_sector = 0.35
+max_position = 0.08              # per-name sizing target; the hard cap is risk.max_position_hard
+max_sector = 0.25
 min_cash = 0.02
 max_gross = 1.0
 min_prob_to_hold = 0.52          # minimum pooled P(beat benchmark) to hold a long
 kelly_fraction = 0.25            # quarter Kelly: full Kelly is ruinous with estimated edges (P8)
-target_vol = 0.18                # annualized volatility target for the active sleeve
-no_trade_band = 0.01             # skip weight changes smaller than this (costs beat noise)
-max_turnover = 0.5               # max one-way turnover per rebalance
+target_vol = 0.15                # annualized volatility target for the active sleeve; excess stays in cash
+no_trade_band = 0.005            # skip weight changes smaller than 0.5% of NAV (costs beat noise)
+max_turnover = 0.25              # max one-way turnover per rebalance
+rebalance_fraction = 0.5         # move half of the way to the target each rebalance (forced exits: all)
 dispersion_shrink = 2.0          # edge x max(0, 1 - 2 x analyst disagreement)
 
 [risk]
 # The invariant risk core (P9). Nothing an LLM says can override these.
-drawdown_derisk = 0.10           # halve the active sleeve at a 10% drawdown from peak NAV
-drawdown_freeze = 0.15           # move the active sleeve to cash at 15%; only a human unfreezes
+drawdown_derisk = 0.10           # halve the active sleeve at a 10% drawdown from peak NAV; full
+                                 # gross again once half of the peak-to-trough drawdown is recovered
+drawdown_freeze = 0.20           # move the active sleeve to cash at 20%; only a human unfreezes
                                  # (`aifirm unfreeze --config ... --reason "..."`)
+max_position_hard = 0.10         # hard per-name cap (drift included); sizing targets max_position
 daily_loss_halt = 0.05           # after a 5% one-day loss, no position may grow this cycle
 max_adv_participation = 0.02     # an order may be at most 2% of 20-day dollar volume
 restricted = []                  # tickers that must never be held
@@ -111,3 +150,24 @@ impact_coefficient = 0.1         # square-root impact: bps += 0.1 x 1e4 x daily_
 broker = "paper"                 # "paper" (simulated) or "alpaca" (Alpaca paper API; live needs code changes)
 require_approval = true          # a human approves every order sent to a real broker
 initial_cash = 100000.0
+
+[calibration]
+# Per-agent Platt calibration of LLM probabilities before pooling, fitted point-in-time from
+# resolved forecasts (forecasts keep the raw probability). The quant is never calibrated.
+enabled = true
+min_n = 30                       # identity map until an agent has this many resolved questions
+prior_strength = 50.0            # shrink toward the identity as if 50 calibrated forecasts agreed
+
+[evaluation]
+# How a backtest is judged ("is there skill, and would we know?"). These settings change
+# what the report measures, never a decision, so they are not part of the config
+# fingerprint (changing them is not a new trial for the deflated Sharpe ratio).
+n_random_books = 1000            # composition-matched random books for the null (0 = off)
+random_seed = 20240917           # the random books are reproducible
+random_books_sector_matched = false   # draw each replacement from the replaced name's sector
+cost_multipliers = [0.0, 1.0, 2.0]    # re-execute the SAME decisions with every cost component x k
+breakeven_cap = 50.0             # search the breakeven cost multiplier up to this; beyond it "> 50x"
+cutoff_buffer_days = 31          # days after a model's training cutoff still treated as contaminated
+ic_min_names = 5                 # fewest names for one date's rank IC to count
+factor_proxies = true            # ETF factor regression (SPY, IWM, IWD/IWF, MTUM, QUAL, USMV; BIL = cash)
+shadow_book = true               # `aifirm run` also keeps a quant-only shadow book (paper) under <book>/shadow

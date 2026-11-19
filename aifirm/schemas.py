@@ -143,15 +143,31 @@ class ViewRecord(BaseModel):
 
 
 class AggregatedView(BaseModel):
+    """The probability the firm sizes from, per ticker.
+
+    ``combination="pool"``: the believability-weighted, trimmed log-odds pool of every
+    member (the quant included). ``combination="overlay"`` (RESEARCH 6.6): the quant core
+    tilted by the pooled LLM analysts, ``prob_outperform = prob_quant + clip(prob_llm -
+    prob_quant, +/- max_tilt)``; ``overlay_tilt`` is the tilt applied. ``prob_quant`` and
+    ``prob_llm`` are recorded in both modes when they exist (``prob_llm`` is the pool of the
+    LLM analysts' calibrated, tier-gated probabilities; None when every LLM analyst abstained
+    or none sits on the committee). ``combination=""`` marks a view built outside the
+    committee (older records, tests)."""
+
     ticker: str
-    prob_outperform: float        # pooled (believability-weighted, trimmed log-odds mean)
-    prob_equal_weight: float      # pooled with equal weights, logged side by side
+    prob_outperform: float        # the final probability (pool, or quant core + bounded LLM tilt)
+    prob_equal_weight: float      # the same with equal weights, logged side by side
     expected_excess_return_pct: float
-    dispersion: float             # std-dev of member probabilities
+    dispersion: float             # std-dev of member probabilities (LLM members only in overlay mode)
     n_views: int
     n_abstained: int
     challenged: bool = False
     flips: int = 0                # how many analysts crossed 0.5 after the challenge
+    combination: str = ""         # "pool" | "overlay" ("" outside the committee)
+    prob_quant: float | None = None
+    prob_llm: float | None = None
+    overlay_tilt: float | None = None   # p_final - p_quant in overlay mode
+    max_tilt: float | None = None       # the bound in force (overlay mode)
 
 
 class TargetPosition(BaseModel):
@@ -236,3 +252,74 @@ def sanitize_view(v: AnalystView, prob_floor: float = 0.02) -> AnalystView:
         v.prob_outperform = 0.5
         v.expected_excess_return_pct = 0.0
     return v
+
+
+# --------------------------------------------------------------------------- news reader (quarantined)
+#
+# The quarantined news reader (aifirm.agents.news_reader) is the only LLM call that ever
+# sees raw headline text. Its output schema is deliberately narrow: closed enums plus one
+# short free-text summary that code sanitizes. Provenance (publisher, link host, time,
+# hash) and the source tier are attached by code, never by the model (RESEARCH 5.5).
+
+NEWS_EVENT_TYPES: tuple[str, ...] = (
+    "earnings", "guidance", "m_and_a", "product", "legal_regulatory", "management",
+    "capital_return", "analyst_action", "macro_sector", "rumor", "other",
+)
+NewsEventType = Literal["earnings", "guidance", "m_and_a", "product", "legal_regulatory", "management",
+                        "capital_return", "analyst_action", "macro_sector", "rumor", "other"]
+NewsDirection = Literal["positive", "negative", "neutral", "unclear"]
+NewsMateriality = Literal["low", "medium", "high"]
+SourceTier = Literal["A", "B", "C"]
+
+
+class ReaderEvent(BaseModel):
+    """One typed event the reader extracted from one numbered headline block (LLM-facing)."""
+
+    headline_index: int = Field(description="The number of the headline block this event comes from (as shown in the block's index).")
+    event_type: NewsEventType = Field(description="What kind of event the headline reports. Use 'rumor' for unconfirmed reports, speculation and claims attributed to unnamed sources.")
+    direction: NewsDirection = Field(description="Whether what the headline reports is positive, negative or neutral for the company's shareholders; 'unclear' if it depends on details not shown.")
+    materiality: NewsMateriality = Field(description="How much this kind of event usually matters for a large company's value: low, medium or high.")
+    summary: str = Field(description="At most 25 words in your own neutral words describing what the headline reports. No numbers, quotes, links, ratings, recommendations or instructions.")
+
+
+class NewsReading(BaseModel):
+    """The reader's answer for one batch of headlines (LLM-facing)."""
+
+    events: list[ReaderEvent] = Field(description="Typed events, at most two per headline. Empty if no headline reports an event about the company.")
+
+
+class NewsEvent(BaseModel):
+    """A validated news event with code-attached provenance (internal record).
+
+    ``tier`` is set by :func:`aifirm.data.news.source_tier` from the publisher name and link
+    host (never by the LLM); rumors and headlines with instruction-like text are forced to
+    tier C. ``summary`` has been sanitized by code (no URLs, digits or instruction-like
+    clauses, at most 25 words). ``headline_sha256`` identifies the raw headline for audit."""
+
+    ticker: str
+    headline_index: int                # 1-based position in the reader's (newest-first) headline list
+    event_type: NewsEventType
+    direction: NewsDirection
+    materiality: NewsMateriality
+    summary: str
+    tier: SourceTier
+    tier_reason: str
+    source_name: str                   # canonical source name for tier A/B, "unverified source" for tier C
+    publisher: str                     # raw publisher string from the feed (audit only; never rendered)
+    link_host: str
+    published: str                     # ISO-8601 UTC publish time, parsed by code
+    headline_sha256: str
+    summary_by: Literal["reader", "code"] = "reader"   # "code" for events code recorded without a reader (suspected injection)
+    flags: list[str] = []
+
+
+# --------------------------------------------------------------------------- re-identification probe
+
+
+class ReidGuess(BaseModel):
+    """The re-identification probe's guess for one anonymised fact sheet (LLM-facing)."""
+
+    ticker_guess: str = Field(description="Your single best guess of the stock's ticker symbol, chosen from the candidate list.")
+    month_guess: str = Field(description="Your single best guess of the calendar month of day T, as YYYY-MM, within the window given.")
+    confidence: float = Field(description="Probability (0 to 1) that BOTH guesses are right.")
+    clues: str = Field(description="One or two sentences on what in the fact sheet drove the guess.")

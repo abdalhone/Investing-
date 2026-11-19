@@ -87,7 +87,7 @@ def test_kill_switch_holds_current_book_and_produces_no_orders(tmp_path):
 
 def test_drawdown_freeze_zeroes_active_keeps_core_and_is_sticky(tmp_path):
     target = _target({"AAA": 0.10, "BBB": 0.05}, core=0.4)
-    out, msgs, state = _apply(tmp_path, target, nav=84.0, peak=100.0)
+    out, msgs, state = _apply(tmp_path, target, nav=79.0, peak=100.0)      # freeze at 20% (research 6.4)
     assert state.frozen
     assert all(w == 0 for w in _w(out).values()) and out.core_weight == pytest.approx(0.4)
     assert any("DRAWDOWN FREEZE" in m for m in msgs)
@@ -145,15 +145,15 @@ def test_human_unfreeze_resets_the_high_water_mark_instead_of_refreezing(tmp_pat
     A frozen book sits in cash and cannot regain the old peak, so the next cycle has to start
     a new high-water mark rather than re-freeze at once."""
     target = _target({"AAA": 0.10})
-    _, _, state = _apply(tmp_path, target, nav=80.0, peak=100.0)
-    assert state.frozen and state.frozen_at_nav == pytest.approx(80.0)
+    _, _, state = _apply(tmp_path, target, nav=79.0, peak=100.0)
+    assert state.frozen and state.frozen_at_nav == pytest.approx(79.0)
     state.frozen = False                                              # the human decision
-    out, msgs, state2 = _apply(tmp_path, target, nav=80.0, state=state)
-    assert not state2.frozen and state2.peak_nav == pytest.approx(80.0) and state2.frozen_at_nav is None
+    out, msgs, state2 = _apply(tmp_path, target, nav=79.0, state=state)
+    assert not state2.frozen and state2.peak_nav == pytest.approx(79.0) and state2.frozen_at_nav is None
     assert _w(out) == {"AAA": 0.10}
     assert any("unfrozen by a human" in m for m in msgs)
     # a book that was never frozen keeps measuring drawdowns from its real peak
-    _, _, fresh = _apply(tmp_path, target, nav=80.0, state=RiskState(peak_nav=100.0))
+    _, _, fresh = _apply(tmp_path, target, nav=79.0, state=RiskState(peak_nav=100.0))
     assert fresh.frozen
 
 
@@ -165,8 +165,8 @@ def test_forced_exits_are_not_skipped_by_the_no_trade_band(tmp_path):
     names = [f"T{i:02d}" for i in range(12)]
     current = {"BAD": 0.008} | {t: 0.009 for t in names}
     prices = {t: 50.0 for t in current}
-    cfg = _cfg(tmp_path, risk={"restricted": ["BAD"]})
-    out, _, state = _apply(tmp_path, _target(current), nav=nav, peak=1.25 * nav, current=current, cfg=cfg,
+    cfg = _cfg(tmp_path, risk={"restricted": ["BAD"]}, no_trade_band=0.01)   # positions below a 1% band
+    out, _, state = _apply(tmp_path, _target(current), nav=nav, peak=1.3 * nav, current=current, cfg=cfg,
                            prices=prices)
     assert state.frozen and all(w == 0.0 for w in _w(out).values())
     positions = {t: w * nav / prices[t] for t, w in current.items()}

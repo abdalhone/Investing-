@@ -216,7 +216,11 @@ def test_revisions_repool_count_flips_and_reject_unsupported_changes():
     assert by["events"].revised_prob == pytest.approx(0.42)          # the challenger keeps its view
     assert res.aggregate.challenged and res.aggregate.flips == 1
     expected = pool_probabilities([0.85, 0.45, 0.60, 0.42], [1.0] * 4, FirmConfig().process.trim_fraction)
-    assert res.aggregate.prob_outperform == pytest.approx(expected)
+    # the LLM analysts are re-pooled with their revised values; in the default overlay mode that
+    # pool tilts the quant core (0.5 here: no quant view) by at most the overlay bound
+    assert res.llm_aggregate.prob_outperform == pytest.approx(expected)
+    tilt = FirmConfig().process.overlay_max_tilt
+    assert res.aggregate.prob_outperform == pytest.approx(0.5 + max(-tilt, min(tilt, expected - 0.5)))
     statuses = {p["agent"]: p["status"] for e, p in events if e == "revision"}
     assert statuses["technical"] == "accepted" and statuses["macro"].startswith("rejected")
     assert statuses["fundamental"] == "unchanged"
@@ -294,9 +298,9 @@ def test_log_events_cover_every_stage():
     events = []
     committee(ScriptedLLM(SPLIT), log=lambda e, p: events.append(e))
     assert events[:4] == ["view"] * 4
-    assert events[4:6] == ["aggregate", "challenge"]
+    assert events[4:7] == ["pool_inputs", "aggregate", "challenge"]   # raw vs pooled inputs, then the pool
     assert events.count("revision") == 3
-    assert events[-2:] == ["aggregate", "memo"]
+    assert events[-3:] == ["pool_inputs", "aggregate", "memo"]
 
 
 # --------------------------------------------------------------------------- offline end to end

@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from aifirm.config import (
     CostConfig,
+    EvaluationConfig,
     ExecutionConfig,
     FirmConfig,
     PortfolioConfig,
@@ -24,6 +25,7 @@ from aifirm.config import (
 )
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "firm.toml"
+DEFAULT_FINGERPRINT = "dfd68b7f37ba982f"     # FirmConfig().fingerprint(): a change of any default is a new strategy
 
 
 def _write(tmp_path: Path, text: str, name: str = "firm.toml") -> Path:
@@ -229,3 +231,45 @@ def test_universe_ciks_pin_sec_filers_and_reach_the_default_loaders(tmp_path, mo
     cfg.universe.tickers = ["AAA", "BBB"]
     pipeline.gather_data(cfg, "2024-06-03", live=False, prices=make_prices(), macro_loader=lambda d: [])
     assert sorted(seen["fund"]) == sorted(seen["filings"]) == [("AAA", "0000000042"), ("BBB", None)]
+
+
+# ----------------------------------------------------------------------------- evaluation section
+
+
+@pytest.mark.parametrize("kwargs,needle", [
+    ({"n_random_books": -1}, "n_random_books: -1 is out of range"),
+    ({"ic_min_names": 2}, "ic_min_names: 2 is out of range"),
+    ({"cutoff_buffer_days": -5}, "cutoff_buffer_days: -5 is out of range"),
+    ({"breakeven_cap": 1.0}, "breakeven_cap: 1.0 is out of range"),
+    ({"random_seed": -1}, "random_seed: -1 is out of range"),
+    ({"cost_multipliers": []}, "cost_multipliers must list at least one multiplier"),
+    ({"cost_multipliers": [0.0, -1.0]}, "cost_multipliers [-1.0] must be finite, >= 0"),
+    ({"cost_multipliers": [1.0, 80.0]}, "<= breakeven_cap (50)"),
+])
+def test_evaluation_settings_are_validated(kwargs, needle):
+    with pytest.raises(ValidationError) as info:
+        EvaluationConfig(**kwargs)
+    assert needle in describe_config_error(info.value)
+
+
+def test_evaluation_section_loads_from_toml_and_rejects_typos(tmp_path):
+    cfg = FirmConfig.load(_write(tmp_path, "[evaluation]\nn_random_books = 200\ncost_multipliers = [0.0, 1.0, 3.0]\n"
+                                           "cutoff_buffer_days = 60\nfactor_proxies = false\n"))
+    assert cfg.evaluation.n_random_books == 200 and cfg.evaluation.cost_multipliers == [0.0, 1.0, 3.0]
+    assert cfg.evaluation.cutoff_buffer_days == 60 and cfg.evaluation.factor_proxies is False
+    assert "evaluation.n_random_bookz: unknown setting" in _errors("[evaluation]\nn_random_bookz = 5\n", tmp_path)
+    defaults = EvaluationConfig()
+    assert (defaults.n_random_books, defaults.cost_multipliers, defaults.cutoff_buffer_days) == (1000, [0.0, 1.0, 2.0],
+                                                                                                31)
+
+
+def test_evaluation_settings_are_not_part_of_the_fingerprint():
+    """Regression guard: re-scoring a strategy with another null, cost grid or cutoff buffer
+    is not a new trial, and adding the [evaluation] section must not change the fingerprint
+    of any existing configuration (that would silently reset every trial ledger count)."""
+    changed = FirmConfig(evaluation=EvaluationConfig(n_random_books=7, random_seed=1, cost_multipliers=[3.0],
+                                                     cutoff_buffer_days=0, factor_proxies=False))
+    assert changed.fingerprint() == FirmConfig().fingerprint()
+    # Pinned: evaluation settings never move it. (The value changed once, deliberately, when the
+    # research defaults, the screen, the overlay and calibration settings were added: a new strategy.)
+    assert FirmConfig().fingerprint() == DEFAULT_FINGERPRINT

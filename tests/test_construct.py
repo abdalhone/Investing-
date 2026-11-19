@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from scipy.stats import norm
 
-from aifirm.config import FirmConfig, PortfolioConfig
+from aifirm.config import FirmConfig, PortfolioConfig, RiskConfig
 from aifirm.data.factsheet import Fact, FactSheet
 from aifirm.portfolio.construct import construct_portfolio
 from aifirm.schemas import AggregatedView
@@ -16,10 +16,18 @@ AS_OF = "2026-01-30"
 BENCH = "SPY"
 
 
+# The tests in this file were written against the pre-research defaults (10% cap, 35% sector,
+# 18% vol target, 1% band, full rebalancing) and each isolates one rule, so _cfg pins those
+# values; the hard cap equals the sizing cap, as it did. The research defaults, partial
+# rebalancing and the separate hard cap are tested in test_construct_research.py.
+PRE_RESEARCH = dict(max_position=0.10, max_sector=0.35, target_vol=0.18, no_trade_band=0.01, rebalance_fraction=1.0)
+
+
 def _cfg(**portfolio) -> FirmConfig:
-    base = dict(max_turnover=10.0)   # most tests isolate one rule; the turnover cap is tested separately
+    base = dict(PRE_RESEARCH, max_turnover=10.0)   # most tests isolate one rule; the turnover cap is tested separately
     base.update(portfolio)
-    return FirmConfig(portfolio=PortfolioConfig(**base))
+    pc = PortfolioConfig(**base)
+    return FirmConfig(portfolio=pc, risk=RiskConfig(max_position_hard=pc.max_position))
 
 
 def _fs(t, vol=30.0, price=100.0, sector=""):

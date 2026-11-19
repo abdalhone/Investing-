@@ -17,8 +17,11 @@ Why it works this way
   everything early still cannot leak future outcomes into past weights.
 * **Shrink toward equal weight.** With ``n`` resolved questions the weight is
   ``1 + n/(n+prior_n) * 4 * skill``, clipped to ``[floor, cap]``, and exactly 1.0 below
-  ``min_n``. A handful of lucky calls cannot capture the committee, and nobody is
-  silenced completely (the floor keeps dissent alive, see P6).
+  ``min_n`` questions or below ``min_dates`` distinct decision dates (RESEARCH 6.2: "after
+  at least about 20 graded dates per agent"; 9.3 item 5). The date rule matters with a
+  broad universe: one decision date can resolve a hundred questions, but they share one
+  market episode, so they are not a track record. A handful of lucky calls cannot capture
+  the committee, and nobody is silenced completely (the floor keeps dissent alive, see P6).
 * **Training-contamination guard (P10).** Forecasts made on dates the model may have
   seen in training (``pre_cutoff``) can "predict" memorised history. They are excluded
   from weights by default and reported separately in the scorecard.
@@ -69,6 +72,13 @@ from ..data.prices import PriceData
 from ..schemas import AggregatedView, ForecastRecord, ViewRecord
 
 COMMITTEE_AGENT = "committee"
+LLM_POOL_AGENT = "llm_pool"    # the pooled LLM analysts' probability, recorded beside the final one (overlay)
+# The quant-only shadow book's final probability, mirrored into the live book's store by
+# aifirm.shadow so the live final probability ("committee") and the shadow's can be compared
+# date by date. It is a book, not an analyst: never weighted, calibrated or pooled.
+SHADOW_AGENT = "shadow"
+# Records that summarise a book or a pool rather than one analyst's sealed view.
+POOLED_AGENTS = frozenset({COMMITTEE_AGENT, LLM_POOL_AGENT, SHADOW_AGENT})
 MAX_PRINT_LAG_DAYS = 5         # a missing print is bridged by a close at most this many calendar days earlier
 DETERMINISTIC_MODELS = frozenset({"deterministic"})   # code, not a trained model: nothing to have memorised
 NO_SKILL_BRIER = 0.25          # Brier score of a constant 0.5 forecast
@@ -134,17 +144,23 @@ def is_pre_cutoff(model: str, as_of: str | date | pd.Timestamp) -> bool:
 
 def make_forecast_records(run_id: str, as_of: str, views: list[ViewRecord], agg: AggregatedView,
                           cfg: FirmConfig, trading_calendar: TradingCalendar | None) -> list[ForecastRecord]:
-    """One record per non-abstaining view plus one ``"committee"`` record for the pool.
+    """One record per non-abstaining view, one ``"committee"`` record for the final
+    probability and, when ``agg.prob_llm`` is set, one ``"llm_pool"`` record.
 
-    IDs are ``run_id|as_of|ticker|agent|s<sample>`` (``|committee`` for the pool), so they
-    are unique across decision dates within one run and re-adding is idempotent. The
-    ticker comes from ``agg`` (in blind mode an LLM may echo an alias such as "STOCK").
-    Each analyst record stores its *sealed* probability (see module docstring).
+    IDs are ``run_id|as_of|ticker|agent|s<sample>`` (``|committee`` / ``|llm_pool`` for the
+    pooled records), so they are unique across decision dates within one run and re-adding
+    is idempotent. The ticker comes from ``agg`` (in blind mode an LLM may echo an alias
+    such as "STOCK"). Each analyst record stores its *sealed, raw* stated probability (see
+    module docstring): never a calibrated or tier-gated copy, so calibration maps are always
+    refitted on what the agents actually said.
 
-    The committee record is skipped when every view abstained: a 0.5 pooled from nothing
-    is not a forecast and would only dilute the committee's score. It is flagged
-    ``pre_cutoff`` if any contributing member is, since contamination propagates through
-    the pool.
+    The committee record is the probability the firm sized from (the pool, or the quant core
+    plus the bounded LLM tilt in overlay mode). The ``llm_pool`` record is the pooled LLM
+    analysts' probability (calibrated, tier-gated) before any overlay, so the LLM pool and
+    the final overlay can be scored separately (and the adaptive overlay bound can compare
+    the LLM pool's IC with the quant's). Both are skipped when every contributing view
+    abstained (a 0.5 pooled from nothing is not a forecast), and both are flagged
+    ``pre_cutoff`` if any contributing member is (contamination propagates through a pool).
     """
     as_of_s = _day(as_of)
     h = cfg.process.horizon_days
@@ -164,6 +180,13 @@ def make_forecast_records(run_id: str, as_of: str, views: list[ViewRecord], agg:
             model="+".join(sorted({v.model for v in members})),
             prob_outperform=agg.prob_outperform, expected_excess_return_pct=agg.expected_excess_return_pct,
             pre_cutoff=any(r.pre_cutoff for r in records), **common))
+    llm_members = [v for v in members if v.model not in DETERMINISTIC_MODELS]
+    if agg.prob_llm is not None and llm_members:
+        llm_recs = [r for r in records if r.agent not in (COMMITTEE_AGENT,) and r.model not in DETERMINISTIC_MODELS]
+        records.append(ForecastRecord(
+            id=f"{run_id}|{as_of_s}|{agg.ticker}|{LLM_POOL_AGENT}", agent=LLM_POOL_AGENT,
+            model="+".join(sorted({v.model for v in llm_members})), prob_outperform=float(agg.prob_llm),
+            expected_excess_return_pct=0.0, pre_cutoff=any(r.pre_cutoff for r in llm_recs), **common))
     return records
 
 
@@ -359,6 +382,7 @@ def _agent_stats(recs: list[ForecastRecord]) -> dict:
     return {
         "n": n,
         "n_questions": len({(r.ticker, _day(r.as_of)) for r in recs}),
+        "n_dates": len({_day(r.as_of) for r in recs}),
         "n_pre_cutoff": sum(1 for r in recs if r.pre_cutoff),
         "brier": brier,
         "brier_skill": (NO_SKILL_BRIER - brier) / NO_SKILL_BRIER,
@@ -376,7 +400,7 @@ def scorecard(records: Iterable[ForecastRecord], as_of: str | None = None,
     """Per-agent track record from resolved records (only ``resolve_on <= as_of`` if given).
 
     Keys per agent: ``n`` (records), ``n_questions`` (distinct ticker and decision date),
-    ``n_pre_cutoff``, ``brier``, ``brier_skill`` (= (0.25 - brier) / 0.25, skill over a
+    ``n_dates`` (distinct decision dates), ``n_pre_cutoff``, ``brier``, ``brier_skill`` (= (0.25 - brier) / 0.25, skill over a
     constant 0.5), ``log_loss``, ``hit_rate`` (direction right, over forecasts != 0.5;
     ``None`` if none), ``mean_prob``, ``base_rate``, ``mean_realized_excess_pct`` and
     ``calibration`` (buckets with ``n``, ``mean_prob``, ``observed_rate``). Agents with no
@@ -398,24 +422,26 @@ def scorecard(records: Iterable[ForecastRecord], as_of: str | None = None,
 
 def believability_weights(records: Iterable[ForecastRecord], as_of: str, agents: Iterable[str],
                           min_n: int = 20, prior_n: int = 30, floor: float = 0.25, cap: float = 2.0,
-                          include_pre_cutoff: bool = False) -> dict[str, float]:
+                          include_pre_cutoff: bool = False, min_dates: int = 20) -> dict[str, float]:
     """Track-record weights for ``agents`` usable for a decision on ``as_of`` (P7).
 
     ``skill = (0.25 - brier) / 0.25``; ``weight = 1 + n/(n + prior_n) * 4 * skill``
-    clipped to ``[floor, cap]``; ``weight = 1.0`` while ``n < min_n``. ``n`` counts
-    distinct questions (see module docstring). Only records with ``resolve_on <= as_of``
-    count, and ``pre_cutoff`` records only with ``include_pre_cutoff=True``.
+    clipped to ``[floor, cap]``; ``weight = 1.0`` (equal weights) while ``n < min_n`` or
+    the agent's resolved questions span fewer than ``min_dates`` distinct decision dates.
+    ``n`` counts distinct questions (see module docstring). Only records with
+    ``resolve_on <= as_of`` count, and ``pre_cutoff`` records only with
+    ``include_pre_cutoff=True``.
     """
     if not 0 < floor <= 1.0 <= cap:
         raise ValueError(f"need 0 < floor <= 1 <= cap, got floor={floor}, cap={cap}")
-    if min_n < 0 or prior_n < 0:
-        raise ValueError("min_n and prior_n must be non-negative")
+    if min_n < 0 or prior_n < 0 or min_dates < 0:
+        raise ValueError("min_n, prior_n and min_dates must be non-negative")
     cards = scorecard(records, as_of, include_pre_cutoff=include_pre_cutoff)
     weights = {}
     for agent in agents:
         card = cards.get(agent)
         n = card["n_questions"] if card else 0
-        if n == 0 or n < min_n:
+        if n == 0 or n < min_n or card["n_dates"] < min_dates:
             weights[agent] = 1.0
             continue
         skill = (NO_SKILL_BRIER - card["brier"]) / NO_SKILL_BRIER

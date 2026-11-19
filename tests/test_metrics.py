@@ -7,8 +7,12 @@ import pytest
 from aifirm.backtest.metrics import (
     brier_score,
     deflated_sharpe,
+    long_run_variance,
     max_drawdown,
+    mean_t_stat,
     min_track_record_length,
+    newey_west_lags,
+    ols_hac,
     performance_report,
     probabilistic_sharpe,
     sharpe,
@@ -71,3 +75,50 @@ def test_performance_report_with_benchmark():
 def test_brier():
     assert brier_score([0.5, 0.5], [1, 0]) == pytest.approx(0.25)
     assert brier_score([1.0, 0.0], [1, 0]) == 0.0
+
+
+# ----------------------------------------------------------------------------- Newey-West and HAC regression
+
+
+def test_long_run_variance_without_lags_is_the_sample_variance():
+    x = _series(mu=0.001, sd=0.02, n=200)
+    assert long_run_variance(x, 0) == pytest.approx(x.var(ddof=1))
+    assert mean_t_stat(x, 0) == pytest.approx(x.mean() / x.std(ddof=1) * math.sqrt(len(x)))
+    assert math.isnan(mean_t_stat(pd.Series([0.1])))                       # one value: no t-stat
+    assert math.isnan(mean_t_stat(pd.Series([0.1, 0.1, 0.1])))             # no variation: no t-stat
+
+
+def test_newey_west_t_stat_discounts_overlapping_observations():
+    """Regression guard: overlapping forward windows (e.g. 21-day forecasts made every 5 days)
+    are positively autocorrelated; an iid t-stat would overstate significance."""
+    rng = np.random.default_rng(3)
+    shocks = rng.normal(0.01, 0.05, 400)
+    overlapped = pd.Series(np.convolve(shocks, np.ones(4) / 4, mode="valid"))   # MA(3): 4 overlapping draws
+    assert long_run_variance(overlapped, 3) > long_run_variance(overlapped, 0)
+    assert abs(mean_t_stat(overlapped, 3)) < abs(mean_t_stat(overlapped, 0))
+    assert newey_west_lags(100) == 4 and newey_west_lags(1000) == 6
+
+
+def test_ols_hac_recovers_known_coefficients_and_matches_hc1_without_lags():
+    rng = np.random.default_rng(5)
+    n = 500
+    x1, x2 = rng.normal(size=n), rng.normal(size=n)
+    y = 0.3 + 1.5 * x1 - 0.7 * x2 + rng.normal(0, 0.5, n)
+    x = np.column_stack([np.ones(n), x1, x2])
+    fit = ols_hac(y, x, lags=0)
+    assert fit.coef == pytest.approx([0.3, 1.5, -0.7], abs=0.08)
+    # lags = 0 is White's heteroskedasticity-robust covariance with the n/(n-k) correction (HC1)
+    e = y - x @ fit.coef
+    inv = np.linalg.inv(x.T @ x)
+    hc1 = inv @ (x.T * e ** 2) @ x @ inv * n / (n - 3)
+    assert fit.se == pytest.approx(np.sqrt(np.diag(hc1)))
+    assert fit.t == pytest.approx(fit.coef / fit.se)
+    assert 0.8 < fit.r2 < 1.0 and fit.n == n
+
+
+def test_ols_hac_refuses_degenerate_regressions():
+    x = np.column_stack([np.ones(10), np.ones(10)])                        # a constant "factor"
+    with pytest.raises(ValueError, match="collinear"):
+        ols_hac(np.arange(10.0), x, 2)
+    with pytest.raises(ValueError, match="more observations"):
+        ols_hac(np.arange(2.0), np.ones((2, 2)), 0)

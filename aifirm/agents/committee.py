@@ -29,6 +29,20 @@ Why the process looks like this (see docs/ARCHITECTURE.md):
   means "do not buy", so it also gets 0.
 * **Weights from track record (P7).** Each view is weighted by its agent's believability;
   ungrounded views count half (P2).
+* **What reaches the pool is code-checked (RESEARCH 6.2, 9.3 item 3).** Each LLM analyst's
+  sealed view is first passed through the tier gate (a bullish view that rests only on
+  unverified news is capped at 0.5, :mod:`aifirm.agents.tier_gate`) and then through its
+  agent's point-in-time calibration map (:mod:`aifirm.journal.calibration`). Pooling,
+  challenger selection and the overlay use those copies; ``CommitteeResult.views`` keep
+  the RAW stated probabilities, which are what the forecast store records (calibrators are
+  refitted on raw data). The prompts shown to agents also quote raw views: an analyst is
+  never told it said something it did not. The quant is neither gated nor calibrated.
+* **Quant core plus a bounded LLM overlay (RESEARCH 6.6).** With
+  ``process.combination = "overlay"`` (the default) the final probability is the quant's,
+  tilted by the pooled LLM analysts by at most ``max_tilt``
+  (:mod:`aifirm.portfolio.overlay`); with ``"pool"`` every analyst, quant included, is one
+  member of the trimmed log-odds pool. Either way the challenge round is triggered by the
+  dispersion of all members and the challenger is the most opposed LLM analyst.
 * **Fail closed.** A failed analyst call is an abstention; a failed challenge leaves the
   sealed pool in place; a failed revision keeps the sealed view. A failed memo on a name
   the book does not own sets the edge multiplier to 0, so an unreviewed edge is never
@@ -48,18 +62,22 @@ import random
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, TypeVar
 
 from ..config import FirmConfig
 from ..data.factsheet import FactSheet
+from ..journal.calibration import Calibrator, calibrate_view
 from ..llm.client import LLM, BudgetExceeded, LLMCallFailed
 from ..portfolio.aggregate import aggregate_views
+from ..portfolio.overlay import overlay_aggregate
+from ..quant.signals import horizon_sigma_pct
 from ..schemas import AggregatedView, Challenge, EvidenceItem, ICMemo, Revision, ViewRecord, clamp
 from .analysts import (BLIND_ALIAS, EVIDENCE_RULES, NEUTRALITY, blind_factsheet, blind_ids_in_text, blind_text,
                        horizon_phrase, render_slice, run_analyst, served_model, shown_sheet, unblind_id)
 from .grounding import resolve_fact_id
 from .roles import ROLES
+from .tier_gate import tier_gate
 
 QUANT_AGENT = "quant"
 PROB_FLOOR = 0.02                       # same floor as schemas.sanitize_view
@@ -97,6 +115,13 @@ class CommitteeResult:
     # True when the chair was required but could not review a HELD name (the memo call failed):
     # keep the current weight this cycle instead of re-sizing or selling on an LLM failure.
     hold_current: bool = False
+    # The pool of the LLM analysts alone (calibrated, tier-gated; revised after a challenge),
+    # None when no LLM analyst sits on the committee. In overlay mode it is what tilts the quant.
+    llm_aggregate: AggregatedView | None = None
+    # The views as pooled: tier-gated and calibrated copies of ``views`` (same order). ``views``
+    # keep the raw stated probabilities, which are what the forecast store records.
+    pool_views: list[ViewRecord] = field(default_factory=list)
+    tier_gate_notes: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- prompts
@@ -426,8 +451,17 @@ def memo_user_prompt(fs: FactSheet, cfg: FirmConfig, views: list[ViewRecord], ag
         f"{DISPERSION_LABEL}: {agg.dispersion:.3f}",
         f"Views pooled: {agg.n_views}; abstained: {agg.n_abstained}",
         f"{CHALLENGE_ROUND_LABEL}: " + (f"yes (analysts who crossed 0.50 afterwards: {agg.flips})" if agg.challenged else "no"),
-        "", "ANALYST VIEWS (anonymised; letters are random labels in a random order, not ranks)",
     ]
+    if agg.combination == "overlay":
+        core = f"{agg.prob_quant:.3f}" if agg.prob_quant is not None else "none (the quant abstained; core 0.500)"
+        llm_p = f"{agg.prob_llm:.3f}" if agg.prob_llm is not None else "none (every language-model analyst abstained)"
+        lines += ["How the pooled probability was formed: the deterministic factor model is the core; the "
+                  "language-model analysts' pooled probability may tilt it by at most "
+                  f"{agg.max_tilt or 0.0:.3f} either way.",
+                  f"Factor-model core: {core}; analysts' pool (calibrated): {llm_p}; tilt applied: "
+                  f"{agg.overlay_tilt or 0.0:+.3f}"]
+    lines += ["", "ANALYST VIEWS (anonymised; letters are random labels in a random order, not ranks; probabilities "
+                  "as each analyst stated them)"]
     peer = _peer_text(fs, blind)
     for pos, i in enumerate(anonymous_order(fs.ticker, len(views))):
         v, view = views[i], views[i].view
@@ -597,22 +631,96 @@ def _run_memo(llm: LLM, fs: FactSheet, cfg: FirmConfig, views: list[ViewRecord],
     return memo, multiplier, False
 
 
+# --------------------------------------------------------------------------- pooling inputs and the final aggregate
+
+
+def pool_inputs(views: list[ViewRecord], fs: FactSheet, cfg: FirmConfig,
+                calibrators: dict[str, Calibrator] | None) -> tuple[list[ViewRecord], list[str]]:
+    """The views as they enter the pool, in the same order: each LLM analyst's view through
+    the tier gate (if ``cfg.process.tier_gate_enabled``) and then its agent's calibrator (if
+    given). The quant and any agent without an LLM role pass unchanged. Inputs are never
+    modified; changed views are copies that keep their weights. Returns the views and the
+    tier-gate notes."""
+    out, notes = [], []
+    for v in views:
+        if v.agent not in ROLES:
+            out.append(v)
+            continue
+        if cfg.process.tier_gate_enabled:
+            v, note = tier_gate(v, fs)
+            if note:
+                notes.append(note)
+        if calibrators:
+            v = calibrate_view(v, calibrators.get(v.agent))
+        out.append(v)
+    return out, notes
+
+
+def _pool_log(fs: FactSheet, stage: str, raw: list[ViewRecord], pooled: list[ViewRecord], notes: list[str],
+              calibrators: dict[str, Calibrator] | None) -> dict:
+    rows = []
+    for r, v in zip(raw, pooled, strict=True):
+        if r.view.abstain:
+            continue
+        cal = (calibrators or {}).get(r.agent)
+        rows.append({"agent": r.agent, "sample": r.sample, "raw_prob": r.view.prob_outperform,
+                     "pool_prob": v.view.prob_outperform, "raw_excess_pct": r.view.expected_excess_return_pct,
+                     "pool_excess_pct": v.view.expected_excess_return_pct, "raw_revised_prob": r.revised_prob,
+                     "pool_revised_prob": v.revised_prob, "weight": v.weight,
+                     "calibrator": None if cal is None or cal.is_identity else {"a": cal.a, "b": cal.b, "n": cal.n}})
+    return {"ticker": fs.ticker, "stage": stage, "tier_gate_notes": list(notes), "views": rows}
+
+
+def _final_aggregate(fs: FactSheet, cfg: FirmConfig, pool: list[ViewRecord], max_tilt: float,
+                     use_revised: bool) -> tuple[AggregatedView, AggregatedView, AggregatedView | None]:
+    """``(final, members, llm_pool)``: the aggregate the firm sizes from (pool or overlay), the
+    pool of every member (the challenge trigger) and the LLM analysts' pool (None without
+    an LLM analyst view)."""
+    trim = cfg.process.trim_fraction
+    members = aggregate_views(fs.ticker, pool, trim=trim, use_revised=use_revised)
+    quant = next((v for v in pool if v.agent == QUANT_AGENT), None)
+    llm_views = [v for v in pool if v.agent in ROLES]
+    if cfg.process.combination == "overlay":
+        final, llm_agg = overlay_aggregate(fs.ticker, quant, llm_views, trim=trim, max_tilt=max_tilt,
+                                           sigma_h_pct=horizon_sigma_pct(fs, cfg.process.horizon_days),
+                                           use_revised=use_revised)
+        return final, members, llm_agg
+    llm_agg = aggregate_views(fs.ticker, llm_views, trim=trim, use_revised=use_revised) if llm_views else None
+    q_ok = quant is not None and not quant.view.abstain
+    final = members.model_copy(update={
+        "combination": "pool",
+        "prob_quant": float(quant.view.prob_outperform) if q_ok else None,  # type: ignore[union-attr]
+        "prob_llm": llm_agg.prob_outperform if llm_agg is not None and llm_agg.n_views > 0 else None})
+    return final, members, llm_agg
+
+
 # --------------------------------------------------------------------------- entry point
 
 def run_committee(llm: LLM, fs: FactSheet, cfg: FirmConfig, *, quant_view: ViewRecord | None,
                   believability: dict[str, float], lessons: dict[str, list[str]], held: bool,
-                  log: LogFn = lambda e, p: None) -> CommitteeResult:
+                  log: LogFn = lambda e, p: None, calibrators: dict[str, Calibrator] | None = None,
+                  max_tilt: float | None = None) -> CommitteeResult:
     """Run the full committee process for one ticker (docs/ARCHITECTURE.md section 3.5).
 
     ``lessons`` maps agent name to retrieved process lessons; the chair receives
-    ``lessons["committee"]``. ``log(event, payload)`` receives "view", "aggregate",
-    "challenge", "revision" and "memo" events for the ledger; challenge, revision and memo
-    payloads carry ``served_by``, the model that actually answered.
+    ``lessons["committee"]``. ``log(event, payload)`` receives "view" (raw), "pool_inputs"
+    (raw vs pooled probabilities, tier-gate notes), "aggregate" (sealed and, after a
+    challenge, revised), "challenge", "revision" and "memo" events for the ledger;
+    challenge, revision and memo payloads carry ``served_by``, the model that actually
+    answered.
+
+    ``calibrators``: per-agent calibration maps fitted point-in-time (None: no calibration).
+    ``max_tilt``: the overlay bound in force (None: ``cfg.process.overlay_max_tilt``; the
+    pipeline passes the adaptive bound). Only used when ``cfg.process.combination`` is
+    "overlay".
 
     With memos enabled, the chair reviews every name :func:`memo_required` selects; any
     other name gets an edge multiplier of 0. ``CommitteeResult.hold_current`` is True when
     a held name's required memo failed: the caller should keep that name at its current
     weight this cycle (an LLM failure is not a reason to trade it)."""
+    tilt = cfg.process.overlay_max_tilt if max_tilt is None else float(max_tilt)
+    if not 0.0 <= tilt <= 0.5:
+        raise ValueError(f"max_tilt must be in [0, 0.5], got {max_tilt!r}")
     views = _sealed_views(llm, fs, cfg, lessons)
     if quant_view is not None:
         views.append(quant_view.model_copy(deep=True))
@@ -620,21 +728,27 @@ def run_committee(llm: LLM, fs: FactSheet, cfg: FirmConfig, *, quant_view: ViewR
     for v in views:
         log("view", {"ticker": fs.ticker, **v.model_dump()})
 
-    trim = cfg.process.trim_fraction
-    agg = aggregate_views(fs.ticker, views, trim=trim)
+    pool, notes = pool_inputs(views, fs, cfg, calibrators)
+    gate_notes = list(notes)
+    log("pool_inputs", _pool_log(fs, "sealed", views, pool, notes, calibrators))
+    agg, members, llm_agg = _final_aggregate(fs, cfg, pool, tilt, use_revised=False)
     log("aggregate", {"stage": "sealed", **agg.model_dump()})
 
     challenge: Challenge | None = None
     challenger: ViewRecord | None = None
     n_active = sum(1 for v in views if not v.view.abstain)
-    if (cfg.process.challenge_enabled and agg.dispersion > cfg.process.challenge_dispersion_threshold
+    if (cfg.process.challenge_enabled and members.dispersion > cfg.process.challenge_dispersion_threshold
             and n_active >= 2):
-        challenger = select_challenger(views, agg.prob_outperform)
-        if challenger is not None:
-            challenge = _run_challenge(llm, fs, cfg, challenger, views, agg, log)
-        if challenge is not None:
+        chosen = select_challenger(pool, members.prob_outperform)
+        if chosen is not None:      # the raw view behind the pooled copy: prompts quote what it stated
+            challenger = views[next(i for i, v in enumerate(pool) if v is chosen)]
+            challenge = _run_challenge(llm, fs, cfg, challenger, views, members, log)
+        if challenge is not None and challenger is not None:
             _run_revisions(llm, fs, cfg, views, challenger, challenge, log)
-            agg = aggregate_views(fs.ticker, views, trim=trim, use_revised=True)   # sets challenged and flips
+            pool, notes = pool_inputs(views, fs, cfg, calibrators)
+            gate_notes += [n for n in notes if n not in gate_notes]
+            log("pool_inputs", _pool_log(fs, "revised", views, pool, notes, calibrators))
+            agg, members, llm_agg = _final_aggregate(fs, cfg, pool, tilt, use_revised=True)   # challenged, flips
             log("aggregate", {"stage": "revised", **agg.model_dump()})
 
     memo: ICMemo | None = None
@@ -650,4 +764,5 @@ def run_committee(llm: LLM, fs: FactSheet, cfg: FirmConfig, *, quant_view: ViewR
     challenger_name = challenger.agent if challenge is not None and challenger is not None else None
     return CommitteeResult(ticker=fs.ticker, views=views, aggregate=agg, challenge=challenge,
                            challenger=challenger_name, memo=memo, edge_multiplier=edge_multiplier,
-                           hold_current=hold_current)
+                           hold_current=hold_current, llm_aggregate=llm_agg, pool_views=pool,
+                           tier_gate_notes=gate_notes)

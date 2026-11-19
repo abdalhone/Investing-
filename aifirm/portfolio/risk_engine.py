@@ -15,7 +15,13 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   still set, treats that as the human reset, restarts the high-water mark at the current
   NAV and clears the marker. Without that, a book frozen to cash could never recover the
   old peak and would re-freeze on the very next run.
-* **Drawdown de-risk**: at ``drawdown_derisk`` active weights are halved.
+* **Drawdown de-risk and re-risk** (RESEARCH 6.4): at ``drawdown_derisk`` active weights
+  are halved and ``state.derisked`` is set. The book stays halved until it has recovered
+  half of the drawdown, measured from the peak to the lowest NAV since that peak
+  (``state.trough_nav``): full gross returns once ``nav >= trough + 0.5 * (peak - trough)``
+  (or at a new peak), while unfrozen. Without this hysteresis the book would re-risk the
+  moment the drawdown crept back under the threshold and could flip between half and full
+  gross on every small move around it.
 * **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
   may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
 * **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more on *any*
@@ -23,8 +29,10 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   may increase this cycle (sells and reductions still go through). The high-water mark
   must likewise see every daily NAV (:func:`update_risk_state` per mark), not only the
   decision-day NAVs, or drawdowns inside a cycle are measured from a too-low peak.
-* **Backstops**: non-finite weights -> 0, shorts in a long-only book -> 0, position cap,
-  max gross and cash floor. Construction already enforces these; repeating them here
+* **Backstops**: non-finite weights -> 0, shorts in a long-only book -> 0, the hard
+  per-name cap ``risk.max_position_hard`` (construction sizes to the lower target
+  ``portfolio.max_position``; a drifted holding between the two is not cut here), max gross
+  and cash floor. Construction already enforces these; repeating them here
   means a bug upstream cannot reach the broker.
 
 Invariant: apart from the kill switch (which returns the current book unchanged), every
@@ -60,13 +68,18 @@ class RiskState:
     ``last_nav`` / ``last_as_of``: the NAV and date of the last decision (set by the
     pipeline), so the next cycle can see the path since then. ``frozen_at_nav``: set when
     the book freezes and kept after a human clears ``frozen``, which is how the next cycle
-    recognises the human reset (see the module docstring)."""
+    recognises the human reset (see the module docstring). ``trough_nav``: the lowest NAV
+    mark since the last peak (:func:`update_risk_state`); ``derisked``: the drawdown
+    de-risk is in force until half of the drawdown is recovered. Both default so that a
+    state saved before they existed loads unchanged."""
 
     peak_nav: float
     frozen: bool = False
     last_nav: float | None = None
     last_as_of: str | None = None
     frozen_at_nav: float | None = None
+    trough_nav: float | None = None
+    derisked: bool = False
 
 
 def _valid_positive(x: object) -> bool:
@@ -78,7 +91,8 @@ def _valid_positive(x: object) -> bool:
 
 
 def update_risk_state(state: RiskState, nav: float) -> RiskState:
-    """Record a new NAV mark: raise the peak if exceeded and remember ``last_nav``.
+    """Record a new NAV mark: raise the peak if exceeded, track the lowest NAV since the
+    peak (``trough_nav``, reset to the NAV at each new peak) and remember ``last_nav``.
 
     Returns a new state (the input is not modified). A non-finite or non-positive NAV means
     the accounting is broken, so the book is frozen (fail closed). A corrupt peak is reset
@@ -89,9 +103,12 @@ def update_risk_state(state: RiskState, nav: float) -> RiskState:
         return replace(state, frozen=True, frozen_at_nav=marker)
     nav = float(nav)
     if not _valid_positive(state.peak_nav):
-        return replace(state, peak_nav=nav, last_nav=nav, frozen=True,
+        return replace(state, peak_nav=nav, last_nav=nav, frozen=True, trough_nav=nav,
                        frozen_at_nav=state.frozen_at_nav if state.frozen_at_nav is not None else nav)
-    return replace(state, peak_nav=max(float(state.peak_nav), nav), last_nav=nav)
+    if nav >= float(state.peak_nav):
+        return replace(state, peak_nav=nav, last_nav=nav, trough_nav=nav)
+    trough = min(float(state.trough_nav), nav) if _valid_positive(state.trough_nav) else nav
+    return replace(state, last_nav=nav, trough_nav=trough)
 
 
 def _no_increase(target: float, current: float) -> float:
@@ -163,13 +180,14 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             msgs.append(f"{p.ticker}: short target {w:.2%} in a long-only book -> 0")
             hits[p.ticker].append("risk:long_only")
             w = 0.0
-        if abs(w) > pc.max_position:
+        if abs(w) > rc.max_position_hard:
             # Construction meets the cap up to float rounding (e.g. 0.10000000000100001); clip
             # that silently and report only a real breach.
-            if abs(w) > pc.max_position + CAP_NOISE:
-                msgs.append(f"{p.ticker}: {w:.2%} exceeds the position cap -> {pc.max_position:.2%}")
+            if abs(w) > rc.max_position_hard + CAP_NOISE:
+                msgs.append(f"{p.ticker}: {w:.2%} exceeds the position cap (risk.max_position_hard) -> "
+                                f"{rc.max_position_hard:.2%}")
                 hits[p.ticker].append("risk:max_position")
-            w = math.copysign(pc.max_position, w)
+            w = math.copysign(rc.max_position_hard, w)
         weights[p.ticker] = w
     core = float(target.core_weight) if math.isfinite(float(target.core_weight)) else 0.0
     core_limit = min(pc.max_gross, 1.0 - pc.min_cash)
@@ -184,6 +202,8 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
                     f"high-water mark reset from {float(state.peak_nav):,.2f} to the current NAV {float(nav):,.2f}")
         state.peak_nav = float(nav)
         state.frozen_at_nav = None
+        state.trough_nav = float(nav)
+        state.derisked = False
 
     # Drawdown: freeze (sticky) or de-risk.
     peak = max(float(state.peak_nav), float(nav))
@@ -201,12 +221,29 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             if weights[t] != 0.0:
                 hits[t].append("risk:drawdown_freeze")
             weights[t] = 0.0
-    elif drawdown >= rc.drawdown_derisk:
-        msgs.append(f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights halved")
-        for t in weights:
-            if weights[t] != 0.0:
-                weights[t] *= 0.5
-                hits[t].append("risk:drawdown_derisk")
+    else:
+        trough = min(float(state.trough_nav), float(nav)) if _valid_positive(state.trough_nav) else float(nav)
+        recovery = trough + 0.5 * (peak - trough)        # half of the peak-to-trough drawdown recovered
+        halve = False
+        if drawdown >= rc.drawdown_derisk:
+            halve = True
+            state.derisked = True
+            msgs.append(f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights "
+                        f"halved until half of the drawdown is recovered")
+        elif state.derisked and float(nav) < recovery and float(nav) < peak:
+            halve = True
+            msgs.append(f"drawdown de-risk still in force: {drawdown:.1%} from peak, but less than half of the "
+                        f"drawdown from {peak:,.2f} to the trough {trough:,.2f} is recovered (full gross at NAV "
+                        f">= {recovery:,.2f}); active weights halved")
+        elif state.derisked:
+            state.derisked = False
+            msgs.append(f"re-risk: half of the drawdown from {peak:,.2f} to the trough {trough:,.2f} recovered (NAV "
+                        f"{float(nav):,.2f}); full gross restored")
+        if halve:
+            for t in weights:
+                if weights[t] != 0.0:
+                    weights[t] *= 0.5
+                    hits[t].append("risk:drawdown_derisk")
 
     # Restricted list and minimum price.
     restricted = {x.upper() for x in rc.restricted}

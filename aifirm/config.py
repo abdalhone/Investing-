@@ -146,6 +146,8 @@ class ModelConfig(_Section):
     risk_model: str = "claude-opus-5-5"
     risk_effort: str = "medium"
     use_server_fallbacks: bool = Field(True, description="Ask the API to retry a refused request on a fallback model (server-side fallbacks beta).")
+    news_reader_model: str = Field("claude-opus-5-5", description="Model of the quarantined news reader (the only call that sees raw headline text).")
+    news_reader_effort: str = "low"
     max_tokens: int = 16000
     max_parallel_calls: int = 4
 
@@ -161,17 +163,68 @@ class ModelConfig(_Section):
         return []
 
 
+COMBINATIONS = ("overlay", "pool")
+
+
+class ScreenConfig(_Section):
+    """Broad-universe quant screen with an LLM deep dive on the top band only
+    (RESEARCH 7.3, 9.2 "cadence and universe", 9.3 item 1: breadth is what gives statistical power).
+
+    When ``enabled``, the investable universe is the union of the bundled ``preset``, the
+    tickers listed in ``file`` and the inline ``tickers`` (plus ``universe.tickers``, which are
+    always covered). Every decision then: (1) builds cheap fact sheets for the whole universe
+    (prices, SEC fundamentals; no news, no LLM), (2) scores the deterministic quant over the
+    whole cross-section, (3) keeps names that pass the point-in-time filters (last close at
+    least ``risk.min_price``, 20-day average dollar volume at least ``min_dollar_volume``, a
+    recent price), and (4) sends the top ``deep_dive_top_n`` of them by quant probability
+    (only names above 0.5) plus every held name to the LLM committee. Names outside that
+    deep-dive set get no new position. Held names are always deep-dived (not configurable):
+    a held position must be reviewed, and dropping it from review would force a sale.
+
+    Survivorship: a list of today's members (such as the bundled ``sp100``) omits names that
+    were dropped or delisted, so backtests on it are biased upward; reports say so."""
+
+    enabled: bool = Field(False, description="Screen a broad universe and deep-dive only the top band.")
+    preset: str = Field("", description="A bundled universe list, e.g. \"sp100\" (current members: survivorship-biased).")
+    file: str = Field("", description="A text file with one ticker per line ('#' comments). A relative path is relative "
+                                      "to the config file's directory.")
+    tickers: list[str] = Field(default_factory=list, description="Inline tickers added to the screened universe.")
+    deep_dive_top_n: int = Field(12, description="Names (ranked by quant probability, only those above 0.5) sent to the "
+                                                 "LLM committee each cycle, in addition to every held name.")
+    min_dollar_volume: float = Field(10_000_000.0, description="Minimum 20-day average daily dollar volume (close x "
+                                                               "volume, data up to the decision close) to be eligible.")
+
+    _RANGES: ClassVar[dict[str, _Range]] = {
+        "deep_dive_top_n": _Range(1, 1000),
+        "min_dollar_volume": _Range(0.0),
+    }
+
+    def _cross_checks(self) -> list[str]:
+        problems = []
+        if self.enabled and not (self.preset.strip() or self.file.strip() or any(t.strip() for t in self.tickers)):
+            problems.append("screen.enabled needs a universe source: preset, file or tickers")
+        if self.preset.strip():
+            from .universes import PRESETS        # local import: the universes package needs no config
+            if self.preset.strip().lower() not in PRESETS:
+                problems.append(f"screen.preset = {self.preset!r} is unknown; bundled presets: {', '.join(PRESETS)}")
+        return problems
+
+
 class UniverseConfig(_Section):
     tickers: list[str] = Field(default_factory=lambda: ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "JPM", "XOM", "JNJ", "PG"])
     benchmark: str = "SPY"
     sectors: dict[str, str] = Field(default_factory=dict, description="Optional manual sector labels (ticker -> sector) used for sector limits. Defaults to SEC SIC descriptions.")
     ciks: dict[str, str | int] = Field(default_factory=dict, description="Optional SEC filer pins (ticker -> CIK) used for that ticker's fundamentals and filing events on every date. Use when SEC's current ticker table maps a ticker to the wrong filer for your dates (e.g. after a holding-company reorganization).")
+    issuer_domains: dict[str, list[str]] = Field(default_factory=dict, description="Optional investor-relations domains per ticker (e.g. NVDA = [\"nvidia.com\"]): headlines linking there count as tier A (primary source) for the news reader.")
+    screen: ScreenConfig = Field(default_factory=ScreenConfig)
 
     def _cross_checks(self) -> list[str]:
         bench = self.benchmark.strip().upper()
         if not bench:
             return ["benchmark must not be empty"]
-        if not any(t.strip() and t.strip().upper() != bench for t in self.tickers):
+        screened = self.screen.enabled and (self.screen.preset.strip() or self.screen.file.strip()
+                                            or any(t.strip().upper() != bench for t in self.screen.tickers if t.strip()))
+        if not screened and not any(t.strip() and t.strip().upper() != bench for t in self.tickers):
             return ["tickers must list at least one stock other than the benchmark"]
         bad = [f"{t} = {c!r}" for t, c in self.ciks.items()
                if isinstance(c, bool) or not str(c).strip().isdigit() or len(str(c).strip()) > 10]
@@ -182,6 +235,11 @@ class UniverseConfig(_Section):
     def cik_pins(self) -> dict[str, str]:
         """``ciks`` normalized: upper-case tickers -> 10-digit CIK strings."""
         return {t.strip().upper(): str(c).strip().zfill(10) for t, c in self.ciks.items()}
+
+    def issuer_domain_map(self) -> dict[str, tuple[str, ...]]:
+        """``issuer_domains`` normalized: upper-case tickers -> lower-case domains."""
+        return {t.strip().upper(): tuple(d.strip().lower() for d in ds if d.strip())
+                for t, ds in self.issuer_domains.items()}
 
 
 class AnalystsConfig(_Section):
@@ -207,6 +265,23 @@ class ProcessConfig(_Section):
     blind_mode: bool = Field(False, description="Hide ticker, company name and absolute dates from LLM analysts (for historical research: reduces memorization leakage).")
     news_enabled: bool = True
     max_llm_cost_usd_per_run: float = 10.0
+    combination: str = Field("overlay", description="How the quant core and the LLM analysts combine (RESEARCH 6.6). "
+                                                    "'overlay': p_final = p_quant + clip(p_llm - p_quant, +/- max tilt), "
+                                                    "the LLM pool only tilts the quant inside a bound; 'pool': every "
+                                                    "analyst, quant included, is one member of the trimmed log-odds pool.")
+    overlay_max_tilt: float = Field(0.05, description="Largest move (in probability) the LLM pool may apply to the quant "
+                                                      "core. Halved, then set to 0, when resolved forecasts show the LLM "
+                                                      "pool ranking worse than the quant (never raised above this).")
+    overlay_min_dates: int = Field(12, description="Resolved decision dates with both an LLM-pool and a quant forecast "
+                                                   "needed before the adaptive bound may shrink the tilt.")
+    believability_min_dates: int = Field(20, description="Distinct resolved decision dates an agent needs before its "
+                                                         "track record tilts its pooling weight (equal weights until then).")
+    news_reader_enabled: bool = Field(True, description="Live headlines are read by the quarantined news reader into "
+                                                        "typed, tier-labelled events; analysts never see raw headline text.")
+    news_max_headlines: int = Field(20, description="Most recent headlines read per ticker and cycle.")
+    news_isolate_untrusted: bool = Field(True, description="Read tier A/B and tier C headlines in separate reader calls.")
+    tier_gate_enabled: bool = Field(True, description="Cap a bullish LLM view at 0.5 unless it cites admissible evidence "
+                                                      "(a non-news fact, a filing, or a tier A/B news event).")
 
     _RANGES: ClassVar[dict[str, _Range]] = {
         "horizon_days": _Range(1, 252),                 # trading days: one day to one year
@@ -215,21 +290,52 @@ class ProcessConfig(_Section):
         "trim_fraction": _fraction(0.0, 0.5, hi_open=True),
         "memo_min_edge": _fraction(0.0, 0.5),
         "max_llm_cost_usd_per_run": _Range(0.0, lo_open=True),
+        "overlay_max_tilt": _fraction(0.0, 0.5),
+        "overlay_min_dates": _Range(2, 10_000),
+        "believability_min_dates": _Range(0, 10_000),
+        "news_max_headlines": _Range(1, 200),
+    }
+
+    def _cross_checks(self) -> list[str]:
+        if self.combination not in COMBINATIONS:
+            return [f"combination = {self.combination!r} is unknown; use one of {', '.join(COMBINATIONS)}"]
+        return []
+
+
+class CalibrationConfig(_Section):
+    """Per-agent Platt calibration of LLM analyst probabilities before pooling
+    (:mod:`aifirm.journal.calibration`). Fitted point-in-time from resolved forecasts; the
+    identity until an agent has ``min_n`` resolved questions; shrunk toward the identity by
+    a prior worth ``prior_strength`` forecasts. Forecast records keep the RAW probability.
+    The deterministic quant is never calibrated."""
+
+    enabled: bool = True
+    min_n: int = Field(30, description="Resolved questions an agent needs before its map moves from the identity.")
+    prior_strength: float = Field(50.0, description="Pseudo-forecasts at the identity that the fit is shrunk toward.")
+
+    _RANGES: ClassVar[dict[str, _Range]] = {
+        "min_n": _Range(0, 1_000_000),
+        "prior_strength": _Range(0.0, 1e9),
     }
 
 
 class PortfolioConfig(_Section):
     core_weight: float = Field(0.0, description="Fraction of capital held passively in the benchmark (core-satellite). The agents manage the rest.")
     long_only: bool = True
-    max_position: float = 0.10
-    max_sector: float = 0.35
+    max_position: float = Field(0.08, description="Target cap per name used by sizing (research 6.4: 8% target; the hard "
+                                                  "cap is risk.max_position_hard).")
+    max_sector: float = Field(0.25, description="Cap on the gross weight of one sector (research 6.4).")
     min_cash: float = 0.02
     max_gross: float = 1.0
     min_prob_to_hold: float = Field(0.52, description="Minimum pooled P(outperform) to hold a long.")
     kelly_fraction: float = Field(0.25, description="Fraction of the Kelly-optimal weight to use (full Kelly is far too aggressive with estimated edges).")
-    target_vol: float = Field(0.18, description="Annualized volatility target for the active sleeve.")
-    no_trade_band: float = Field(0.01, description="Skip trades that change a weight by less than this.")
-    max_turnover: float = Field(0.5, description="Max one-way turnover per rebalance (fraction of NAV).")
+    target_vol: float = Field(0.15, description="Annualized volatility target for the active sleeve (research 6.4: "
+                                                "12-15%; the excess stays in cash, no leverage).")
+    no_trade_band: float = Field(0.005, description="Skip trades that change a weight by less than this (0.5% of NAV).")
+    max_turnover: float = Field(0.25, description="Max one-way turnover per rebalance (fraction of NAV).")
+    rebalance_fraction: float = Field(0.5, description="Each rebalance moves this fraction of the way from the current "
+                                                       "to the target weight (research 6.4/6.5); forced exits and "
+                                                       "hard-limit repairs go all the way.")
     dispersion_shrink: float = Field(2.0, description="Edge is multiplied by max(0, 1 - dispersion_shrink * dispersion).")
 
     # Upper bounds well above any sensible value still catch percent-style typos: a value that
@@ -246,13 +352,19 @@ class PortfolioConfig(_Section):
         "target_vol": _fraction(0.0, 5.0, lo_open=True),
         "no_trade_band": _fraction(0.0, 0.5),
         "max_turnover": _fraction(0.0, 10.0),
+        "rebalance_fraction": _fraction(0.0, 1.0, lo_open=True),
         "dispersion_shrink": _Range(0.0),
     }
 
 
 class RiskConfig(_Section):
-    drawdown_derisk: float = Field(0.10, description="At this drawdown from peak NAV, gross exposure of the active sleeve is halved.")
-    drawdown_freeze: float = Field(0.15, description="At this drawdown, the active sleeve goes to cash/core until a human resets it.")
+    drawdown_derisk: float = Field(0.10, description="At this drawdown from peak NAV, gross exposure of the active sleeve "
+                                                     "is halved; full gross returns once half of the drawdown (peak to "
+                                                     "trough) has been recovered (research 6.4).")
+    drawdown_freeze: float = Field(0.20, description="At this drawdown, the active sleeve goes to cash/core until a human resets it.")
+    max_position_hard: float = Field(0.10, description="Hard cap per name (research 6.4). Construction never leaves a "
+                                                       "name above it, drift included, and the risk engine clips any "
+                                                       "target above it. Sizing targets portfolio.max_position.")
     daily_loss_halt: float = Field(0.05, description="A one-day NAV loss this large halts new buys for the next cycle.")
     max_adv_participation: float = Field(0.02, description="Max order size as a fraction of 20-day average dollar volume.")
     restricted: list[str] = Field(default_factory=list)
@@ -265,6 +377,7 @@ class RiskConfig(_Section):
         "daily_loss_halt": _fraction(0.0, 1.0, lo_open=True, hi_open=True),
         "max_adv_participation": _fraction(0.0, 1.0, lo_open=True),
         "min_price": _Range(0.0),
+        "max_position_hard": _fraction(),
     }
 
     def _cross_checks(self) -> list[str]:
@@ -303,6 +416,55 @@ class ExecutionConfig(_Section):
         return []
 
 
+class EvaluationConfig(_Section):
+    """How a backtest is judged (P10): "is there skill, and would we know?", and whether the
+    live book keeps a quant-only shadow book to be judged against (RESEARCH 6.6, 7.4 S6).
+
+    None of these settings changes a decision, an order or a fill of the strategy; they only
+    change what is measured. They are therefore left out of :meth:`FirmConfig.fingerprint`
+    (changing them is not a new trial for the deflated Sharpe ratio, and adding this
+    section did not change any existing fingerprint)."""
+
+    n_random_books: int = Field(1000, description="Composition-matched random books for the null distribution "
+                                                  "(0 switches them off).")
+    random_seed: int = Field(20240917, description="Seed for the random books (results are reproducible).")
+    random_books_sector_matched: bool = Field(False, description="Draw each random replacement from the same sector "
+                                                                 "as the name it replaces (when sector labels exist).")
+    cost_multipliers: list[float] = Field(default_factory=lambda: [0.0, 1.0, 2.0],
+                                          description="Every cost component (commission, spread, impact) is "
+                                                      "multiplied by each k and the SAME decisions are re-executed.")
+    breakeven_cap: float = Field(50.0, description="Largest cost multiplier searched for the breakeven; beyond it the "
+                                                   "breakeven is reported as '> cap'.")
+    cutoff_buffer_days: int = Field(31, description="Calendar days after a model's training cutoff that still count as "
+                                                    "contaminated (vendor cutoffs are unreliable; research 7.2).")
+    ic_min_names: int = Field(5, description="Fewest names with a forecast and a realised return for a date's "
+                                             "rank IC to count.")
+    factor_proxies: bool = Field(True, description="Regress strategy returns on ETF factor proxies (SPY, IWM, IWD/IWF, "
+                                                   "MTUM, QUAL, USMV; BIL as cash) when their prices are available.")
+    shadow_book: bool = Field(True, description="Every `aifirm run` also decides a quant-only shadow book (same "
+                                                "universe, screen, limits and costs; paper only) under "
+                                                "<book>/shadow, so the LLM's value added net of its cost is measured "
+                                                "forward. Never changes the live decision.")
+
+    _RANGES: ClassVar[dict[str, _Range]] = {
+        "n_random_books": _Range(0, 100_000),
+        "random_seed": _Range(0),
+        "breakeven_cap": _Range(1.0, 1000.0, lo_open=True),
+        "cutoff_buffer_days": _Range(0, 3650),
+        "ic_min_names": _Range(3, 100_000),
+    }
+
+    def _cross_checks(self) -> list[str]:
+        problems = []
+        if not self.cost_multipliers:
+            problems.append("cost_multipliers must list at least one multiplier (for example [0.0, 1.0, 2.0])")
+        bad = [k for k in self.cost_multipliers if not math.isfinite(k) or k < 0 or k > self.breakeven_cap]
+        if bad:
+            problems.append(f"cost_multipliers {bad} must be finite, >= 0 and <= breakeven_cap "
+                            f"({self.breakeven_cap:g})")
+        return problems
+
+
 class FirmConfig(_Section):
     name: str = "AI Investment Firm"
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
@@ -313,6 +475,8 @@ class FirmConfig(_Section):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     costs: CostConfig = Field(default_factory=CostConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     runs_dir: str = Field("runs", description="Book and backtest directory. Relative paths are relative to the "
                                               "config file's directory (see FirmConfig.runs_path).")
 
@@ -321,7 +485,15 @@ class FirmConfig(_Section):
     _source_dir: Path | None = PrivateAttr(default=None)
 
     def _cross_checks(self) -> list[str]:
-        return [] if self.runs_dir.strip() else ["runs_dir must not be empty"]
+        problems = [] if self.runs_dir.strip() else ["runs_dir must not be empty"]
+        if self.portfolio.max_position > self.risk.max_position_hard:
+            problems.append(f"portfolio.max_position = {self.portfolio.max_position:g} must not exceed "
+                            f"risk.max_position_hard = {self.risk.max_position_hard:g} (the sizing target sits "
+                            "under the hard cap)")
+        if self.process.combination == "overlay" and "quant" not in self.analysts.enabled:
+            problems.append("process.combination = \"overlay\" tilts the deterministic quant core, so analysts.enabled "
+                            "must include \"quant\" (or use combination = \"pool\")")
+        return problems
 
     @classmethod
     def load(cls, path: str | Path) -> "FirmConfig":
@@ -331,7 +503,32 @@ class FirmConfig(_Section):
         with open(path, "rb") as fh:
             cfg = cls.model_validate(tomllib.load(fh))
         cfg._source_dir = path.resolve().parent
+        scr = cfg.universe.screen
+        if scr.enabled and scr.file.strip() and not cfg.screen_file_path().is_file():   # fail at load, not mid-run
+            raise FileNotFoundError(f"universe.screen.file {scr.file!r} not found (resolved to {cfg.screen_file_path()})")
         return cfg
+
+    def revalidated(self, data: dict) -> "FirmConfig":
+        """``data`` (a complete ``model_dump()``, typically this config's with some values
+        changed) validated as a new config that keeps this config's source directory, so a
+        relative ``runs_dir`` or screen file resolves exactly as before. Unlike attribute
+        assignment, every range and cross-check runs again. Raises
+        ``pydantic.ValidationError`` like :meth:`load`, and ``FileNotFoundError`` when an
+        enabled screen names a file that does not exist."""
+        cfg = type(self).model_validate(data)
+        cfg._source_dir = self._source_dir
+        scr = cfg.universe.screen
+        if scr.enabled and scr.file.strip() and not cfg.screen_file_path().is_file():
+            raise FileNotFoundError(f"universe.screen.file {scr.file!r} not found (resolved to {cfg.screen_file_path()})")
+        return cfg
+
+    def screen_file_path(self) -> Path:
+        """Absolute path of ``universe.screen.file``: a relative path is anchored at the
+        config file's directory (like ``runs_dir``), else at the working directory."""
+        p = Path(self.universe.screen.file).expanduser()
+        if not p.is_absolute():
+            p = (self._source_dir if self._source_dir is not None else Path.cwd()) / p
+        return p.resolve()
 
     def runs_path(self) -> Path:
         """Absolute ``runs_dir``. A relative value is anchored at the directory of the config
@@ -347,8 +544,11 @@ class FirmConfig(_Section):
         """Stable hash of the configuration (used to count distinct trials for the deflated Sharpe).
 
         ``runs_dir`` is left out: where results are written is not a strategy choice, and
-        the same config must not count as a new trial because its path was resolved or moved."""
-        dump = self.model_dump(exclude={"runs_dir"})
+        the same config must not count as a new trial because its path was resolved or moved.
+        ``evaluation`` is left out too: it changes what a backtest report measures, never a
+        decision, so re-scoring the same strategy with another null or cost grid is not a
+        new trial (and configs written before the section existed keep their fingerprint)."""
+        dump = self.model_dump(exclude={"runs_dir", "evaluation"})
         if not dump["universe"]["ciks"]:      # added later: an unused pin must not change existing fingerprints
             del dump["universe"]["ciks"]
         blob = json.dumps(dump, sort_keys=True)

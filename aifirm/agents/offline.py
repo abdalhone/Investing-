@@ -14,7 +14,9 @@ line with the calibration guidance the real analysts receive.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import random
 import re
 from dataclasses import dataclass
 from statistics import NormalDist
@@ -24,11 +26,12 @@ from pydantic import BaseModel
 
 from ..llm.client import OfflineLLM
 from ..schemas import (AnalystView, Challenge, ChecklistItem, EvidenceItem, ICMemo, KillCriterion, Lesson,
-                       RiskConcern, RiskReview, Revision, Scenario)
+                       NewsReading, ReaderEvent, ReidGuess, RiskConcern, RiskReview, Revision, Scenario)
 from .committee import (ABSTAINED_LABEL, CHALLENGE_HEADER, CHALLENGE_ROUND_LABEL, DISPERSION_LABEL,
                         FLAGGED_LABEL, HELD_LABEL, MEMBER_SEALED_LABEL, POOLED_PROB_LABEL, SEALED_EXCESS_LABEL,
                         SEALED_PROB_LABEL)
 from .reflection import FORECAST_PROB_LABEL, OUTCOME_BEAT
+from .reid import CANDIDATES_LABEL, MONTH_WINDOW_LABEL, months_between
 from .risk_review import POSITIONS_HEADER
 
 MAX_EDGE = 0.10              # analyst probabilities stay within 0.5 +/- MAX_EDGE
@@ -224,27 +227,69 @@ def macro_signals(s: _Sheet) -> tuple[list[Signal], str]:
     return out, ""
 
 
-def events_signals(s: _Sheet) -> tuple[list[Signal], str]:
-    """Count adverse 8-K items and dilution signals; earnings drift via the 1-month return."""
-    events = [e for e in _section_lines(s.text, "RECENT SEC FILING EVENTS") if e != "none in window"]
-    headlines = [h for h in _section_lines(s.text, "RECENT HEADLINES") if not h.startswith("no headlines")]
-    if not events and not headlines:
-        return [], "no filing events or headlines in the window"
+_ID_PREFIX = re.compile(r"^\[(?P<id>[^\]]+)\]\s*(?P<text>.*)$")
+_NEWS_LABEL = re.compile(r"tier (?P<tier>[ABC]), (?P<type>\w+), (?P<direction>\w+), (?P<materiality>\w+) materiality")
+
+
+def _filing_lines(text: str) -> list[tuple[str, str]]:
+    """(fact ID or "", event text) for each filing-event line; IDs appear once news is attached."""
+    out = []
+    for line in _section_lines(text, "RECENT SEC FILING EVENTS"):
+        if line == "none in window":
+            continue
+        m = _ID_PREFIX.match(line)
+        out.append((m["id"], m["text"]) if m else ("", line))
+    return out
+
+
+def news_signals(s: _Sheet) -> list[Signal]:
+    """Reader-extracted news events: tier A/B events with a clear direction move the
+    probability (+/-0.01, doubled for high materiality); tier C events are context only."""
     out: list[Signal] = []
-    for e in events:
+    for fid, f in s.facts.items():
+        if ".news_" not in fid or (m := _NEWS_LABEL.search(f.label)) is None:
+            continue
+        tier, etype, direction, materiality = m["tier"], m["type"], m["direction"], m["materiality"]
+        kind = etype.replace("_", " ")
+        if tier in ("A", "B") and direction in ("positive", "negative") and etype != "analyst_action":
+            size = 0.02 if materiality == "high" else 0.01
+            out.append(Signal(size if direction == "positive" else -size, (fid,),
+                              f"Tier {tier} {kind} news ({materiality} materiality), {direction}: {f.text}."))
+        else:
+            out.append(Signal(0.0, (fid,), f"Tier {tier} {kind} news, {direction}: {f.text}; context only "
+                                           "(unverified or opinion).", direction_override="neutral"))
+    return out
+
+
+def events_signals(s: _Sheet) -> tuple[list[Signal], str]:
+    """Count adverse 8-K items and dilution signals; earnings drift via the 1-month return;
+    tier A/B news events (tier C news is context only)."""
+    events = _filing_lines(s.text)
+    headlines = [h for h in _section_lines(s.text, "RECENT HEADLINES") if not h.startswith("no headlines")]
+    news = news_signals(s)
+    if not events and not headlines and not news:
+        return [], "no filing events, news events or headlines in the window"
+    out: list[Signal] = []
+    for fid, e in events:
+        ids = (fid,) if fid else ()
         if any(k in e for k in NEGATIVE_EVENTS):
-            out.append(Signal(-0.02, (), f"Adverse filing event: {e}."))
+            out.append(Signal(-0.02, ids, f"Adverse filing event: {e}."))
         elif any(k in e for k in DILUTION_EVENTS):
-            out.append(Signal(-0.01, (), f"Possible dilution: {e}."))
+            out.append(Signal(-0.01, ids, f"Possible dilution: {e}."))
         elif "insider transaction" in e:
-            out.append(Signal(0.0, (), f"{e}; a count says nothing about buying versus selling."))
+            out.append(Signal(0.0, ids, f"{e}; a count says nothing about buying versus selling."))
     r1 = s.get("ret_1m")
-    if r1 is not None and any("results of operations" in e for e in events):
+    earnings = [fid for fid, e in events if "results of operations" in e]
+    if r1 is not None and earnings:
         d = 0.01 if r1.value > 5 else -0.01 if r1.value < -5 else 0.0
-        out.append(Signal(d, (r1.id,), f"An earnings release was filed and {r1.label.lower()} is {r1.text}; "
-                                       "post-earnings drift tends to follow the initial reaction."))
+        out.append(Signal(d, (r1.id, *[i for i in earnings[:1] if i]),
+                          f"An earnings release was filed and {r1.label.lower()} is {r1.text}; "
+                          "post-earnings drift tends to follow the initial reaction."))
+    out += news
     if not out:
-        out.append(Signal(0.0, (), f"Only routine filings in the window (latest: {events[0] if events else 'headlines only'})."))
+        latest = events[0][1] if events else "headlines only"
+        out.append(Signal(0.0, (events[0][0],) if events and events[0][0] else (),
+                          f"Only routine filings in the window (latest: {latest})."))
     if (v20 := s.get("vol_20d")) is not None:
         out.append(Signal(0.0, (v20.id,), f"{_quote(v20)}; it sets the width of the outcome range."))
     return out, ""
@@ -455,6 +500,82 @@ def lesson_responder(role: str, system: str, user: str, schema: type[BaseModel])
                   applies_when="Forecasts far from 0.50" if confident else "Forecasts close to 0.50")
 
 
+# --------------------------------------------------------------------------- news reader and re-identification probe
+
+_BLOCK = re.compile(r'<headline index="(?P<idx>\d+)">\ntitle: (?P<title>[^\n]*)\n(?:feed summary: (?P<summary>[^\n]*)\n)?</headline>')
+
+# (event type, keywords) in priority order: the first type with a keyword in the text wins.
+NEWS_TYPE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("rumor", ("reportedly", "in talks", "considering", "rumor", "rumour", "sources say", "people familiar",
+               "speculation", "said to be", "could be")),
+    ("m_and_a", ("acquire", "acquisition", "merger", "merge", "takeover", "buyout", "to buy ")),
+    ("guidance", ("guidance", "outlook", "forecast")),
+    ("earnings", ("earnings", "results", "quarterly", "revenue", "profit", "eps")),
+    ("legal_regulatory", ("lawsuit", "sues", "sued", "probe", "investigation", "antitrust", "fined", "regulator",
+                          "settlement", "subpoena", "recall")),
+    ("management", ("ceo", "cfo", "chief executive", "resigns", "steps down", "appoints", "appointed", "names new")),
+    ("capital_return", ("dividend", "buyback", "repurchase")),
+    ("analyst_action", ("upgrade", "downgrade", "price target", "rating", "initiates coverage", "analyst")),
+    ("product", ("launch", "unveil", "introduces", "new product", "approval", "approved", "fda")),
+    ("macro_sector", ("fed ", "rates", "inflation", "tariff", "sector", "industry", "economy")),
+)
+NEWS_POSITIVE = ("beat", "record", "raise", "surge", "jump", "soar", "gain", "rise", "upgrade", "approv", "wins",
+                 "strong", "growth", "higher", "boost", "expand", "increase", "hike")
+NEWS_NEGATIVE = ("miss", "cut", "lower", "fall", "plunge", "drop", "slump", "downgrade", "lawsuit", "probe", "recall",
+                 "weak", "loss", "resign", "bankrupt", "fraud", "delay", "warn", "investigation", "decline", "sue")
+_HIGH_TYPES = ("earnings", "guidance", "m_and_a", "legal_regulatory")
+_LOW_TYPES = ("analyst_action", "macro_sector", "other", "rumor")
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _has_word(text: str, word: str) -> bool:
+    """``word`` starts a word in ``text`` ("eps" matches "EPS beat" but not "steps")."""
+    return re.search(r"\b" + re.escape(word), text) is not None
+
+
+def classify_headline(text: str) -> tuple[str, str, str]:
+    """Keyword rules: (event_type, direction, materiality) for one headline's text."""
+    t = f" {text.lower()} "
+    etype = next((name for name, words in NEWS_TYPE_RULES if any(_has_word(t, w) for w in words)), "other")
+    score = sum(_has_word(t, w) for w in NEWS_POSITIVE) - sum(_has_word(t, w) for w in NEWS_NEGATIVE)
+    direction = "positive" if score > 0 else "negative" if score < 0 else "unclear"
+    if etype in _LOW_TYPES:
+        materiality = "low"
+    elif etype in _HIGH_TYPES and direction != "unclear":
+        materiality = "high"
+    else:
+        materiality = "medium"
+    return etype, direction, materiality
+
+
+def news_reader_responder(role: str, system: str, user: str, schema: type[BaseModel]) -> NewsReading:
+    """One event per headline block from keyword rules. The summary is a template built
+    from the typed fields; no headline text is ever copied."""
+    events = []
+    for m in _BLOCK.finditer(user):
+        etype, direction, materiality = classify_headline(f"{m['title']} {m['summary'] or ''}")
+        events.append(ReaderEvent(headline_index=int(m["idx"]), event_type=etype, direction=direction,
+                                  materiality=materiality,
+                                  summary=f"Offline rules read {_article(direction)} {direction} "
+                                          f"{etype.replace('_', ' ')} report about the company"))
+    return NewsReading(events=events)
+
+
+def reid_responder(role: str, system: str, user: str, schema: type[BaseModel]) -> ReidGuess:
+    """A uniformly random guess from the candidate tickers and the month window, seeded by the
+    prompt's SHA-256 (deterministic). Its hit rates should match the chance baseline."""
+    rng = random.Random(int(hashlib.sha256(user.encode()).hexdigest()[:16], 16))
+    tickers = re.search(rf"^{re.escape(CANDIDATES_LABEL)}: (.*)$", user, re.M)
+    window = re.search(rf"^{re.escape(MONTH_WINDOW_LABEL)}: (\d{{4}}-\d{{2}}) to (\d{{4}}-\d{{2}})", user, re.M)
+    cands = [t.strip() for t in tickers.group(1).split(",") if t.strip()] if tickers else ["UNKNOWN"]
+    months = months_between(window.group(1), window.group(2)) if window else ["2000-01"]
+    return ReidGuess(ticker_guess=rng.choice(cands), month_guess=rng.choice(months),
+                     confidence=1.0 / (len(cands) * len(months)), clues="Offline random guess; no analysis.")
+
+
 def make_offline_llm() -> OfflineLLM:
     """An ``OfflineLLM`` with deterministic responders for every role used by the firm."""
     return OfflineLLM({
@@ -464,4 +585,6 @@ def make_offline_llm() -> OfflineLLM:
         "memo": memo_responder,
         "risk_review": risk_review_responder,
         "lesson": lesson_responder,
+        "news_reader": news_reader_responder,
+        "reid_probe": reid_responder,
     })

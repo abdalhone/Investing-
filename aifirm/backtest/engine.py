@@ -42,8 +42,16 @@ What makes it honest, and why each rule exists:
   and reporting the best is exactly what DSR corrects for, so the trial ledger must be
   complete to be meaningful.
 
+* **Exposure is visible.** The fraction of NAV invested (positions, core included) is
+  recorded every day (``BacktestResult.exposure``) and each decision records its target
+  active gross, core and cash, so a result driven by how much cash the book held is
+  never mistaken for stock selection.
+* **The screen runs point-in-time.** With ``universe.screen`` enabled every decision runs
+  the same screen as live (:func:`aifirm.pipeline.decide`): prices, liquidity and price
+  filters cut at the decision close. The universe *list* is not point-in-time (see below).
+
 Known limitations (also stated in the report): a universe chosen today is biased toward
-survivors; costs are modelled, not observed; no taxes, withholding or borrow fees; cash
+survivors (a bundled list of current index members makes this explicit); costs are modelled, not observed; no taxes, withholding or borrow fees; cash
 distributions are inferred from Yahoo's adjusted closes (ordinary dividends and other
 distributions alike), not read from a corporate-actions feed.
 """
@@ -57,26 +65,33 @@ import re
 import secrets
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import TypeVar
 
 import pandas as pd
 
-from ..agents import llm_analysts, make_offline_llm
+from ..agents import CommitteeResult, llm_analysts, make_offline_llm
 from ..config import FirmConfig, model_cutoff
 from ..data.prices import PriceData, load_prices
 from ..execution.broker import PaperBroker
 from ..journal import ForecastStore, Ledger, LessonStore, scorecard
 from ..llm.client import LLM
+from ..universes import SURVIVORSHIP_NOTE
 from ..pipeline import (PRICE_LOOKBACK_DAYS, FilingsLoader, FundamentalsLoader, MacroLoader, MarketSnapshot, decide,
-                        gather_data, implied_dividends, market_snapshot, quant_only_config, universe)
+                        gather_data, implied_dividends, market_snapshot, quant_only_config, sector_map, universe)
 from ..portfolio import RiskState, orders_from_target
 from ..schemas import Order, TargetPortfolio, TargetPosition
+from .evaluation import Evaluation, cost_sensitivity
+from .factors import PROXY_TICKERS, FactorAttribution, factor_attribution
+from .ic import FORWARD_RETURN_DEFINITION, POOL, information_coefficients, power_analysis
 from .metrics import PerformanceReport, performance_report
+from .random_books import build_schedule, random_books, realised_cost_rate
 
 MODES = ("quant", "offline", "llm")
+_T = TypeVar("_T")
 MIN_REPORT_DAYS = 10            # fewer daily returns and a sub-period report says nothing
 TRIALS_FILE = "trials.jsonl"
 _ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
@@ -97,14 +112,41 @@ def _day(d: object) -> str:
 # --------------------------------------------------------------------------- result
 
 
+@dataclass(frozen=True)
+class OverlayValue:
+    """What the language-model stages added over the quant-only baseline, net of what they
+    cost (RESEARCH 6.6: "let measured net-of-cost improvement set the overlay's weight").
+
+    Both books start with the same cash and run through the same engine, universe, screen,
+    limits and costs; the only difference is the LLM stages. ``difference_usd`` is the
+    strategy's final NAV minus the quant-only baseline's; LLM spend is not charged to the
+    simulated book, so ``value_added_usd = difference_usd - llm_cost_usd``;
+    ``value_added_pct`` is that in percent of the starting NAV. ``offline``: deterministic
+    rules stood in for the LLM (cost 0: a plumbing check, not a measurement of an LLM)."""
+
+    initial_nav: float
+    strategy_nav: float
+    quant_nav: float
+    difference_usd: float
+    llm_cost_usd: float
+    value_added_usd: float
+    value_added_pct: float
+    offline: bool
+
+
 @dataclass
 class BacktestResult:
     """Everything a backtest produced. Return series are daily, net of costs.
 
     ``reports`` holds a :class:`PerformanceReport` for ``"strategy"`` and each baseline
     (``"benchmark"``, ``"equal_weight"`` and, unless ``mode == "quant"``, ``"quant_only"``).
+    ``model_cutoff`` is the latest training cutoff of the models the run used (None in
+    quant mode); ``contamination_end`` is that cutoff plus ``cutoff_buffer_days``.
     ``pre_cutoff_report`` / ``post_cutoff_report`` split the strategy's returns by whether
-    the decision behind them was made on or before ``model_cutoff`` (None in quant mode).
+    the decision behind them was made on or before ``contamination_end``.
+    ``evaluation`` answers "is there skill, and would we know?" (signal IC, power,
+    composition-matched random books, cost sensitivity, factor attribution; see
+    :mod:`aifirm.backtest.evaluation`); None only if it was switched off by the caller.
     """
 
     run_id: str
@@ -130,6 +172,49 @@ class BacktestResult:
     costs_usd: dict[str, float]
     warnings: list[str] = field(default_factory=list)
     dividends_usd: float = 0.0          # net dividend cash credited to the strategy book
+    benchmark: str = ""
+    tickers: list[str] = field(default_factory=list)          # the active universe (benchmark excluded)
+    models: list[str] = field(default_factory=list)           # language models the run's LLM stages used
+    contamination_end: str | None = None                      # model_cutoff + cutoff_buffer_days
+    cutoff_buffer_days: int = 0
+    cost_model: dict[str, float] = field(default_factory=dict)  # commission_bps, slippage_bps, impact_coefficient
+    trials_path: str = ""
+    evaluation: Evaluation | None = None
+    # Daily fraction of NAV held in positions (core included) at the close; 1 - this is cash.
+    exposure: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    universe_note: str = ""                                   # survivorship caveat of the universe list, if any
+    # Daily NAV of each traded baseline ("equal_weight", and "quant_only" unless mode == "quant").
+    baseline_nav: dict[str, pd.Series] = field(default_factory=dict)
+
+    def overlay_value(self) -> OverlayValue | None:
+        """The LLM stages' value added over the quant-only baseline net of LLM cost (see
+        :class:`OverlayValue`); None in quant mode (no baseline to compare with) or when a
+        NAV series is empty."""
+        q = self.baseline_nav.get("quant_only")
+        if q is None or q.empty or self.nav.empty:
+            return None
+        start, s_end, q_end = float(self.nav.iloc[0]), float(self.nav.iloc[-1]), float(q.iloc[-1])
+        cost = float(self.usage.get("cost_usd", 0.0) or 0.0)
+        diff = s_end - q_end
+        return OverlayValue(initial_nav=start, strategy_nav=s_end, quant_nav=q_end, difference_usd=diff,
+                            llm_cost_usd=cost, value_added_usd=diff - cost,
+                            value_added_pct=(diff - cost) / start * 100.0 if start > 0 else math.nan,
+                            offline=self.mode == "offline")
+
+    def exposure_summary(self) -> dict[str, float]:
+        """Averages over the run: ``invested`` (daily, positions incl. core / NAV), ``cash``
+        (1 - invested), and from the decisions' final targets ``target_active_gross``,
+        ``target_core``, ``target_cash`` and ``target_names`` (active names per decision).
+        NaN where nothing was recorded."""
+        def mean(xs: list[float]) -> float:
+            xs = [x for x in xs if isinstance(x, (int, float)) and math.isfinite(x)]
+            return sum(xs) / len(xs) if xs else math.nan
+        inv = float(self.exposure.mean()) if len(self.exposure) else math.nan
+        return {"invested": inv, "cash": 1.0 - inv if math.isfinite(inv) else math.nan,
+                "target_active_gross": mean([d.get("active_gross") for d in self.decisions]),
+                "target_core": mean([d.get("core_weight") for d in self.decisions]),
+                "target_cash": mean([d.get("cash_weight") for d in self.decisions]),
+                "target_names": mean([d.get("n_names") for d in self.decisions])}
 
 
 # --------------------------------------------------------------------------- simulation core
@@ -145,6 +230,7 @@ class _Sim:
     commission_usd: float
     slippage_usd: float
     dividends_usd: float = 0.0
+    invested: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))   # 1 - cash / NAV at each close
 
 
 def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebalance_days: set[pd.Timestamp],
@@ -161,6 +247,7 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
     opens = prices.open if prices.open is not None else prices.close
     dividends = implied_dividends(prices)
     navs: dict[pd.Timestamp, float] = {}
+    invested: dict[pd.Timestamp, float] = {}
     turnover: dict[pd.Timestamp, float] = {}
     costs: dict[pd.Timestamp, float] = {}
     records: list[dict] = []
@@ -191,6 +278,8 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
         marks = {t: float(v) for t, v in row.items() if math.isfinite(v) and v > 0}
         nav = broker.nav(marks)
         navs[d] = nav
+        if math.isfinite(nav) and nav > 0:
+            invested[d] = 1.0 - broker.cash() / nav
         if d in rebalance_days and i + 1 < len(days):
             orders, market, rec = policy(d, broker, nav, prev_nav, marks, list(since_decision))
             rec.update({"as_of": _day(d), "nav": nav,
@@ -206,7 +295,7 @@ def _simulate(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex, rebala
     return _Sim(nav=pd.Series(navs, dtype=float), turnover=pd.Series(turnover, dtype=float),
                 costs=pd.Series(costs, dtype=float), decisions=records, decision_dates=decision_dates,
                 commission_usd=broker.total_commission, slippage_usd=broker.total_slippage,
-                dividends_usd=broker.total_dividends)
+                dividends_usd=broker.total_dividends, invested=pd.Series(invested, dtype=float))
 
 
 def _total_returns(prices: PriceData, ticker: str, days: pd.DatetimeIndex) -> pd.Series:
@@ -218,6 +307,24 @@ def _total_returns(prices: PriceData, ticker: str, days: pd.DatetimeIndex) -> pd
     div = implied_dividends(prices)[ticker]
     tr = (close + div) / close.shift(1) - 1.0
     return tr.reindex(days).iloc[1:].fillna(0.0)
+
+
+def _agent_probs(committee: Mapping[str, CommitteeResult],
+                 screen_quant: Mapping[str, float] | None = None) -> dict[str, dict[str, float]]:
+    """Ticker -> agent -> sealed P(outperform), the mean over that agent's non-abstaining
+    samples (the analyst's independent forecast, before any challenge round). With a screen,
+    ``screen_quant`` adds the quant's probability for screened names outside the committee,
+    so the quant's IC is measured over the whole universe."""
+    out: dict[str, dict[str, float]] = {}
+    for t, r in committee.items():
+        by_agent: dict[str, list[float]] = {}
+        for v in r.views:
+            if not v.view.abstain:
+                by_agent.setdefault(v.agent, []).append(float(v.view.prob_outperform))
+        out[t] = {a: sum(ps) / len(ps) for a, ps in by_agent.items()}
+    for t, q in (screen_quant or {}).items():
+        out.setdefault(t, {"quant": float(q)})
+    return out
 
 
 class _CommitteePolicy:
@@ -252,8 +359,26 @@ class _CommitteePolicy:
         self.cycles += 1
         messages = [*dec.warnings, *(f"{t}: {g}" for t, gaps in dec.data_gaps.items() for g in gaps)]
         self._warning_counts.update(dict.fromkeys((_ISO_DATE.sub("<date>", w) for w in messages), 1))
+        screen_quant = dec.screen.quant_probs() if dec.screen is not None else {}
+        outside = {t: q for t, q in screen_quant.items() if t not in dec.aggregates}
+        exposure = dec.exposure()
         rec = {
-            "pooled_prob": {t: a.prob_outperform for t, a in dec.aggregates.items()},
+            # the firm's final probability for every name it scored (committee names: the final pooled or
+            # overlay probability; screened names outside the deep-dive set: the quant's)
+            "pooled_prob": dec.final_probabilities(),
+            # for the evaluation (signal IC per agent and per pool, sector-matched null); never read by decide
+            "prob_equal_weight": {**outside, **{t: a.prob_equal_weight for t, a in dec.aggregates.items()}},
+            "n_views": {**{t: 1 for t in outside}, **{t: a.n_views for t, a in dec.aggregates.items()}},
+            "agent_probs": _agent_probs(dec.committee, outside),
+            "deep_dive": list(dec.committee),
+            "screen": ({"n_universe": dec.screen.n_universe, "n_eligible": dec.screen.n_eligible}
+                       if dec.screen is not None else None),
+            "overlay": {t: {"p_quant": a.prob_quant, "p_llm": a.prob_llm, "tilt": a.overlay_tilt}
+                        for t, a in dec.aggregates.items() if a.combination == "overlay"},
+            "overlay_max_tilt": dec.overlay_bound.max_tilt if dec.overlay_bound is not None else None,
+            "active_gross": exposure["active_gross"],
+            "n_names": exposure["n_names"],
+            "sectors": sector_map(self.cfg, factsheets),
             "edge_multiplier": {t: r.edge_multiplier for t, r in dec.committee.items()},
             "challenged": sorted(t for t, a in dec.aggregates.items() if a.challenged),
             "target": dec.target_final.weights(),
@@ -310,17 +435,163 @@ def _equal_weight_policy(cfg: FirmConfig, prices: PriceData) -> Policy:
     return policy
 
 
+# --------------------------------------------------------------------------- re-execution at other costs
+
+
+def scaled_costs(cfg: FirmConfig, k: float) -> FirmConfig:
+    """A copy of ``cfg`` with every cost component (commission, spread/slippage, impact
+    coefficient) multiplied by ``k >= 0``. Nothing else changes."""
+    if not (math.isfinite(k) and k >= 0):
+        raise ValueError(f"cost multiplier must be finite and >= 0, got {k!r}")
+    out = cfg.model_copy(deep=True)
+    out.costs.commission_bps *= k
+    out.costs.slippage_bps *= k
+    out.costs.impact_coefficient *= k
+    return out
+
+
+class _ReplayPolicy:
+    """Re-executes the recorded final targets of a finished run (no new decision, no LLM
+    call): at each rebalance close the recorded target (active weights, core, cash) is
+    turned into orders by :func:`orders_from_target` against the replayed book, exactly as
+    :func:`decide` did. With the run's own configuration it reproduces the run's NAV path;
+    with :func:`scaled_costs` it shows what the SAME decisions earn at other costs.
+    Market snapshots do not depend on costs, so they are shared through ``markets``."""
+
+    def __init__(self, cfg: FirmConfig, prices: PriceData, decisions: list[dict],
+                 markets: dict[tuple[str, frozenset[str]], MarketSnapshot]) -> None:
+        self.cfg, self.prices, self.markets = cfg, prices, markets
+        self.by_date = {d["as_of"]: d for d in decisions}
+        self.bench = cfg.universe.benchmark.upper()
+        self.names = universe(cfg)
+
+    def __call__(self, d: pd.Timestamp, broker: PaperBroker, nav: float, prev_nav: float | None,
+                 marks: dict[str, float], nav_path: list[float]) -> tuple[list[Order], MarketSnapshot, dict]:
+        as_of = _day(d)
+        rec = self.by_date.get(as_of)
+        if rec is None or "core_weight" not in rec:
+            raise ValueError(f"no recorded target for {as_of}: cannot replay a decision that was not made")
+        held = broker.positions()
+        tickers = frozenset({*self.names, self.bench, *held, *rec["target"]})
+        key = (as_of, tickers)
+        if key not in self.markets:
+            self.markets[key] = market_snapshot(self.prices, as_of, tickers)
+        market = self.markets[key]
+        target = TargetPortfolio(
+            as_of=as_of, core_weight=float(rec["core_weight"]), cash_weight=float(rec["cash_weight"]),
+            positions=[TargetPosition(ticker=t, weight=float(w), prob_outperform=0.5, expected_excess_return_pct=0.0,
+                                      rationale="replay of a recorded decision") for t, w in rec["target"].items()])
+        orders, _ = orders_from_target(target, held, market.prices, nav, market.adv, self.cfg, self.bench)
+        return orders, market, {}
+
+
+def replay_total_return(prices: PriceData, cfg: FirmConfig, days: pd.DatetimeIndex,
+                        rebalance_days: set[pd.Timestamp], decisions: list[dict], k: float = 1.0,
+                        markets: dict[tuple[str, frozenset[str]], MarketSnapshot] | None = None) -> float:
+    """Total return in percent of ``decisions`` (a finished run's records, made with
+    ``cfg``) re-executed through the same engine with costs multiplied by ``k``."""
+    policy = _ReplayPolicy(scaled_costs(cfg, k), prices, decisions, markets if markets is not None else {})
+    nav = _simulate(prices, policy.cfg, days, rebalance_days, policy).nav
+    return float((nav.iloc[-1] / nav.iloc[0] - 1.0) * 100.0)
+
+
 # --------------------------------------------------------------------------- evaluation helpers
 
 
-def contamination_cutoff(cfg: FirmConfig, mode: str) -> str | None:
-    """The date up to which the run's language models may have seen the future.
-
-    None in quant mode (no model). Otherwise the latest training cutoff among the models
-    the configuration uses; an unknown cutoff counts as today, so every period is treated
-    as contaminated (fail closed: unproven skill is not counted as skill)."""
-    if mode == "quant":
+def _factor_proxy_prices(cfg: FirmConfig, prices: PriceData, factor_prices: PriceData | None, downloaded: bool,
+                         start: str, end: str, notes: list[str]) -> PriceData | None:
+    """Where factor-proxy prices come from: ``factor_prices`` if given; else ``prices`` when
+    it holds every proxy; else, when run_backtest downloaded ``prices`` itself, a download
+    of the proxies; else (prices passed in, as offline tests do: never a network call)
+    whatever proxies ``prices`` holds, typically just the benchmark. A failed download is
+    a note, never an error."""
+    if factor_prices is not None:
+        return factor_prices
+    have = [t for t in PROXY_TICKERS if t in prices.adj_close.columns]
+    if len(have) == len(PROXY_TICKERS) or not downloaded:
+        if not have:
+            notes.append("factor attribution skipped: the prices passed in hold no factor proxies "
+                         f"({', '.join(PROXY_TICKERS)}); pass factor_prices")
+            return None
+        return prices
+    try:
+        return load_prices(list(PROXY_TICKERS), pd.Timestamp(start) - pd.Timedelta(days=10), end)
+    except Exception as exc:  # noqa: BLE001 - proxies are optional: missing ones are reported, never fatal
+        notes.append(f"factor attribution skipped: proxy prices could not be loaded ({type(exc).__name__}: {exc})")
         return None
+
+
+def _guarded(part: str, notes: list[str], fn: Callable[[], _T]) -> _T | None:
+    """Run one evaluation part; a failure becomes None plus a note (fail closed: a part
+    that could not be computed is reported as missing, never as a result)."""
+    try:
+        return fn()
+    except Exception as exc:  # parts are independent; one failure must not hide the others
+        log.warning("backtest evaluation: %s failed", part, exc_info=True)
+        notes.append(f"{part} could not be computed ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _evaluate(*, cfg: FirmConfig, strat_cfg: FirmConfig, prices: PriceData, days: pd.DatetimeIndex,
+              rebalance_days: set[pd.Timestamp], end: str, sim: _Sim, q_sim: _Sim | None, returns: pd.Series,
+              bench_total_pct: float, factor_prices: PriceData | None, downloaded: bool, start: str) -> Evaluation:
+    """Compute every part of :class:`Evaluation` from a finished run (no new decisions)."""
+    ev = cfg.evaluation
+    proc = strat_cfg.process
+    bench = cfg.universe.benchmark.upper()
+    names = universe(cfg)
+    out = Evaluation(horizon_days=proc.horizon_days, step_days=proc.rebalance_every_days,
+                     forward_return_definition=FORWARD_RETURN_DEFINITION)
+    notes = out.notes
+    engine_total = float((sim.nav.iloc[-1] / sim.nav.iloc[0] - 1.0) * 100.0)
+
+    ic = _guarded("signal IC", notes, lambda: information_coefficients(
+        sim.decisions, prices, names, bench, proc.horizon_days, proc.rebalance_every_days, end, ev.ic_min_names,
+        quant_decisions=q_sim.decisions if q_sim is not None else None))
+    if ic is not None:
+        out.ic, out.ic_differences = ic
+        if POOL in out.ic:
+            out.power = _guarded("power analysis", notes,
+                                 lambda: power_analysis(out.ic[POOL], proc.rebalance_every_days, returns))
+
+    rate = realised_cost_rate(sim.decisions)
+    if ev.n_random_books > 0:
+        sectors: dict[str, str] = {}
+        for rec in sim.decisions:
+            sectors.update(rec.get("sectors") or {})
+        out.random_books = _guarded("random books", notes, lambda: random_books(
+            build_schedule(sim.decisions, prices, days, names, bench, sectors), prices, ev.n_random_books,
+            ev.random_seed, rate, engine_total, sector_matched=ev.random_books_sector_matched))
+
+    markets: dict[tuple[str, frozenset[str]], MarketSnapshot] = {}
+    q_markets: dict[tuple[str, frozenset[str]], MarketSnapshot] = {}
+    q_cfg = quant_only_config(cfg)
+    out.costs = _guarded("cost sensitivity", notes, lambda: cost_sensitivity(
+        lambda k: replay_total_return(prices, strat_cfg, days, rebalance_days, sim.decisions, k, markets),
+        bench_total_pct, list(ev.cost_multipliers), ev.breakeven_cap, rate * 1e4, engine_total,
+        replay_quant=(None if q_sim is None else
+                      lambda k: replay_total_return(prices, q_cfg, days, rebalance_days, q_sim.decisions, k,
+                                                    q_markets))))
+    if out.costs is not None and not out.costs.replay_matches_engine:
+        notes.append("re-executing the recorded decisions at 1x costs did not reproduce the engine's NAV; the cost "
+                     "sensitivity is approximate")
+
+    if ev.factor_proxies:
+        def factors() -> FactorAttribution | None:
+            fp = _factor_proxy_prices(cfg, prices, factor_prices, downloaded, start, end, notes)
+            result, why = factor_attribution(returns, fp)
+            notes.extend(n for n in why if n not in notes)
+            return result
+        out.factors = _guarded("factor attribution", notes, factors)
+    return out
+
+
+def run_models(cfg: FirmConfig, mode: str) -> list[str]:
+    """The language models the run's LLM stages call, sorted ([] in quant mode or when no
+    stage uses a model). In offline mode these are the models the offline rules stand in
+    for: the configuration, not the rules, decides what a real run would have seen."""
+    if mode == "quant":
+        return []
     models: set[str] = set()
     if llm_analysts(cfg):
         models |= set(cfg.models.analyst_models)
@@ -328,12 +599,35 @@ def contamination_cutoff(cfg: FirmConfig, mode: str) -> str | None:
         models.add(cfg.models.committee_model)     # the chair and the lesson writer
     if cfg.process.risk_review_enabled:
         models.add(cfg.models.risk_model)
+    return sorted(models)
+
+
+def training_cutoff(cfg: FirmConfig, mode: str) -> str | None:
+    """The latest training cutoff among :func:`run_models` (None without a model). An
+    unknown cutoff counts as today (fail closed: every past period is contaminated)."""
+    models = run_models(cfg, mode)
     if not models:
         return None
-    cutoffs = [model_cutoff(m) for m in sorted(models)]
+    cutoffs = [model_cutoff(m) for m in models]
     if any(c is None for c in cutoffs):
         return str(date.today())
     return max(c for c in cutoffs if c is not None)
+
+
+def contamination_cutoff(cfg: FirmConfig, mode: str, buffer_days: int | None = None) -> str | None:
+    """The last decision date whose outcomes the run's language models may have seen.
+
+    None in quant mode (no model). Otherwise :func:`training_cutoff` plus ``buffer_days``
+    calendar days (default ``cfg.evaluation.cutoff_buffer_days``): measured cutoffs differ
+    from vendor dates by months (research report 7.2), so clean evaluation starts only
+    after a buffer. Decisions on or before the returned date are contaminated."""
+    cutoff = training_cutoff(cfg, mode)
+    if cutoff is None:
+        return None
+    days = cfg.evaluation.cutoff_buffer_days if buffer_days is None else int(buffer_days)
+    if days < 0:
+        raise ValueError(f"buffer_days must be >= 0, got {days}")
+    return _day(pd.Timestamp(cutoff) + pd.Timedelta(days=days))
 
 
 def _decision_in_force(return_days: pd.DatetimeIndex, decision_dates: list[pd.Timestamp]) -> pd.Series:
@@ -377,6 +671,20 @@ def _append_trial(path: Path, entry: dict) -> None:
         fh.write(json.dumps(entry, sort_keys=True, allow_nan=False, default=str) + "\n")
 
 
+def _screen_mismatch(strategy: list[dict], quant: list[dict]) -> str:
+    """A warning when the quant-only baseline did not screen the same universe as the
+    strategy on the same dates (same names priced, same names eligible), else "". Both use
+    the configuration's screen by construction (:func:`quant_only_config` keeps
+    ``universe``); this guards that a comparison of the two never mixes universes."""
+    q_by_date = {d["as_of"]: d.get("screen") for d in quant}
+    bad = [d["as_of"] for d in strategy if d["as_of"] in q_by_date and d.get("screen") != q_by_date[d["as_of"]]]
+    missing = sorted({d["as_of"] for d in strategy} ^ set(q_by_date))
+    if not bad and not missing:
+        return ""
+    return (f"the quant-only baseline did not screen the same universe as the strategy on {len(bad) + len(missing)} "
+            f"decision date(s) (e.g. {(bad + missing)[0]}): the baseline comparison mixes universes")
+
+
 def _finite_or_none(x: float | None) -> float | None:
     return x if x is not None and math.isfinite(x) else None
 
@@ -387,7 +695,7 @@ def _finite_or_none(x: float | None) -> float | None:
 def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | None = None,
                  prices: PriceData | None = None, fundamentals_loader: FundamentalsLoader | None = None,
                  macro_loader: MacroLoader | None = None, filings_loader: FilingsLoader | None = None, *,
-                 run_id: str | None = None) -> BacktestResult:
+                 run_id: str | None = None, factor_prices: PriceData | None = None) -> BacktestResult:
     """Walk-forward backtest of the firm from ``start`` to ``end`` (inclusive).
 
     * ``mode="quant"``: the deterministic quant analyst alone, no LLM anywhere.
@@ -402,6 +710,15 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     Artifacts (ledger, forecasts, lessons) go to ``<runs_dir>/backtests/<run_id>/`` and the
     trial ledger to ``<runs_dir>/trials.jsonl``, with ``runs_dir`` resolved by
     :meth:`FirmConfig.runs_path` (relative to the config file, not the working directory).
+
+    After the run, ``result.evaluation`` is computed from the recorded decisions without
+    any new decision or LLM call, as configured by ``cfg.evaluation`` (signal IC and power,
+    composition-matched random books, cost sensitivity, factor attribution). Factor-proxy
+    prices come from ``factor_prices`` if given, else from ``prices`` if it holds any
+    proxy, else they are downloaded, but only when ``prices`` was not passed in (so an
+    offline caller never touches the network). Returns are split into contaminated and
+    clean periods at :func:`contamination_cutoff` (training cutoff plus
+    ``cfg.evaluation.cutoff_buffer_days``).
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -415,6 +732,7 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     if start_s >= end_s:
         raise ValueError(f"start {start_s} must be before end {end_s}")
     bench = cfg.universe.benchmark.upper()
+    downloaded = prices is None
     if prices is None:
         prices = load_prices([*universe(cfg), bench],
                              pd.Timestamp(start_s) - pd.Timedelta(days=PRICE_LOOKBACK_DAYS), end_s)
@@ -443,28 +761,48 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     ew = _simulate(prices, cfg, days, rebalance_days, _equal_weight_policy(cfg, prices))
     baseline_returns = {"benchmark": bench_ret, "equal_weight": ew.nav.pct_change().iloc[1:]}
     baseline_sims = {"equal_weight": ew}
+    q_sim: _Sim | None = None
     if mode != "quant":
         q_policy = _CommitteePolicy(quant_only_config(cfg), None, prices, run_dir / "quant_only",
                                     f"{run_id}-quant", loaders)
         q_sim, _ = q_policy.run(prices, days, rebalance_days, end_s)
         baseline_returns["quant_only"] = q_sim.nav.pct_change().iloc[1:]
         baseline_sims["quant_only"] = q_sim
+        mismatch = _screen_mismatch(sim.decisions, q_sim.decisions)
+        if mismatch:
+            warnings.append(mismatch)
 
     returns = sim.nav.pct_change().iloc[1:]
     trials_path = cfg.runs_path() / TRIALS_FILE
+    scr = cfg.universe.screen
+    if scr.enabled and scr.preset.strip():
+        universe_note = f"preset {scr.preset.strip()!r}: {SURVIVORSHIP_NOTE}"
+    elif scr.enabled:
+        universe_note = ("screened universe from a file or inline list: if it is today's membership of an index, "
+                         + SURVIVORSHIP_NOTE)
+    else:
+        universe_note = ""
+    if universe_note:
+        warnings.insert(0, f"SURVIVORSHIP: {universe_note}")
     n_trials = _count_trials(trials_path, fingerprint, mode, start_s, end_s)
     reports = {"strategy": performance_report(returns, bench_ret, sim.turnover, sim.costs, n_trials=n_trials),
                "benchmark": performance_report(bench_ret, bench_ret)}
     for name, s in baseline_sims.items():
         reports[name] = performance_report(baseline_returns[name], bench_ret, s.turnover, s.costs)
 
-    cutoff = contamination_cutoff(strat_cfg, mode)
+    cutoff = training_cutoff(strat_cfg, mode)
+    contamination_end = contamination_cutoff(strat_cfg, mode)
     pre = post = None
-    if cutoff is not None:
+    if contamination_end is not None:
         in_force = _decision_in_force(returns.index, sim.decision_dates)
-        contaminated = in_force.notna() & (in_force <= pd.Timestamp(cutoff))
+        contaminated = in_force.notna() & (in_force <= pd.Timestamp(contamination_end))
         pre = _report_or_none(returns[contaminated], bench_ret, n_trials)
         post = _report_or_none(returns[~contaminated], bench_ret, n_trials)
+
+    evaluation = _evaluate(cfg=cfg, strat_cfg=strat_cfg, prices=prices, days=days, rebalance_days=rebalance_days,
+                           end=end_s, sim=sim, q_sim=q_sim, returns=returns,
+                           bench_total_pct=reports["benchmark"].total_return_pct, factor_prices=factor_prices,
+                           downloaded=downloaded, start=start_s)
 
     _append_trial(trials_path, {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run_id": run_id, "fingerprint": fingerprint, "mode": mode,
@@ -479,5 +817,11 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
         pre_cutoff_report=pre, post_cutoff_report=post, model_cutoff=cutoff, n_trials=n_trials, scorecard=card,
         usage=strat_llm.usage.summary() if strat_llm is not None else {},
         costs_usd={"commission": sim.commission_usd, "slippage": sim.slippage_usd}, warnings=warnings,
-        dividends_usd=sim.dividends_usd,
+        dividends_usd=sim.dividends_usd, benchmark=bench, tickers=universe(cfg), models=run_models(strat_cfg, mode),
+        contamination_end=contamination_end,
+        cutoff_buffer_days=cfg.evaluation.cutoff_buffer_days if cutoff is not None else 0,
+        cost_model={"commission_bps": cfg.costs.commission_bps, "slippage_bps": cfg.costs.slippage_bps,
+                    "impact_coefficient": cfg.costs.impact_coefficient},
+        trials_path=str(trials_path), evaluation=evaluation, exposure=sim.invested, universe_note=universe_note,
+        baseline_nav={name: s.nav for name, s in baseline_sims.items()},
     )

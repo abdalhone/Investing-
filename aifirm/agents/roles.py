@@ -135,9 +135,10 @@ EVENTS = AnalystRole(
     name="events",
     title="Events and filings analyst",
     mandate=(
-        "Judge what recent corporate events (SEC filings and, when available, headlines) imply for the stock's odds of "
+        "Judge what recent corporate events (SEC filings and, when available, news) imply for the stock's odds of "
         "beating the benchmark over the horizon, and how much remains unknown. Your slice is the dated filing events and "
-        "headlines plus the last price, the 1-month return and 20-day volatility, so you can see how the market has "
+        "news (tier-labelled news events, or headlines) plus the last price, the 1-month return and 20-day volatility, so "
+        "you can see how the market has "
         "reacted so far. Separate genuinely new information that may not be fully priced from routine disclosures. "
         "Most windows contain only routine filings; then the honest answer is close to 0.50."
     ),
@@ -152,8 +153,11 @@ EVENTS = AnalystRole(
         "only if the window is long enough to expect one; say how confident you are.",
         "Insider filings: Form 4 counts show activity, not direction. The fact sheet says the direction is not parsed; do "
         "not infer buying or selling from a count.",
-        "Headlines: if present, separate reported facts from opinion. Analyst ratings, price targets and commentary are "
-        "not evidence about the business. If no headlines are available, do not assume any news.",
+        "News: reader-extracted news events (news_N) carry a source tier set by code. Tier A (primary source) and tier B "
+        "(established news organisation) events are evidence; a tier C event (aggregator, blog, unknown publisher, "
+        "rumor) is unverified and cannot by itself support a probability above 0.50. Analyst ratings, price targets "
+        "(analyst_action) and commentary are opinions, not evidence about the business. If raw headlines are shown "
+        "instead, separate reported facts from opinion. If no news is shown, do not assume any.",
         "Post-event drift: after earnings news, prices tend to keep drifting in the direction of the initial reaction for "
         "weeks. You cannot see the surprise itself; ret_1m after an earnings 8-K is only a rough proxy, so weight it lightly.",
         "Volatility: vol_20d. Elevated short-term volatility around events widens the range of outcomes.",
