@@ -126,8 +126,8 @@ def test_relative_config_path_from_another_directory_finds_the_same_book(env, pr
 
 
 def test_backtest_trial_ledger_follows_the_config_file(env, prices, monkeypatch):
-    def offline_backtest(cfg, start, end, mode, llm=None):
-        return run_backtest(cfg, start, end, mode, llm=llm, prices=prices, **LOADERS)
+    def offline_backtest(cfg, start, end, mode, llm=None, **kw):
+        return run_backtest(cfg, start, end, mode, llm=llm, prices=prices, **LOADERS, **kw)
 
     monkeypatch.setattr(cli, "run_backtest", offline_backtest)
     args = ["backtest", "--config", env.config, "--start", _day(prices, DAY), "--end", _day(prices, DAY + 30),

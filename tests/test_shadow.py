@@ -493,7 +493,9 @@ def test_compare_counts_failed_live_spend_and_needs_a_completed_cycle(tmp_path):
         ("cycle_end", {"as_of": "2024-03-01"})])
     c = shadow.compare_books(cfg, book, [])
     assert c.nav_date == "2024-02-01"                       # 2024-04-01 is not a common decided session
-    assert c.live_failed == [] and c.llm_spend_pending_usd == pytest.approx(5.8)
+    # spend from the compared session on (02-01: $5.8, the failed 03-01: $1, 04-01: $3) is pending, and the
+    # failed 03-01 session is listed although it lies after the compared session
+    assert c.live_failed == ["2024-03-01"] and c.llm_spend_pending_usd == pytest.approx(5.8 + 1.0 + 3.0)
     # the shadow's 04-01 attempt failed, so the last common decided session is 02-01; re-run it and recheck
     _ledger(book / "shadow" / "ledger.jsonl", [("cycle_start", {"as_of": "2024-04-01", "nav": 100_800.0}),
                                                ("cycle_end", {"as_of": "2024-04-01"})])
@@ -501,6 +503,30 @@ def test_compare_counts_failed_live_spend_and_needs_a_completed_cycle(tmp_path):
     assert c3.nav_date == "2024-04-01" and c3.live_failed == ["2024-03-01"]
     assert c3.llm_spend_usd == pytest.approx(2.9 + 2.9 + 1.0) and c3.llm_spend_pending_usd == pytest.approx(3.0)
     assert any("failed and was not decided on 1 session" in n for n in c3.notes)
+
+
+def test_a_failed_latest_live_cycle_and_its_spend_are_reported(tmp_path):
+    """Regression: when the newest live cycle failed after spending ($9.50, BudgetExceeded), the
+    shadow did not run, so that session lay after the compared one: compare showed neither the
+    spend nor the failed session until a later cycle completed."""
+    cfg = make_config(str(tmp_path))
+    book = tmp_path / "book"
+    live, sh = [], [("shadow_inception", {"as_of": "2024-02-01", "nav": 100_000.0})]
+    for d, nav in (("2024-02-01", 100_000.0), ("2024-03-01", 100_500.0)):
+        live += [("cycle_start", {"as_of": d, "nav": nav}), ("cycle_end", {"as_of": d, "usage": {"cost_usd": 2.0}})]
+        sh += [("cycle_start", {"as_of": d, "nav": nav - 100}), ("cycle_end", {"as_of": d})]
+    live += [("cycle_start", {"as_of": "2024-04-01", "nav": 100_700.0}),
+             ("cycle_error", {"as_of": "2024-04-01", "error": "BudgetExceeded", "usage": {"cost_usd": 9.5}})]
+    _ledger(book / "ledger.jsonl", live)
+    _ledger(book / "shadow" / "ledger.jsonl", sh)
+    c = shadow.compare_books(cfg, book, [], as_of="2024-04-01")
+    assert c.nav_date == "2024-03-01" and c.llm_spend_usd == pytest.approx(2.0)
+    assert c.llm_spend_pending_usd == pytest.approx(2.0 + 9.5) and c.live_failed == ["2024-04-01"]
+    text = "\n".join(c.lines())
+    assert "$11.50 spent on the 2024-03-01 decision and any later attempt" in text
+    assert "failed and was not decided on 1 session(s) (2024-04-01)" in text
+    before = shadow.compare_books(cfg, book, [], as_of="2024-03-15")        # point in time: not yet happened
+    assert before.live_failed == [] and before.llm_spend_pending_usd == pytest.approx(2.0)
 
 
 def test_compare_without_a_shadow_or_a_common_session_says_so(tmp_path, capsys):

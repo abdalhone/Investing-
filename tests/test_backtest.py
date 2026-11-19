@@ -670,3 +670,43 @@ def test_report_reads_no_direction_into_a_handful_of_clean_dates(quant_result):
     r.n_trials = 1
     md = render_backtest_report(r)
     assert "The LLM committee ranked stocks better than the quant-only model" in md and "positive (t >= 2)" in md
+
+
+def test_a_universe_file_edited_mid_run_does_not_change_the_run(prices, tmp_path):
+    """Regression: the screened universe file was read when the fingerprint was hashed, again at
+    every decision and once more for the trial row's universe_digest, so an edit during a long
+    backtest mixed two universes and gave a row whose fingerprint and digest disagreed. The
+    universe is now read once at the start and frozen for the whole run."""
+    from aifirm.config import FirmConfig
+    from aifirm.journal import Ledger
+    work = tmp_path / "w"
+    work.mkdir()
+    dump = make_config(str(work)).model_dump()
+    dump["universe"]["tickers"] = []
+    dump["universe"]["screen"] = {"enabled": True, "file": "universe.txt", "deep_dive_top_n": 5,
+                                  "min_dollar_volume": 1e6}
+    dump["evaluation"]["n_random_books"] = 0
+    dump["runs_dir"] = str(work / "runs")
+    (work / "universe.txt").write_text("\n".join(NAMES[:4]) + "\n")
+    cfg = FirmConfig.model_validate(dump)
+    cfg._source_dir = work.resolve()
+    fp_a, digest_a = cfg.fingerprint(), cfg.universe_digest()
+    frozen = cfg.with_frozen_universe()
+    assert frozen.fingerprint() == fp_a and frozen.universe_digest() == digest_a
+    assert frozen.universe.screen.file == "" and frozen.investable_tickers() == NAMES[:4]
+    seen: set[str] = set()
+
+    def fundamentals(t, d):
+        seen.add(d)
+        if len(seen) == 2:                                    # someone edits the file during the run
+            (work / "universe.txt").write_text("\n".join(NAMES) + "\n")
+        return LOADERS["fundamentals_loader"](t, d)
+
+    r = run_backtest(cfg, _day(prices, 380), _day(prices, 470), "quant", prices=prices,
+                     **{**LOADERS, "fundamentals_loader": fundamentals})
+    assert len(seen) >= 2 and cfg.universe_digest() != digest_a           # the edit did happen
+    row = json.loads((work / "runs" / "trials.jsonl").read_text().splitlines()[-1])
+    assert row["fingerprint"] == fp_a == r.config_fingerprint and row["universe_digest"] == digest_a
+    sizes = {e["payload"]["n_universe"] for e in Ledger(f"{r.run_dir}/ledger.jsonl").entries() if e["event"] == "screen"}
+    assert sizes == {4} and r.tickers == NAMES[:4]
+    assert "screened universe from a file" in (r.universe_note or "")     # the note still names the source

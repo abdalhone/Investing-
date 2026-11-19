@@ -605,6 +605,10 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     end = _completed_session(args.end, "--end")
     llm = None
     if args.mode == "llm":
+        problem = credentials_problem()           # before the budget prompt: answering it must not be wasted
+        if problem:
+            raise CLIError(f"{problem} (--mode quant needs no model; --mode offline runs the plumbing with "
+                           "deterministic rules)")
         cycles = len(pd.bdate_range(args.start, end)) // max(1, cfg.process.rebalance_every_days) + 1
         budget = cfg.process.max_llm_cost_usd_per_run * cycles
         print(f"LLM backtest: about {cycles} decision cycles, LLM budget up to ${budget:,.2f} "
@@ -614,7 +618,10 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             print("cancelled")
             return 1
         llm = _claude(cfg, budget)
-    result = run_backtest(cfg, args.start, end, args.mode, llm=llm)
+    print(f"backtest {args.mode} {args.start} to {end}: progress lines go to stderr (a 100-name screened run takes "
+          "tens of minutes)", file=sys.stderr, flush=True)
+    result = run_backtest(cfg, args.start, end, args.mode, llm=llm,
+                          progress=lambda line: print(f"  {line}", file=sys.stderr, flush=True))
     report = Path(result.run_dir) / "report.md"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_backtest_report(result))

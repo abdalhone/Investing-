@@ -362,8 +362,10 @@ class _CommitteePolicy:
     """The firm itself: gather point-in-time data and run :func:`decide` at each rebalance."""
 
     def __init__(self, cfg: FirmConfig, llm: LLM | None, prices: PriceData, run_dir: Path, run_id: str,
-                 loaders: dict, sheets: _SheetCache | None = None) -> None:
+                 loaders: dict, sheets: _SheetCache | None = None,
+                 progress: Callable[[str], None] | None = None, label: str = "", n_decisions: int = 0) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
+        self.progress, self.label, self.n_decisions = progress, label, n_decisions
         self.cfg, self.llm, self.prices, self.loaders = cfg, llm, prices, loaders
         self.sheets = sheets if sheets is not None else _SheetCache(prices, loaders)
         self.run_dir, self.run_id = run_dir, run_id
@@ -389,6 +391,9 @@ class _CommitteePolicy:
                      trading_calendar=self.prices.close.index, runs_dir=str(self.run_dir), nav_marks=nav_path)
         self.state = dec.risk_state
         self.cycles += 1
+        if self.progress is not None:
+            of = f" of {self.n_decisions}" if self.n_decisions else ""
+            self.progress(f"{self.label or 'strategy'}: decision {self.cycles}{of} at the close of {as_of}")
         messages = [*dec.warnings, *(f"{t}: {g}" for t, gaps in dec.data_gaps.items() for g in gaps)]
         self._warning_counts.update(dict.fromkeys((_ISO_DATE.sub("<date>", w) for w in messages), 1))
         screen_quant = dec.screen.quant_probs() if dec.screen is not None else {}
@@ -793,8 +798,13 @@ def _finite_or_none(x: float | None) -> float | None:
 def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | None = None,
                  prices: PriceData | None = None, fundamentals_loader: FundamentalsLoader | None = None,
                  macro_loader: MacroLoader | None = None, filings_loader: FilingsLoader | None = None, *,
-                 run_id: str | None = None, factor_prices: PriceData | None = None) -> BacktestResult:
+                 run_id: str | None = None, factor_prices: PriceData | None = None,
+                 progress: Callable[[str], None] | None = None) -> BacktestResult:
     """Walk-forward backtest of the firm from ``start`` to ``end`` (inclusive).
+
+    ``progress`` (optional) receives one line per decision of the strategy and of the
+    quant-only baseline, and one before the evaluation (the CLI prints them, so a long run
+    does not look like a hang).
 
     * ``mode="quant"``: the deterministic quant analyst alone, no LLM anywhere.
     * ``mode="offline"``: the full committee answered by :func:`make_offline_llm`
@@ -829,6 +839,10 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     start_s, end_s = _day(start), _day(end)
     if start_s >= end_s:
         raise ValueError(f"start {start_s} must be before end {end_s}")
+    # Read a screened universe once: the fingerprint, the prices, every decision and the trial
+    # row's universe digest all see the same names, even if the universe file is edited mid-run.
+    source_scr = cfg.universe.screen          # the sources, for the survivorship note
+    cfg = cfg.with_frozen_universe()
     bench = cfg.universe.benchmark.upper()
     downloaded = prices is None
     if prices is None:
@@ -850,7 +864,9 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     strat_cfg = quant_only_config(cfg) if mode == "quant" else cfg
     strat_llm = make_offline_llm() if mode == "offline" else llm
     sheets = _SheetCache(prices, loaders)          # built once per date, shared with the quant-only baseline
-    policy = _CommitteePolicy(strat_cfg, strat_llm, prices, run_dir, run_id, loaders, sheets)
+    n_rebal = len(rebalance_days)
+    policy = _CommitteePolicy(strat_cfg, strat_llm, prices, run_dir, run_id, loaders, sheets,
+                              progress=progress, label=f"{mode} strategy", n_decisions=n_rebal)
     sim, card = policy.run(prices, days, rebalance_days, end_s)
     warnings = list(policy.warnings)
 
@@ -863,7 +879,8 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     q_sim: _Sim | None = None
     if mode != "quant":
         q_policy = _CommitteePolicy(quant_only_config(cfg), None, prices, run_dir / "quant_only",
-                                    f"{run_id}-quant", loaders, sheets)
+                                    f"{run_id}-quant", loaders, sheets, progress=progress,
+                                    label="quant-only baseline", n_decisions=n_rebal)
         q_sim, _ = q_policy.run(prices, days, rebalance_days, end_s)
         baseline_returns["quant_only"] = q_sim.nav.pct_change().iloc[1:]
         baseline_sims["quant_only"] = q_sim
@@ -873,7 +890,7 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
 
     returns = sim.nav.pct_change().iloc[1:]
     trials_path = cfg.runs_path() / TRIALS_FILE
-    scr = cfg.universe.screen
+    scr = source_scr
     if scr.enabled and scr.preset.strip():
         universe_note = f"preset {scr.preset.strip()!r}: {SURVIVORSHIP_NOTE}"
     elif scr.enabled:
@@ -902,6 +919,8 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     clean_returns = None
     if contamination_end is not None:      # returns earned under a decision made after the contaminated period
         clean_returns = returns[in_force.notna() & (in_force > pd.Timestamp(contamination_end))]
+    if progress is not None:
+        progress("evaluating: signal IC, random books, cost re-runs and factor attribution")
     evaluation = _evaluate(cfg=cfg, strat_cfg=strat_cfg, prices=prices, days=days, rebalance_days=rebalance_days,
                            end=end_s, sim=sim, q_sim=q_sim, returns=returns,
                            bench_total_pct=reports["benchmark"].total_return_pct, factor_prices=factor_prices,

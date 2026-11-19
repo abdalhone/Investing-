@@ -329,12 +329,34 @@ def test_a_deep_dive_narrower_than_the_ic_minimum_is_reported_not_awaited():
     """Regression: with 2-3 deep-dive names per date every date was skipped and the bound said
     '0 resolved dates < 12' for ever, as if waiting would help. The skipped dates are now
     counted and the reason names the cause."""
-    cfg = FirmConfig()
+    cfg = FirmConfig.model_validate({"universe": {"screen": {"enabled": True, "preset": "sp100",
+                                                             "deep_dive_top_n": 3}}})
     thin = adaptive_bound(_records(20, -0.9, 0.9, names=3), "2026-01-01", cfg)
     assert thin.n_dates == 0 and thin.n_thin_dates == 20 and thin.max_tilt == 0.05
-    assert "20 resolved date(s) skipped because fewer than 5 names" in thin.reason
-    assert "deep_dive_top_n" in thin.reason and thin.to_dict()["n_thin_dates"] == 20
+    assert "20 resolved decision date(s) were skipped because fewer than 5 names" in thin.reason
+    assert "deep_dive_top_n = 3" in thin.reason and "never become measurable" in thin.reason
+    assert thin.to_dict()["n_thin_dates"] == 20
     wide = adaptive_bound(_records(20, -0.6, 0.6, names=8), "2026-01-01", cfg)
     assert wide.n_thin_dates == 0 and wide.max_tilt == 0.0
     res = paired_rank_ic(_records(4, 0.5, 0.5, names=3), "2026-01-01", LLM_POOL_AGENT, "quant", min_names=5)
     assert res.n_dates == 0 and res.n_thin == 4
+
+
+def test_thin_dates_blame_a_setting_only_when_it_caps_the_count():
+    """Regression: the 'deep-dive band too narrow, can never become measurable: widen
+    deep_dive_top_n' advice fired whenever any date had fewer than 5 common names, even with
+    deep_dive_top_n = 12 (a weak day has few names above 0.5) or with the screen off."""
+    from aifirm.portfolio.overlay import thin_dates_note
+    wide = FirmConfig.model_validate({"universe": {"screen": {"enabled": True, "preset": "sp100",
+                                                             "deep_dive_top_n": 12}}})
+    note = thin_dates_note(wide, 6, 5)
+    assert note.startswith("6 resolved decision date(s) were skipped") and "too few names with quant P above 0.5" in note
+    assert "never" not in note and "widen" not in note
+    bound = adaptive_bound(_records(20, -0.9, 0.9, names=3), "2026-01-01", wide)
+    assert "never" not in bound.reason and "widen" not in bound.reason
+    small = FirmConfig.model_validate({"universe": {"tickers": ["AAA", "BBB", "CCC"]}})
+    assert "the universe holds only 3 name(s)" in thin_dates_note(small, 2, 5)
+    assert "deep_dive_top_n" not in thin_dates_note(small, 2, 5)
+    assert "deep_dive_top_n" not in thin_dates_note(FirmConfig(), 2, 5) and "never" not in thin_dates_note(
+        FirmConfig(), 2, 5)
+    assert thin_dates_note(wide, 0, 5) == ""

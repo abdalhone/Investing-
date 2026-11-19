@@ -64,12 +64,13 @@ choose weights, share counts or leverage.
   you can run and test the whole machine without an API key. Never act on its output.
 
 A development run shows what an honest report looks like. A quant-only backtest (no LLM)
-from 2022-01-01 to 2025-12-31 on the bundled `sp100` list returned +37.1%, against +50.9%
-for SPY and +51.3% for an equal-weight basket of the same names. Its forecasts had no
-ranking skill (mean rank IC −0.019, t = −0.63 over 47 decision dates), it sat at the 62nd
-percentile of 1,000 composition-matched random books (p = 0.38), and its factor-adjusted
-alpha was +1.5% a year with t = 0.48. The list is today's index membership, so even those
-returns are biased upward. The report said all of this in its first six lines and its
+from 2022-01-01 to 2025-12-31 on the bundled `sp100` list (the first command of step 4,
+re-run on 2026-11-19 with the current code) returned +39.5%, against +50.9% for SPY and
++51.3% for an equal-weight basket of the same names. Its forecasts had no ranking skill
+(mean rank IC −0.019, t = −0.63 over 47 decision dates), it sat at the 53rd percentile of
+1,000 composition-matched random books (p = 0.47), and its factor-adjusted alpha was +2.4%
+a year with t = 0.86. Prices are re-downloaded, so a later run can differ slightly. The
+list is today's index membership, so even those returns are biased upward. The report said all of this in its first six lines and its
 "Is there skill, and would we know?" section.
 
 ## Quick start
@@ -138,6 +139,13 @@ aifirm backtest --config my.toml --start 2025-01-02 --end 2026-10-30 --mode offl
 aifirm backtest --config my.toml --start 2026-08-03 --end 2026-11-13 --mode llm       # Claude; costs money
 ```
 
+The first two need no API key. The `--mode llm` line needs `ANTHROPIC_API_KEY` (or an
+`ant auth login` profile; see step 6); without one it stops before asking about the budget.
+A 100-name screened backtest is slow: on one core the four-year quant run above takes about
+20 to 25 minutes and the offline run about 10, most of it simulating and evaluating, not
+downloading. The command prints one progress line per decision (strategy and quant-only
+baseline) and one before the evaluation on stderr, then the summary on stdout.
+
 Every backtest decides at the close and fills at the next open with costs, marks the book
 every day, credits dividends, resolves forecasts as time passes and uses only outcomes
 known at each decision date. It runs three baselines through the same engine: the
@@ -163,6 +171,9 @@ default 31: it also decides which LLM forecasts are clean track record.
 aifirm reid-probe --config my.toml --start 2024-01-02 --end 2026-05-29 --n 400 --offline   # harness check
 aifirm reid-probe --config my.toml --start 2024-01-02 --end 2026-05-29 --n 400 --budget 20 # the real gate
 ```
+
+The real gate calls the model, so it needs `ANTHROPIC_API_KEY` (step 6); `--offline`
+runs the harness with a random guesser and no key.
 
 The probe shows the model 400 blind fact sheets and asks it to name the stock and month.
 The gate passes only with at least 400 answered probes, a joint hit rate (stock and month)
@@ -235,6 +246,15 @@ changed. The shadow book always uses the simulator.
 aifirm score --config examples/firm.toml            # resolve due forecasts; Brier scores; paired ICs
 aifirm verify-ledger --config examples/firm.toml    # check the hash chain against the last recorded head
 aifirm verify-ledger --config examples/firm.toml --shadow
+```
+
+These read the live paper book from step 6. If you have only run offline (step 3), add
+`--offline` for the offline book, and `--offline --shadow` for its shadow:
+
+```bash
+aifirm score --config examples/firm.toml --offline
+aifirm verify-ledger --config examples/firm.toml --offline
+aifirm verify-ledger --config examples/firm.toml --offline --shadow
 ```
 
 ## The staged plan (S0 to S6)
@@ -315,9 +335,10 @@ first.
   `examples/runs/KILL`) and no orders are generated, for the live, offline and shadow
   books, until you delete it.
 - **Drawdown rules.** At a 10% drawdown from the peak the active positions are halved
-  (half of what construction would otherwise hold, not half again every cycle; a position
-  kept because of an LLM outage or a failed memo is halved once, never sold again for the
-  outage) until half of the drawdown is recovered. At 20% the active positions go to cash (the
+  (half of what construction, after any risk-review cut, would otherwise hold, not half
+  again every cycle; a position kept because of an LLM outage or a failed memo is halved
+  once and never sold below that level for the outage, though a halving sale that did not
+  execute is finished later) until half of the drawdown is recovered. At 20% the active positions go to cash (the
   passive core is kept) and the book stays frozen until a human resets it. After a one-day
   loss of 5% or more since the previous cycle, no position may grow that cycle.
 - **Unfreeze.** Review what happened, then run

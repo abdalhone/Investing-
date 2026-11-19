@@ -345,10 +345,11 @@ class BookComparison:
     decision (its orders fill at the next open), so ``llm_spend_usd`` sums the live book's
     LLM cost over the cycles from inception up to but excluding ``nav_date``, failed
     attempts included (their spend is logged on ``cycle_error``): exactly the decisions
-    whose effect the compared NAVs contain. The latest decision's spend is
-    ``llm_spend_pending_usd``, charged once its fills reach a later NAV.
-    ``value_added_usd = difference_usd - llm_spend_usd``. ``live_failed`` lists sessions
-    whose live cycle failed and was not decided. The IC fields
+    whose effect the compared NAVs contain. The spend on ``nav_date`` and on every later
+    cycle up to ``as_of`` (a failed latest cycle included) is ``llm_spend_pending_usd``,
+    charged once its fills reach a compared NAV.
+    ``value_added_usd = difference_usd - llm_spend_usd``. ``live_failed`` lists sessions up
+    to ``as_of`` whose live cycle failed and was not decided. The IC fields
     come from :func:`aifirm.journal.paired_rank_ic` of the live final probability
     (``committee``) against the shadow's, on the names both forecast, with forecasts
     resolved on or before ``as_of``; ``min_dates`` is the forward record needed before a
@@ -407,8 +408,9 @@ class BookComparison:
                f"{_usd_signed(self.difference_usd)} "
                f"({_pp(self.difference_pp)} points).",
                f"Cumulative LLM spend since inception: {_usd(self.llm_spend_usd)} on the decisions reflected in these "
-               f"NAVs" + (f" (plus {_usd(self.llm_spend_pending_usd)} on the {self.nav_date} decision, charged once its "
-                          "fills reach a NAV)." if self.llm_spend_pending_usd else "."),
+               f"NAVs" + (f" (plus {_usd(self.llm_spend_pending_usd)} spent on the {self.nav_date} decision and any "
+                          "later attempt, failed ones included, charged once their fills reach a compared NAV)."
+                          if self.llm_spend_pending_usd else "."),
                self.value_sentence(),
                f"Ranking (paired per-date rank IC, live final P minus shadow P on common names): {self.verdict}"]
         return [*out, *self.notes]
@@ -478,6 +480,15 @@ def ic_verdict(n_dates: int, min_dates: int, mean_diff: float | None, t_stat: fl
                              f"|t| >= {VERDICT_T:g}): by research 7.4, default to the simpler quant-only design.")
 
 
+def _live_failed_note(failed: list[str], last: str | None = None) -> str:
+    shown = ", ".join(failed[:5]) + (", ..." if len(failed) > 5 else "")
+    after = [d for d in failed if last is None or d >= last]
+    tail = (" The spend of failed attempts is counted: in the LLM spend when it lies before the compared session, "
+            "else as spend not yet in the compared NAVs." if after else
+            " The LLM spend of the failed attempts is counted.")
+    return f"The live cycle failed and was not decided on {len(failed)} session(s) ({shown}).{tail}"
+
+
 def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord], *, as_of: str | None = None,
                   include_pre_cutoff: bool = False) -> BookComparison:
     """Compare ``book`` (the live book's directory) with its shadow (module docstring).
@@ -520,8 +531,11 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     min_dates = forward_min_dates(cfg, step)
     out = BookComparison(status="no_common_decision", as_of=as_of_s, verdict="", inception_as_of=inc_day,
                          inception_nav=inc_nav, step_days=step, ic_lags=lags, min_dates=min_dates)
+    out.live_failed = [d for d in live_failed if d >= inc_day and (as_of_s is None or d <= as_of_s)]
     if not common:
         out.verdict = f"The live book and its shadow (inception {inc_day}) have no decided session in common yet."
+        if out.live_failed:
+            out.notes.append(_live_failed_note(out.live_failed))
         return out
     last = common[-1]
     out.nav_date, out.live_nav, out.shadow_nav = last, live_nav[last], shadow_nav[last]
@@ -534,12 +548,12 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
             p = e.get("payload") or {}
             d = _day(p["as_of"]) if p.get("as_of") else None
             cost = (p.get("usage") or {}).get("cost_usd", 0.0)
-            if d is None or not _finite(cost) or d < inc_day:
+            if d is None or not _finite(cost) or d < inc_day or (as_of_s is not None and d > as_of_s):
                 continue
             if d < last:
                 out.llm_spend_usd += float(cost)           # every cycle's spend, a forced re-decision's too
-            elif d == last:
-                out.llm_spend_pending_usd += float(cost)   # its fills are not in the NAV at `last` yet
+            else:   # `last` and any later attempt (a failed latest cycle too): not in the compared NAVs yet
+                out.llm_spend_pending_usd += float(cost)
     out.value_added_usd = out.difference_usd - out.llm_spend_usd
     out.value_added_pct = out.value_added_usd / inc_nav * 100.0 if inc_nav > 0 else None
     upto = [d for d in in_window if d <= last]
@@ -553,10 +567,8 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
         out.notes.append(f"The shadow did not decide on {len(out.shadow_missed)} of the {len(upto)} live sessions "
                          f"since inception ({shown}){inside}: see the 'shadow' entries in the live ledger; the NAV "
                          "comparison includes those gaps.")
-    out.live_failed = [d for d in live_failed if d >= inc_day and d <= last]
     if out.live_failed:
-        out.notes.append(f"The live cycle failed and was not decided on {len(out.live_failed)} session(s) "
-                         f"({', '.join(out.live_failed[:5])}); any LLM spend of the failed attempts is counted.")
+        out.notes.append(_live_failed_note(out.live_failed, last))
 
     res = paired_rank_ic(list(records), as_of_s or last, COMMITTEE_AGENT, SHADOW_AGENT,
                          include_pre_cutoff=include_pre_cutoff, min_names=cfg.evaluation.ic_min_names, nw_lags=lags)

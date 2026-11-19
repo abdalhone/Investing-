@@ -77,7 +77,7 @@ language models add, net of what they cost, is measured forward.
 |---|-----------|--------------------|
 | P1 | **LLMs propose, code disposes.** Agents output probabilities and evidence. They never output share counts, weights or leverage. | FinCon's CVaR ablation; Alpha Arena season 1 losses from leverage and overtrading; ai-hedge-fund v2 "conviction requests, risk disposes" (1, 2.2) |
 | P2 | **Every number comes from the Data Desk, and outside text is data.** Agents cite fact IDs; a grounding check flags unsupported numbers. Raw headlines reach only a quarantined, tool-less reader; its typed output is validated and tiered by code. | FinanceBench error rates; TradingAgents hallucination fixes; FinRobot's numeric auditors; CaMeL-style quarantined readers, TradeTrap and FARSIGHT (4, 5.5, 9.3 item 3) |
-| P3 | **Point-in-time everything.** Fundamentals as filed and accepted before the close, macro with publication lags, headlines published before the 16:00 New York close, no live-only feeds in backtests, decide at the close of T and fill at the open of T+1. | Look-ahead fixes in TradingAgents; FINSABER; "Profit Mirage" and Look-Ahead-Bench (5.1, 7.1) |
+| P3 | **Point-in-time everything.** Fundamentals as filed and accepted before the close, macro with publication lags, headlines published before the session's New York close (16:00, 13:00 on a half day), no live-only feeds in backtests, decide at the close of T and fill at the open of T+1. | Look-ahead fixes in TradingAgents; FINSABER; "Profit Mirage" and Look-Ahead-Bench (5.1, 7.1) |
 | P4 | **Independent first, aggregate statistically, debate only on disagreement.** | "Debate or Vote" (NeurIPS 2025); Lorenz 2011; Good Judgment aggregation (3.2) |
 | P5 | **Information diversity, not persona diversity.** Analysts get different data slices. Optional model diversity. No famous-investor personas. | Hidden-profile research (Stasser and Titus); persona prompting shows no accuracy gain (3.2) |
 | P6 | **Authentic dissent.** The challenger is the analyst whose own sealed view most opposed the pool. | Nemeth 2001 (3.2) |
@@ -179,7 +179,8 @@ aifirm/
 
 * `load_fundamentals(ticker, as_of, cik=None)` reads SEC XBRL "companyfacts" as filed.
   A filing counts as known at the as-of close only if its EDGAR acceptance time is before
-  16:00 New York time on that date; with no acceptance time, a filing dated D is known
+  that session's New York close (`decision_cutoff`: 16:00, 13:00 on a half day); with no
+  acceptance time, a filing dated D is known
   from the next day. `Fundamentals.gaps` lists what is missing. `foreign_filer` marks
   20-F/40-F and IFRS filers, for which no market-cap-based multiples are computed.
 * `recent_filings(ticker, as_of, lookback_days, cik=None)` lists 8-K items, 10-Q/10-K
@@ -198,9 +199,11 @@ revision, not the first print.
 **News** (`aifirm.data.news`). `Headline(title, publisher, published, summary, link)`.
 `recent_headlines(ticker, as_of, max_items=12, max_age_days=14)` reads Yahoo's feed (live
 only; it cannot be replayed).
-`decision_close_utc(as_of, close_time="16:00")` is the decision instant: 16:00 New York
-time. `headlines_as_of(headlines, as_of)` keeps only headlines with a parseable publish
-time at or before that instant, newest first. `source_tier(publisher, link,
+`decision_close_utc(as_of, close_time=None)` is the decision instant: the session's own
+New York close, `aifirm.data.calendar.session_close_time(as_of)` (13:00 on the scheduled
+half days, else 16:00), unless `close_time` ("HH:MM") is given; `recent_headlines` and
+`headlines_as_of` take the same `close_time`. `headlines_as_of(headlines, as_of)` keeps
+only headlines with a parseable publish time at or before that instant, newest first. `source_tier(publisher, link,
 issuer_domains)` assigns the tier (section 3.14).
 
 **LLM interface** (`aifirm.llm.client`). `LLM.structured(role=, model=, system=, user=,
@@ -223,7 +226,13 @@ role prefix. Role strings: `analyst.<name>`, `challenge`, `revision.<name>`, `me
 (for example `portfolio.max_position <= risk.max_position_hard`, and overlay mode needs
 the quant analyst). A relative `runs_dir` or screen file is relative to the config file
 (`runs_path()`, `screen_file_path()`). `fingerprint()` hashes the config without
-`runs_dir` and `evaluation`, so evaluation settings never count as a new trial.
+`runs_dir` and `evaluation`, so evaluation settings do not count as a new trial, with one
+exception: a non-default `evaluation.cutoff_buffer_days` is hashed (it decides which LLM
+forecasts count as clean track record, so it can change a decision). With the screen on,
+the screen's sources (`preset`, `file`, inline `tickers`) are replaced in the hash by the
+resolved universe (`investable_tickers()`). `with_frozen_universe()` returns a copy whose
+screen sources are that resolved list (same fingerprint and `universe_digest()`);
+`run_backtest` uses it so a long run reads the universe file once.
 `MODEL_TRAINING_CUTOFFS` holds the vendor training cutoff per model; `model_cutoff(model)`
 reads it. Python 3.11 or later is needed (the loader uses `tomllib`).
 
@@ -738,8 +747,11 @@ def decide(cfg, llm, as_of, prices, factsheets, *, current_weights, nav, prev_na
            forecast_store, lesson_store, ledger, run_id, positions=None, trading_calendar=None,
            runs_dir=None, nav_marks=None) -> Decision
 def run_backtest(cfg, start, end, mode, llm=None, prices=None, fundamentals_loader=None, macro_loader=None,
-                 filings_loader=None, *, run_id=None, factor_prices=None) -> BacktestResult
+                 filings_loader=None, *, run_id=None, factor_prices=None, progress=None) -> BacktestResult
 ```
+
+`progress(line)` (optional) gets one line per decision of the strategy and of the quant-only
+baseline and one before the evaluation; `aifirm backtest` prints them on stderr.
 
 **`gather_data`** resolves `as_of` to the last session in the price index (a holiday means
 the session before) and loads fundamentals, filings, macro and headlines as of that
@@ -783,7 +795,10 @@ offline and llm runs, the `prompts` digest); the number of distinct (fingerprint
 start, end, prompts) trials feeds the deflated Sharpe. The fingerprint covers the
 *resolved* screened universe (`FirmConfig.investable_tickers`), not the path of the
 universe file: editing the file is a new trial, and the same tickers reached through
-another path are the same trial. Returns are split at `contamination_end` (training cutoff plus
+another path are the same trial. The universe is resolved once when the run starts
+(`FirmConfig.with_frozen_universe`): the fingerprint, the prices, every decision and the
+trial row's `universe_digest` see the same names even if the file is edited during the
+run. Returns are split at `contamination_end` (training cutoff plus
 `evaluation.cutoff_buffer_days`). After the run, `result.evaluation` is computed from the
 recorded decisions with no new decision and no LLM call (section 3.17).
 `BacktestResult` also records daily `exposure`, `baseline_nav`, `universe_note`
@@ -1002,10 +1017,14 @@ t ≤ −2, else "no difference" (default to the simpler design). NAVs come from
 * The NAV at the compared close is the NAV *before* that session's decision (its orders fill
   at the next open), so the LLM spend charged is that of the cycles strictly before it,
   failed attempts included (`cycle_error` logs the spend of the calls made before the
-  failure). The latest decision's spend is shown as pending until its fills reach a NAV.
+  failure). The spend of the compared session and of every later cycle up to `as_of` (a
+  failed latest cycle, whose shadow never ran, included) is shown as pending until fills
+  reach a compared NAV, and every failed live session up to `as_of` is listed.
 * Dates skipped because fewer than `evaluation.ic_min_names` names had both forecasts are
-  counted and reported: a deep-dive band that narrow can never make the comparison
-  measurable.
+  counted and reported. The note says the comparison can never become measurable only when
+  that is true (`overlay.thin_dates_note`): the screen is on and `deep_dive_top_n` is below
+  the minimum, or the universe is smaller than it. Otherwise it says why such a day is
+  usually thin (few names with quant P above 0.5 for the deep dive).
 
 ### 3.17 Backtest evaluation (`backtest/ic.py`, `random_books.py`, `evaluation.py`, `factors.py`)
 

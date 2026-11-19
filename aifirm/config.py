@@ -539,6 +539,24 @@ class FirmConfig(_Section):
             raise FileNotFoundError(f"universe.screen.file {scr.file!r} not found (resolved to {cfg.screen_file_path()})")
         return cfg
 
+    def with_frozen_universe(self) -> "FirmConfig":
+        """A copy whose screened universe has been read once and is fixed from then on.
+
+        With ``universe.screen`` enabled, the screen's sources (``preset``, ``file``, inline
+        ``tickers``) are replaced by the resolved list (:meth:`investable_tickers`), so every
+        later read sees the same names even if the universe file is edited while a long
+        backtest runs. :meth:`fingerprint` and :meth:`universe_digest` are unchanged (both
+        hash the resolved list). Without the screen, or when nothing resolves (the run then
+        fails loudly on its own), returns ``self``. Raises like :meth:`investable_tickers`."""
+        if not self.universe.screen.enabled:
+            return self
+        resolved = self.investable_tickers()
+        if not resolved:
+            return self
+        data = self.model_dump()
+        data["universe"]["screen"].update(preset="", file="", tickers=resolved)
+        return self.revalidated(data)
+
     def screen_file_path(self) -> Path:
         """Absolute path of ``universe.screen.file``: a relative path is anchored at the
         config file's directory (like ``runs_dir``), else at the working directory."""

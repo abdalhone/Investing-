@@ -46,8 +46,8 @@ def env(tmp_path, prices, monkeypatch):
                         gather_data(cfg, as_of, False, prices=prices, **LOADERS))
     monkeypatch.setattr(cli, "load_prices", lambda tickers, start, end: _window(prices, tickers, start, end))
     monkeypatch.setattr(cli, "last_completed_session", lambda now=None: _day(prices, TODAY))
-    monkeypatch.setattr(cli, "run_backtest", lambda cfg, start, end, mode, llm=None:
-                        run_backtest(cfg, start, end, mode, llm=llm, prices=prices, **LOADERS))
+    monkeypatch.setattr(cli, "run_backtest", lambda cfg, start, end, mode, llm=None, **kw:
+                        run_backtest(cfg, start, end, mode, llm=llm, prices=prices, **LOADERS, **kw))
     for var in ANTHROPIC_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "no-profiles"))
@@ -180,6 +180,20 @@ def test_screen_flags_turn_the_screen_on_and_resolve_paths_from_the_shell(env, t
         cli._apply_flags(cfg, _ns(preset="nosuch"))
 
 
+def test_an_llm_backtest_without_credentials_fails_before_asking_to_spend(env, prices, monkeypatch, capsys):
+    """Regression: '--mode llm' printed the budget and asked 'Continue?' before checking for an
+    Anthropic key; answering yes then failed with 'No Anthropic credentials found'."""
+    def no_prompt(*a, **k):
+        raise AssertionError("asked to confirm a budget although no credentials exist")
+
+    monkeypatch.setattr("builtins.input", no_prompt)
+    assert cli.main(["backtest", "--config", env.config, "--start", _day(prices, 380), "--end", _day(prices, 460),
+                     "--mode", "llm"]) == 1
+    err = capsys.readouterr()
+    assert "Anthropic credentials" in err.err and "--mode offline" in err.err and "LLM budget" not in err.out
+    assert not (env.runs / "backtests").exists()
+
+
 def test_invalid_flags_stop_before_anything_runs(env, prices, capsys):
     base = ["backtest", "--config", env.config, "--start", _day(prices, 300), "--end", _day(prices, 400)]
     for bad, message in ((["--max-tilt", "7"], "use 0.07 for 7%"), (["--cost-multipliers", "0,x"], "comma-separated"),
@@ -194,9 +208,9 @@ def test_backtest_flags_reach_the_run_and_the_console_states_the_six_lines(env, 
     seen = {}
     real = cli.run_backtest
 
-    def spy(cfg, start, end, mode, llm=None):
+    def spy(cfg, start, end, mode, llm=None, **kw):
         seen["cfg"] = cfg
-        return real(cfg, start, end, mode, llm=llm)
+        return real(cfg, start, end, mode, llm=llm, **kw)
 
     monkeypatch.setattr(cli, "run_backtest", spy)
     assert cli.main(["backtest", "--config", env.config, "--start", _day(prices, 380), "--end", _day(prices, 460),
@@ -205,8 +219,12 @@ def test_backtest_flags_reach_the_run_and_the_console_states_the_six_lines(env, 
     ev = seen["cfg"].evaluation
     assert (ev.n_random_books, ev.cost_multipliers, ev.cutoff_buffer_days, ev.factor_proxies, ev.random_seed) == \
         (30, [0.0, 1.0, 4.0], 5, False, 11)
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
     assert "1. Window and assets:" in out and "6. Benchmark and null:" in out and "**" not in out
+    # a long run must not look like a hang: one progress line per decision (strategy and baseline) on stderr
+    assert "offline strategy: decision 1 of " in captured.err and "quant-only baseline: decision 1 of " in captured.err
+    assert "evaluating: signal IC" in captured.err and "decision 1 of" not in out
     assert "LLM value added vs the quant-only baseline, net of LLM cost:" in out
     assert "+5 days: contaminated through" in out and "SURVIVORSHIP" in out
     report = next((env.runs / "backtests").glob("*offline*/report.md")).read_text()
