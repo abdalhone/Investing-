@@ -24,6 +24,7 @@ def sheet(tiers: tuple[str, ...] = ("A", "B", "C"), events: tuple[str, ...] = ("
     fs = FactSheet(ticker="AAA", as_of=AS_OF)
     fs.add(Fact("AAA.ret_3m", "Return, 3 months", 5.0, "%", AS_OF, "prices"))
     fs.add(Fact("MACRO.VIXCLS", "VIX", 14.0, "index", AS_OF, "FRED"))
+    fs.add(Fact("MACRO.DGS10", "10-year Treasury yield", 4.2, "%", AS_OF, "FRED"))
     fs.events = list(events)
     fs.headlines = [Headline("t", "p", f"{AS_OF}T14:00:00Z")]
     fs.attach_news_events([news_event(i + 1, t) for i, t in enumerate(tiers)])
@@ -49,13 +50,116 @@ def test_bullish_view_resting_only_on_tier_c_news_is_capped():
     assert out.evidence == v.evidence and out.scenarios == v.scenarios
 
 
-@pytest.mark.parametrize("cited", [["AAA.news_1"], ["AAA.news_2"], ["AAA.filing_1"], ["AAA.ret_3m"], ["MACRO.VIXCLS"],
+@pytest.mark.parametrize("cited", [["AAA.news_1"], ["AAA.news_2"], ["AAA.filing_1"], ["AAA.ret_3m"], ["MACRO.DGS10"],
                                    ["news_2"], ["[AAA.ret_3m]"]])
 def test_admissible_support_lets_a_bullish_view_through(cited):
     fs = sheet()
-    v = view(0.7, ("positive", ["AAA.news_3", *cited]))
+    v = view(0.7, ("positive", ["AAA.news_3"]), ("positive", cited))     # the rumor point is separate
     out, note = tier_gate(v, fs)
     assert out is v and note == "" and supporting_fact_ids(v, fs)
+
+
+@pytest.mark.parametrize("cited", [["AAA.news_1"], ["AAA.filing_1"], ["AAA.ret_3m"], ["MACRO.DGS10"]])
+def test_an_item_mixing_tier_c_news_with_an_admissible_fact_does_not_count(cited):
+    """Regression (gate bypass): an item citing [AAA.news_3 (tier C), <anything admissible>] rests
+    partly on the rumor; adding a fact beside it used to launder the rumor into support."""
+    fs = sheet()
+    out, note = tier_gate(view(0.7, ("positive", ["AAA.news_3", *cited])), fs)
+    assert out.prob_outperform == 0.5 and out.expected_excess_return_pct == 0.0 and "capped" in note
+
+
+@pytest.mark.parametrize("cited", [["AAA.price"], ["AAA.vol_20d"], ["AAA.vol_60d"], ["AAA.adv_20d"],
+                                   ["MACRO.VIXCLS"], ["MKT.SPY_vol_20d"], ["AAA.price", "AAA.vol_20d"]])
+def test_context_levels_cannot_carry_a_bullish_view(cited):
+    """Regression (gate bypass): a price or volatility level says nothing about direction, so a
+    positive item citing only such facts is not support."""
+    fs = sheet()
+    for fid in ("AAA.price", "AAA.vol_20d", "AAA.vol_60d", "AAA.adv_20d", "MKT.SPY_vol_20d"):
+        fs.add(Fact(fid, fid, 10.0, "x", AS_OF, "prices"))
+    out, _ = tier_gate(view(0.92, ("positive", ["AAA.news_3"]), ("positive", cited)), fs)
+    assert out.prob_outperform == 0.5
+
+
+def test_events_analyst_needs_a_filing_or_a_trusted_news_event():
+    """Regression (gate bypass): the events analyst always sees price, ret_1m and vol_20d, so a
+    rumor-based bullish view could cite them; its support must be an admissible event."""
+    fs = sheet()
+    fs.add(Fact("AAA.ret_1m", "Return, 1 month", 4.0, "%", AS_OF, "prices"))
+    for cited, passes in ((["AAA.ret_1m"], False), (["AAA.ret_3m"], False), (["AAA.filing_1"], True),
+                          (["AAA.news_2"], True), (["AAA.ret_1m", "AAA.filing_1"], True)):
+        rec = ViewRecord(agent="events", model="m", view=view(0.9, ("positive", ["AAA.news_3"]), ("positive", cited)))
+        out, note = tier_gate(rec, fs)
+        assert (out is rec and note == "") is passes, cited
+        assert tier_gate(rec.view, fs, role="events")[0].prob_outperform == (0.9 if passes else 0.5)
+    tech = ViewRecord(agent="technical", model="m", view=view(0.6, ("positive", ["AAA.ret_3m"])))
+    assert tier_gate(tech, fs)[0] is tech                              # other roles: directional facts count
+
+
+def test_reviewer_scenario_tier_c_takeover_rumor_plus_vol_level_is_capped():
+    """The reported failure: p=0.92 on a tier-C takeover blog, one positive item citing
+    [news (tier C), vol_20d]. It passed before; now it is capped at 0.5."""
+    fs = sheet(tiers=("C",))
+    fs.add(Fact("AAA.vol_20d", "Realized volatility, 20 days", 30.0, "%", AS_OF, "prices"))
+    rec = ViewRecord(agent="events", model="m", view=view(0.92, ("positive", ["AAA.news_1", "AAA.vol_20d"])))
+    out, note = tier_gate(rec, fs)
+    assert out.view.prob_outperform == 0.5 and out.view.expected_excess_return_pct == 0.0 and note
+
+
+def test_a_forged_news_id_not_on_the_sheet_taints_its_item():
+    fs = sheet()
+    out, _ = tier_gate(view(0.7, ("positive", ["AAA.news_42", "AAA.ret_3m"])), fs)
+    assert out.prob_outperform == 0.5
+    out, _ = tier_gate(view(0.7, ("positive", ["AAA.not_a_fact", "AAA.ret_3m"])), fs)   # unknown non-event ID
+    assert out.prob_outperform == 0.7
+
+
+def test_positive_excess_at_one_half_is_bullish_too():
+    """Regression: a p=0.50 view with +15% excess resting on tier-C news fed the pooled excess
+    (and the Kelly size in pool mode) untouched; its excess is now capped at 0."""
+    fs = sheet()
+    out, note = tier_gate(view(0.5, ("positive", ["AAA.news_3"]), excess=15.0), fs)
+    assert out.prob_outperform == 0.5 and out.expected_excess_return_pct == 0.0 and note
+    ok = view(0.5, ("positive", ["AAA.ret_3m"]), excess=15.0)
+    assert tier_gate(ok, fs)[0] is ok
+    rec = ViewRecord(agent="macro", model="m", view=view(0.45, ("negative", ["AAA.ret_3m"]), excess=-1.0),
+                     revised_prob=0.5, revised_excess_pct=12.0)
+    out, _ = tier_gate(rec, fs)
+    assert out.revised_excess_pct == 0.0 and out.revised_prob == 0.5
+
+
+def test_pool_mode_excess_is_not_raised_by_gated_views():
+    """Gate + pool: two supported views (+1%) and two p=0.50 / +15% views on tier-C news; the
+    pooled excess must not jump to +8% on the unverified ones."""
+    from aifirm.portfolio.aggregate import aggregate_views
+    fs = sheet()
+    good = [ViewRecord(agent=a, model="m", view=view(0.55, ("positive", ["AAA.ret_3m"]), excess=1.0))
+            for a in ("technical", "fundamental")]
+    rumor = [ViewRecord(agent=a, model="m", view=view(0.5, ("positive", ["AAA.news_3"]), excess=15.0))
+             for a in ("events", "macro")]
+    gated, notes = apply_tier_gate([*good, *rumor], fs)
+    agg = aggregate_views("AAA", gated, trim=0.2)
+    assert len(notes) == 2 and agg.expected_excess_return_pct <= 1.0
+
+
+def test_a_raised_revision_needs_admissible_new_evidence():
+    """Regression (revision hole): once the sealed view had admissible support, the revised
+    probability could rise on tier-C content spread by the challenge round."""
+    fs = sheet()
+    sealed = view(0.6, ("positive", ["AAA.ret_3m"]), excess=1.0)
+    rumor = ViewRecord(agent="technical", model="m", view=sealed, revised_prob=0.8, revised_excess_pct=6.0,
+                       revision_fact_ids=["AAA.news_3"])
+    out, note = tier_gate(rumor, fs)
+    assert (out.view.prob_outperform, out.revised_prob, out.revised_excess_pct) == (0.6, 0.6, 1.0)
+    assert "revision capped" in note
+    mixed = rumor.model_copy(update={"revision_fact_ids": ["AAA.news_3", "AAA.ret_3m"]})
+    assert tier_gate(mixed, fs)[0].revised_prob == 0.6
+    none = rumor.model_copy(update={"revision_fact_ids": []})
+    assert tier_gate(none, fs)[0].revised_prob == 0.6
+    for ids in (["AAA.ret_3m"], ["AAA.news_2"], ["AAA.filing_1"]):
+        ok = rumor.model_copy(update={"revision_fact_ids": ids})
+        assert tier_gate(ok, fs) == (ok, "")
+    lower = rumor.model_copy(update={"revised_prob": 0.55, "revised_excess_pct": 0.5, "revision_fact_ids": []})
+    assert tier_gate(lower, fs) == (lower, "")                          # a revision down is never gated
 
 
 @pytest.mark.parametrize("items", [
@@ -79,8 +183,8 @@ def test_news_fact_without_metadata_counts_as_tier_c():
 
 def test_bearish_neutral_and_abstaining_views_are_never_changed():
     fs = sheet()
-    for v in (view(0.4, ("positive", ["AAA.news_3"]), excess=-1.0), view(0.5), view(0.5, abstain=True),
-              view(0.3)):
+    for v in (view(0.4, ("positive", ["AAA.news_3"]), excess=-1.0), view(0.5, excess=0.0),
+              view(0.5, abstain=True), view(0.3, excess=-2.0)):
         out, note = tier_gate(v, fs)
         assert out is v and note == ""
 
@@ -116,8 +220,8 @@ def test_view_record_caps_sealed_and_revised_values():
     assert note.startswith("tier gate: events view on AAA") and rec.view.prob_outperform == 0.75
     flipped = ViewRecord(agent="events", model="m", view=view(0.45, ("negative", ["AAA.ret_3m"]), excess=-1.0),
                          revised_prob=0.6, revised_excess_pct=0.5)
-    out, _ = tier_gate(flipped, fs)     # a revision above 0.5 needs the same admissible support
-    assert out.revised_prob == 0.5 and out.view.prob_outperform == 0.45
+    out, _ = tier_gate(flipped, fs)     # a revision above 0.5 needs admissible support in its new evidence
+    assert out.revised_prob == 0.5 and out.revised_excess_pct == 0.0 and out.view.prob_outperform == 0.45
 
 
 def test_rumor_from_a_reputable_outlet_cannot_support():
@@ -132,6 +236,7 @@ def test_apply_tier_gate_keeps_order_and_reports_capped_views():
     views = [ViewRecord(agent=a, model="m", view=view(p, ("positive", ids)))
              for a, p, ids in (("events", 0.8, ["AAA.news_3"]), ("technical", 0.6, ["AAA.ret_3m"]),
                                ("macro", 0.4, ["AAA.news_3"]))]
+    views[2].view.expected_excess_return_pct = -1.0                       # bearish on both inputs
     out, notes = apply_tier_gate(views, fs)
     assert [v.agent for v in out] == ["events", "technical", "macro"]
     assert [v.view.prob_outperform for v in out] == [0.5, 0.6, 0.4] and len(notes) == 1

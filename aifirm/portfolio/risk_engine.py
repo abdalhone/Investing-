@@ -10,10 +10,11 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   and ``state.frozen`` is set. It stays set until a human resets it, even if NAV
   recovers (section 4 of ARCHITECTURE.md: resetting a frozen book is a human decision).
   The passive core is kept, because the core is not the thing that failed. The freeze
-  also records ``state.frozen_at_nav``. A human unfreezes the book by setting
-  ``frozen`` to false (e.g. in ``risk_state.json``); the next cycle sees ``frozen_at_nav``
-  still set, treats that as the human reset, restarts the high-water mark at the current
-  NAV and clears the marker. Without that, a book frozen to cash could never recover the
+  also records ``state.frozen_at_nav``. A human unfreezes the book with ``aifirm unfreeze``
+  (the supported path: it records who reset the book and why in the ledger); setting
+  ``frozen`` to false by hand in ``risk_state.json`` still works. Either way the next
+  cycle sees ``frozen_at_nav`` still set, treats that as the human reset, restarts the
+  high-water mark at the current NAV and clears the marker. Without that, a book frozen to cash could never recover the
   old peak and would re-freeze on the very next run.
 * **Drawdown de-risk and re-risk** (RESEARCH 6.4): at ``drawdown_derisk`` active weights
   are halved and ``state.derisked`` is set. The book stays halved until it has recovered
@@ -22,6 +23,19 @@ risk practice and broker-dealer pre-trade controls (SEC 15c3-5, after Knight Cap
   (or at a new peak), while unfrozen. Without this hysteresis the book would re-risk the
   moment the drawdown crept back under the threshold and could flip between half and full
   gross on every small move around it.
+
+  "Halved" means half of the *un-derisked plan*, and it is idempotent: applying it every
+  cycle of an episode does not compound. A leg built by construction carries its
+  ``ideal_weight`` (the target before the trade path), and while the de-risk is in force
+  its weight is capped at ``0.5 * |ideal_weight|``. Halving the incoming target instead
+  would compound with partial rebalancing (the target is a step from a book that was
+  already halved last cycle), selling into the drawdown every cycle toward about a third of
+  the ideal. A *deliberate hold* (:data:`HOLD_LABELS`: an LLM-outage hold, a held name
+  whose memo failed, a held name with no view, a risk-review halt) is halved only on the
+  cycle the de-risk triggers, when the held book is still full size; on every later cycle
+  of the episode it keeps its weight, because that weight is already the de-risked one and
+  an LLM outage must never force a sale. A leg without an ``ideal_weight`` (a hand-built
+  target) is halved.
 * **Restricted list / minimum price**: weight 0. A name whose price cannot be verified
   may not grow (we will not add risk we cannot check, nor force an exit on a data glitch).
 * **Daily-loss halt**: after a one-day NAV loss of ``daily_loss_halt`` or more on *any*
@@ -59,6 +73,10 @@ from ..schemas import Order, TargetPortfolio, TargetPosition
 
 DUST = 1e-12
 CAP_NOISE = 1e-9   # a weight this close above the position cap is float rounding, not a breach
+DERISK_FACTOR = 0.5
+# Constraint labels of legs the proposer deliberately kept at the current weight (no view, an LLM
+# failure or outage, a risk-review halt): the de-risk halves them once, when it triggers.
+HOLD_LABELS = frozenset({"pipeline:hold", "unreviewed_hold", "no_view_hold", "risk_review_halt"})
 
 
 @dataclass
@@ -225,8 +243,10 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
         trough = min(float(state.trough_nav), float(nav)) if _valid_positive(state.trough_nav) else float(nav)
         recovery = trough + 0.5 * (peak - trough)        # half of the peak-to-trough drawdown recovered
         halve = False
+        newly = False
         if drawdown >= rc.drawdown_derisk:
             halve = True
+            newly = not state.derisked
             state.derisked = True
             msgs.append(f"drawdown de-risk: {drawdown:.1%} from peak >= {rc.drawdown_derisk:.0%}; active weights "
                         f"halved until half of the drawdown is recovered")
@@ -240,10 +260,29 @@ def apply_risk_limits(target: TargetPortfolio, state: RiskState, nav: float, pre
             msgs.append(f"re-risk: half of the drawdown from {peak:,.2f} to the trough {trough:,.2f} recovered (NAV "
                         f"{float(nav):,.2f}); full gross restored")
         if halve:
+            by_ticker = {p.ticker: p for p in target.positions}
+            kept = []
             for t in weights:
-                if weights[t] != 0.0:
-                    weights[t] *= 0.5
+                if weights[t] == 0.0:
+                    continue
+                pos = by_ticker[t]
+                ideal = pos.ideal_weight
+                if HOLD_LABELS.intersection(pos.constraints_hit):
+                    if not newly:          # already halved when the episode began: never sell a hold again
+                        kept.append(t)
+                        continue
+                    new_w = weights[t] * DERISK_FACTOR
+                elif ideal is not None and math.isfinite(float(ideal)):
+                    cap = DERISK_FACTOR * abs(float(ideal))
+                    new_w = math.copysign(min(abs(weights[t]), cap), weights[t])
+                else:
+                    new_w = weights[t] * DERISK_FACTOR
+                if new_w != weights[t]:
+                    weights[t] = new_w
                     hits[t].append("risk:drawdown_derisk")
+            if kept:
+                msgs.append(f"drawdown de-risk: deliberate hold(s) {', '.join(sorted(kept))} kept at the current "
+                            "weight (already halved when the de-risk began; a hold is never sold again)")
 
     # Restricted list and minimum price.
     restricted = {x.upper() for x in rc.restricted}

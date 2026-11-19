@@ -108,8 +108,15 @@ class ScreenResult:
 
 
 def _liquidity(p: PriceData, ticker: str) -> tuple[float | None, float | None, pd.Timestamp | None]:
-    """(average dollar volume, last close, date of the last close) from prices already cut
-    at the decision close; None where unknown."""
+    """(average dollar volume, last as-traded close, date of the last close) from prices
+    already cut at the decision close; None where unknown.
+
+    The last close is the **as-traded** level (:meth:`PriceData.price_level`), the price that
+    printed that day, as the minimum-price rule and the risk engine's price fact use. The
+    ``close`` series is back-adjusted for every split up to the download date, so in a
+    backtest it would divide a historical level by splits that had not happened yet (NVDA
+    at 2016-06-30 shows 1.18 instead of the 47.01 that traded) and screen names out on
+    future corporate actions. Dollar volume uses ``close x volume``, which is split-invariant."""
     if ticker not in p.close.columns:
         return None, None, None
     closes = p.close[ticker].dropna()
@@ -117,7 +124,11 @@ def _liquidity(p: PriceData, ticker: str) -> tuple[float | None, float | None, p
     if closes.empty:
         return None, None, None
     last_day = closes.index[-1]
-    last = float(closes.iloc[-1])
+    level = p.price_level(ticker)
+    raw = level.get(last_day) if last_day in level.index else None
+    last = float(raw) if raw is not None and math.isfinite(float(raw)) and float(raw) > 0 else None
+    if last is None:
+        return None, None, None
     adv = None
     if ticker in p.volume.columns:
         dollar = (p.close[ticker] * p.volume[ticker]).iloc[-LIQUIDITY_WINDOW:].dropna()

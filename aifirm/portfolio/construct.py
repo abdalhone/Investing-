@@ -48,8 +48,10 @@ Why each piece:
 7. **Trade path.** A no-trade band, partial rebalancing and a turnover cap avoid paying
    costs for noise (RESEARCH 6.4, 6.5). Each rebalance moves ``rebalance_fraction`` of the
    way from the current weight to the target (default half), except that a step which
-   would leave a residual gap smaller than the no-trade band is completed (such a gap
-   could never be traded, so a sale would otherwise leave dust behind for ever). Turnover
+   would leave a residual gap smaller than the no-trade band, or than
+   ``MIN_RESIDUAL_GAP`` (0.25% of NAV) when the band is smaller, is completed (such a gap
+   could never be traded, or would take dozens of cycles of ever smaller orders, so a sale
+   would otherwise leave dust behind for ever). Turnover
    is **one-way**: ``0.5 * sum(|w_target - w_current|)`` over every leg, core included
    (buying 10% with the proceeds of selling 10% is 10% turnover), and ``max_turnover``
    caps that number.
@@ -137,6 +139,7 @@ MIN_COV_OBS = 60        # fewer complete rows than this and the sample covarianc
 PROB_CLIP = 0.01        # keeps Phi^-1(p) finite
 TOL = 1e-12             # slack for limit checks: above float error, far below any meaningful weight
 DUST = 1e-12            # weights smaller than this are floating-point noise
+MIN_RESIDUAL_GAP = 0.0025   # a partial step leaving less than this (0.25% of NAV) to trade completes the trade
 
 
 # --------------------------------------------------------------------------- helpers
@@ -398,10 +401,16 @@ def _apply_book_limits(active: dict[str, float], core: float, pc: PortfolioConfi
 
 
 def _partial_step(delta: float, fraction: float, band: float) -> float:
-    """``fraction`` of the trade ``delta``, unless the remaining gap would be smaller than the
-    no-trade band (it could never be traded), in which case the whole trade."""
+    """``fraction`` of the trade ``delta``, unless the remaining gap would be smaller than
+    ``max(band, MIN_RESIDUAL_GAP)``, in which case the whole trade.
+
+    A gap below the no-trade band could never be traded. The floor
+    :data:`MIN_RESIDUAL_GAP` matters when the band is 0 (allowed by validation): without it
+    every exit would halve for ever (an 8% position takes 37 cycles to reach the dust
+    threshold, with a sell order and a committee deep dive on a name the firm wants out of
+    every cycle)."""
     step = delta * fraction
-    return delta if abs(delta - step) < band else step
+    return delta if abs(delta - step) < max(band, MIN_RESIDUAL_GAP) else step
 
 
 def _trade_path(ideal: dict[str, float], current: dict[str, float], pc: PortfolioConfig, limits: _Limits,
@@ -628,6 +637,7 @@ def construct_portfolio(aggs: dict[str, AggregatedView], edge_multipliers: dict[
             expected_excess_return_pct=agg.expected_excess_return_pct if agg is not None else 0.0,
             rationale=rationale.get(t, ""),
             constraints_hit=list(dict.fromkeys(hits.get(t, []))),
+            ideal_weight=float(ideal.get(t, 0.0)),
         ))
     core_final = final.get(bench, 0.0)
     if any(p.weight != 0.0 and "partial_rebalance" in p.constraints_hit for p in positions) or \

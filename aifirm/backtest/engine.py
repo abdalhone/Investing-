@@ -58,6 +58,10 @@ distributions alike), not read from a corporate-actions feed.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import importlib
+import inspect
 import json
 import logging
 import math
@@ -75,6 +79,7 @@ import pandas as pd
 
 from ..agents import CommitteeResult, llm_analysts, make_offline_llm
 from ..config import FirmConfig, model_cutoff
+from ..data.factsheet import FactSheet
 from ..data.prices import PriceData, load_prices
 from ..execution.broker import PaperBroker
 from ..journal import ForecastStore, Ledger, LessonStore, scorecard
@@ -327,13 +332,40 @@ def _agent_probs(committee: Mapping[str, CommitteeResult],
     return out
 
 
+class _SheetCache:
+    """Point-in-time fact sheets built once per decision date and shared by every policy of
+    one backtest (the strategy and the quant-only baseline).
+
+    In a backtest :func:`gather_data` runs with ``live=False`` (no headlines), so the sheets
+    depend only on the decision date, the prices, the loaders and ``cfg.universe``, which
+    :func:`quant_only_config` keeps: the baseline's sheets are the strategy's, byte for
+    byte. Building them (SEC fundamentals for every screened name) is the dominant cost of a
+    screened backtest, so building them twice doubled it. The key includes the universe
+    section, so two configurations with different universes never share sheets, and each
+    caller gets a deep copy, so nothing one policy does to a sheet can reach another."""
+
+    def __init__(self, prices: PriceData, loaders: dict) -> None:
+        self.prices, self.loaders = prices, loaders
+        self._sheets: dict[tuple[str, str], dict[str, FactSheet]] = {}
+        self.builds = 0
+
+    def get(self, cfg: FirmConfig, as_of: str) -> dict[str, FactSheet]:
+        key = (as_of, json.dumps(cfg.universe.model_dump(), sort_keys=True, default=str))
+        if key not in self._sheets:
+            _, sheets = gather_data(cfg, as_of, live=False, prices=self.prices, **self.loaders)
+            self._sheets[key] = sheets
+            self.builds += 1
+        return copy.deepcopy(self._sheets[key])
+
+
 class _CommitteePolicy:
     """The firm itself: gather point-in-time data and run :func:`decide` at each rebalance."""
 
     def __init__(self, cfg: FirmConfig, llm: LLM | None, prices: PriceData, run_dir: Path, run_id: str,
-                 loaders: dict) -> None:
+                 loaders: dict, sheets: _SheetCache | None = None) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         self.cfg, self.llm, self.prices, self.loaders = cfg, llm, prices, loaders
+        self.sheets = sheets if sheets is not None else _SheetCache(prices, loaders)
         self.run_dir, self.run_id = run_dir, run_id
         self.store = ForecastStore(run_dir / "forecasts.sqlite")
         self.lessons = LessonStore(run_dir / "lessons.jsonl")
@@ -346,7 +378,7 @@ class _CommitteePolicy:
     def __call__(self, d: pd.Timestamp, broker: PaperBroker, nav: float, prev_nav: float | None,
                  marks: dict[str, float], nav_path: list[float]) -> tuple[list[Order], MarketSnapshot, dict]:
         as_of = _day(d)
-        _, factsheets = gather_data(self.cfg, as_of, live=False, prices=self.prices, **self.loaders)
+        factsheets = self.sheets.get(self.cfg, as_of)
         if self.state is None:
             self.state = RiskState(peak_nav=nav_path[0] if nav_path else nav)
         held = broker.positions()
@@ -534,8 +566,13 @@ def _guarded(part: str, notes: list[str], fn: Callable[[], _T]) -> _T | None:
 
 def _evaluate(*, cfg: FirmConfig, strat_cfg: FirmConfig, prices: PriceData, days: pd.DatetimeIndex,
               rebalance_days: set[pd.Timestamp], end: str, sim: _Sim, q_sim: _Sim | None, returns: pd.Series,
-              bench_total_pct: float, factor_prices: PriceData | None, downloaded: bool, start: str) -> Evaluation:
-    """Compute every part of :class:`Evaluation` from a finished run (no new decisions)."""
+              bench_total_pct: float, factor_prices: PriceData | None, downloaded: bool, start: str,
+              contamination_end: str | None = None, clean_returns: pd.Series | None = None) -> Evaluation:
+    """Compute every part of :class:`Evaluation` from a finished run (no new decisions).
+
+    With ``contamination_end`` (the run's training cutoff plus buffer) the skill evidence
+    uses only decisions made after it and ``clean_returns`` (the returns earned under those
+    decisions); see :class:`Evaluation`."""
     ev = cfg.evaluation
     proc = strat_cfg.process
     bench = cfg.universe.benchmark.upper()
@@ -545,22 +582,45 @@ def _evaluate(*, cfg: FirmConfig, strat_cfg: FirmConfig, prices: PriceData, days
     notes = out.notes
     engine_total = float((sim.nav.iloc[-1] / sim.nav.iloc[0] - 1.0) * 100.0)
 
-    ic = _guarded("signal IC", notes, lambda: information_coefficients(
-        sim.decisions, prices, names, bench, proc.horizon_days, proc.rebalance_every_days, end, ev.ic_min_names,
-        quant_decisions=q_sim.decisions if q_sim is not None else None))
-    if ic is not None:
-        out.ic, out.ic_differences = ic
-        if POOL in out.ic:
-            out.power = _guarded("power analysis", notes,
-                                 lambda: power_analysis(out.ic[POOL], proc.rebalance_every_days, returns))
+    def clean(decisions: list[dict]) -> list[dict]:
+        return decisions if contamination_end is None else [d for d in decisions if d["as_of"] > contamination_end]
+
+    decisions = clean(sim.decisions)
+    q_decisions = clean(q_sim.decisions) if q_sim is not None else None
+    skill_returns = returns if contamination_end is None or clean_returns is None else clean_returns
+    out.clean_after, out.n_decisions, out.n_clean_decisions = contamination_end, len(sim.decisions), len(decisions)
+    if contamination_end is not None and len(decisions) < len(sim.decisions):
+        full = _guarded("signal IC (whole window, contaminated)", notes, lambda: information_coefficients(
+            sim.decisions, prices, names, bench, proc.horizon_days, proc.rebalance_every_days, end, ev.ic_min_names,
+            quant_decisions=q_sim.decisions if q_sim is not None else None))
+        if full is not None:
+            out.contaminated_ic, out.contaminated_ic_differences = full
+        if decisions:
+            notes.append(f"skill evidence (IC, power, random books, factor alpha) uses the {len(decisions)} decisions "
+                         f"made after {contamination_end} only; the {len(sim.decisions) - len(decisions)} earlier "
+                         "ones may rest on memorised outcomes (P10)")
+        else:
+            notes.append(f"no decision was made after {contamination_end} (training cutoff plus buffer): IC, power, "
+                         "random books and factor alpha have no clean dates; the whole-window IC includes "
+                         "contaminated decisions and is not evidence of skill")
+
+    if decisions:
+        ic = _guarded("signal IC", notes, lambda: information_coefficients(
+            decisions, prices, names, bench, proc.horizon_days, proc.rebalance_every_days, end, ev.ic_min_names,
+            quant_decisions=q_decisions))
+        if ic is not None:
+            out.ic, out.ic_differences = ic
+            if POOL in out.ic:
+                out.power = _guarded("power analysis", notes,
+                                     lambda: power_analysis(out.ic[POOL], proc.rebalance_every_days, skill_returns))
 
     rate = realised_cost_rate(sim.decisions)
-    if ev.n_random_books > 0:
+    if ev.n_random_books > 0 and decisions:
         sectors: dict[str, str] = {}
         for rec in sim.decisions:
             sectors.update(rec.get("sectors") or {})
         out.random_books = _guarded("random books", notes, lambda: random_books(
-            build_schedule(sim.decisions, prices, days, names, bench, sectors), prices, ev.n_random_books,
+            build_schedule(decisions, prices, days, names, bench, sectors), prices, ev.n_random_books,
             ev.random_seed, rate, engine_total, sector_matched=ev.random_books_sector_matched))
 
     markets: dict[tuple[str, frozenset[str]], MarketSnapshot] = {}
@@ -575,11 +635,14 @@ def _evaluate(*, cfg: FirmConfig, strat_cfg: FirmConfig, prices: PriceData, days
     if out.costs is not None and not out.costs.replay_matches_engine:
         notes.append("re-executing the recorded decisions at 1x costs did not reproduce the engine's NAV; the cost "
                      "sensitivity is approximate")
+    if out.costs is not None and contamination_end is not None and len(decisions) < len(sim.decisions):
+        notes.append("the cost sensitivity and breakeven re-execute every recorded decision, contaminated ones "
+                     "included: they describe the whole run, not clean skill")
 
     if ev.factor_proxies:
         def factors() -> FactorAttribution | None:
             fp = _factor_proxy_prices(cfg, prices, factor_prices, downloaded, start, end, notes)
-            result, why = factor_attribution(returns, fp)
+            result, why = factor_attribution(skill_returns, fp, invested=sim.invested)
             notes.extend(n for n in why if n not in notes)
             return result
         out.factors = _guarded("factor attribution", notes, factors)
@@ -645,21 +708,48 @@ def _report_or_none(r: pd.Series, bench: pd.Series, n_trials: int) -> Performanc
     return performance_report(r, bench.reindex(r.index), n_trials=n_trials)
 
 
-def _count_trials(path: Path, fingerprint: str, mode: str, start: str, end: str) -> int:
-    """Distinct (fingerprint, mode, start, end) trials in the trial ledger, including this one.
+# Modules whose source decides what the language models are asked and how their answers are
+# used: editing a prompt is a strategy change even though it lives in code, not in the config.
+PROMPT_MODULES = ("aifirm.agents.analysts", "aifirm.agents.committee", "aifirm.agents.risk_review",
+                  "aifirm.agents.reflection", "aifirm.agents.news_reader", "aifirm.agents.roles",
+                  "aifirm.agents.tier_gate")
+
+
+def prompt_digest() -> str:
+    """Short hash of the source of :data:`PROMPT_MODULES` (the prompts, the evidence rules,
+    the role slices and the code that reads the answers). It is part of an LLM-stage trial's
+    identity in the trial ledger, so a prompt edit counts as a new configuration for the
+    deflated Sharpe even though the config fingerprint does not see it. Any edit to those
+    modules counts, comments included (the conservative direction: more trials, a higher bar)."""
+    h = hashlib.sha256()
+    for name in PROMPT_MODULES:
+        h.update(name.encode())
+        h.update(inspect.getsource(importlib.import_module(name)).encode())
+    return h.hexdigest()[:16]
+
+
+def _trial_key(fingerprint: str, mode: str, start: str, end: str, prompts: str = "") -> tuple[str, ...]:
+    return (fingerprint, mode, start, end, prompts if mode != "quant" else "")
+
+
+def _count_trials(path: Path, fingerprint: str, mode: str, start: str, end: str, prompts: str = "") -> int:
+    """Distinct (fingerprint, mode, start, end, prompts) trials in the trial ledger, including this one.
 
     The backtest window is part of the trial: re-running one configuration over many
     windows and keeping the best is the same selection DSR corrects for. Re-running the
     identical (configuration, mode, window) is not a new trial. Every ledger row carries
-    its window, so older rows count correctly too."""
-    trials = {(fingerprint, mode, start, end)}
+    its window, so older rows count correctly too. ``prompts`` (:func:`prompt_digest`)
+    identifies the prompt code of an offline or llm run (ignored in quant mode, which sends
+    no prompt); rows written before it was recorded count with an empty digest."""
+    trials = {_trial_key(fingerprint, mode, start, end, prompts)}
     if path.exists():
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
             try:
                 entry = json.loads(line)
-                trials.add((str(entry["fingerprint"]), str(entry["mode"]), str(entry["start"]), str(entry["end"])))
+                trials.add(_trial_key(str(entry["fingerprint"]), str(entry["mode"]), str(entry["start"]),
+                                      str(entry["end"]), str(entry.get("prompts") or "")))
             except (json.JSONDecodeError, KeyError, TypeError):
                 log.warning("%s line %d is not a valid trial record; skipped", path, n)
     return len(trials)
@@ -751,7 +841,8 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     # the strategy
     strat_cfg = quant_only_config(cfg) if mode == "quant" else cfg
     strat_llm = make_offline_llm() if mode == "offline" else llm
-    policy = _CommitteePolicy(strat_cfg, strat_llm, prices, run_dir, run_id, loaders)
+    sheets = _SheetCache(prices, loaders)          # built once per date, shared with the quant-only baseline
+    policy = _CommitteePolicy(strat_cfg, strat_llm, prices, run_dir, run_id, loaders, sheets)
     sim, card = policy.run(prices, days, rebalance_days, end_s)
     warnings = list(policy.warnings)
 
@@ -764,7 +855,7 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
     q_sim: _Sim | None = None
     if mode != "quant":
         q_policy = _CommitteePolicy(quant_only_config(cfg), None, prices, run_dir / "quant_only",
-                                    f"{run_id}-quant", loaders)
+                                    f"{run_id}-quant", loaders, sheets)
         q_sim, _ = q_policy.run(prices, days, rebalance_days, end_s)
         baseline_returns["quant_only"] = q_sim.nav.pct_change().iloc[1:]
         baseline_sims["quant_only"] = q_sim
@@ -784,7 +875,8 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
         universe_note = ""
     if universe_note:
         warnings.insert(0, f"SURVIVORSHIP: {universe_note}")
-    n_trials = _count_trials(trials_path, fingerprint, mode, start_s, end_s)
+    prompts = prompt_digest() if mode != "quant" else ""
+    n_trials = _count_trials(trials_path, fingerprint, mode, start_s, end_s, prompts)
     reports = {"strategy": performance_report(returns, bench_ret, sim.turnover, sim.costs, n_trials=n_trials),
                "benchmark": performance_report(bench_ret, bench_ret)}
     for name, s in baseline_sims.items():
@@ -799,14 +891,19 @@ def run_backtest(cfg: FirmConfig, start: str, end: str, mode: str, llm: LLM | No
         pre = _report_or_none(returns[contaminated], bench_ret, n_trials)
         post = _report_or_none(returns[~contaminated], bench_ret, n_trials)
 
+    clean_returns = None
+    if contamination_end is not None:      # returns earned under a decision made after the contaminated period
+        clean_returns = returns[in_force.notna() & (in_force > pd.Timestamp(contamination_end))]
     evaluation = _evaluate(cfg=cfg, strat_cfg=strat_cfg, prices=prices, days=days, rebalance_days=rebalance_days,
                            end=end_s, sim=sim, q_sim=q_sim, returns=returns,
                            bench_total_pct=reports["benchmark"].total_return_pct, factor_prices=factor_prices,
-                           downloaded=downloaded, start=start_s)
+                           downloaded=downloaded, start=start_s, contamination_end=contamination_end,
+                           clean_returns=clean_returns)
 
     _append_trial(trials_path, {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run_id": run_id, "fingerprint": fingerprint, "mode": mode,
-        "start": start_s, "end": end_s, "days": reports["strategy"].days,
+        "start": start_s, "end": end_s, "days": reports["strategy"].days, "universe_digest": cfg.universe_digest(),
+        "prompts": prompts,
         "sharpe": _finite_or_none(reports["strategy"].sharpe),
         "total_return_pct": _finite_or_none(reports["strategy"].total_return_pct),
     })

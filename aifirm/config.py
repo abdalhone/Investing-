@@ -30,6 +30,13 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, ValidationInfo, field_validator, model_validator
 
+from .universes import file_tickers, preset_tickers
+
+# Calendar days after a model's training cutoff that still count as contaminated (research
+# 7.2: vendor cutoffs are unreliable). One rule for the backtest's contaminated period and the
+# forecast store's ``pre_cutoff`` flag (evaluation.cutoff_buffer_days overrides it per config).
+DEFAULT_CUTOFF_BUFFER_DAYS = 31
+
 # Training-data cutoffs per model. Forecasts made on dates BEFORE a model's cutoff may be
 # contaminated by memorized outcomes, so backtests report those periods separately and
 # never count them as evidence of skill. If a model is missing here, the cutoff is
@@ -172,8 +179,10 @@ class ScreenConfig(_Section):
 
     When ``enabled``, the investable universe is the union of the bundled ``preset``, the
     tickers listed in ``file`` and the inline ``tickers`` (plus ``universe.tickers``, which are
-    always covered). Every decision then: (1) builds cheap fact sheets for the whole universe
-    (prices, SEC fundamentals; no news, no LLM), (2) scores the deterministic quant over the
+    always covered). Every decision then: (1) builds fact sheets for the whole universe
+    (prices, SEC fundamentals, no LLM; in a live run the headline feed is fetched for every
+    name too, but only the deep-dive names' headlines are read by the news reader and every
+    other name's are withheld unread), (2) scores the deterministic quant over the
     whole cross-section, (3) keeps names that pass the point-in-time filters (last close at
     least ``risk.min_price``, 20-day average dollar volume at least ``min_dollar_volume``, a
     recent price), and (4) sends the top ``deep_dive_top_n`` of them by quant probability
@@ -266,8 +275,9 @@ class ProcessConfig(_Section):
     news_enabled: bool = True
     max_llm_cost_usd_per_run: float = 10.0
     combination: str = Field("overlay", description="How the quant core and the LLM analysts combine (RESEARCH 6.6). "
-                                                    "'overlay': p_final = p_quant + clip(p_llm - p_quant, +/- max tilt), "
-                                                    "the LLM pool only tilts the quant inside a bound; 'pool': every "
+                                                    "'overlay': p_final = p_quant + clip(p_llm - 0.5, +/- max tilt), "
+                                                    "the LLM pool's own edge tilts the quant inside a bound (an LLM pool "
+                                                    "at 0.5 leaves the quant unchanged); 'pool': every "
                                                     "analyst, quant included, is one member of the trimmed log-odds pool.")
     overlay_max_tilt: float = Field(0.05, description="Largest move (in probability) the LLM pool may apply to the quant "
                                                       "core. Halved, then set to 0, when resolved forecasts show the LLM "
@@ -280,8 +290,11 @@ class ProcessConfig(_Section):
                                                         "typed, tier-labelled events; analysts never see raw headline text.")
     news_max_headlines: int = Field(20, description="Most recent headlines read per ticker and cycle.")
     news_isolate_untrusted: bool = Field(True, description="Read tier A/B and tier C headlines in separate reader calls.")
-    tier_gate_enabled: bool = Field(True, description="Cap a bullish LLM view at 0.5 unless it cites admissible evidence "
-                                                      "(a non-news fact, a filing, or a tier A/B news event).")
+    tier_gate_enabled: bool = Field(True, description="Cap a bullish LLM view (P > 0.5 or excess > 0) at 0.5 and excess "
+                                                      "0 unless a positive evidence item free of tier-C news cites a "
+                                                      "directional fact, a filing or a tier A/B news event (the events "
+                                                      "analyst needs a filing or tier A/B news); a raised revision "
+                                                      "needs the same support in its new evidence.")
 
     _RANGES: ClassVar[dict[str, _Range]] = {
         "horizon_days": _Range(1, 252),                 # trading days: one day to one year
@@ -305,16 +318,20 @@ class ProcessConfig(_Section):
 class CalibrationConfig(_Section):
     """Per-agent Platt calibration of LLM analyst probabilities before pooling
     (:mod:`aifirm.journal.calibration`). Fitted point-in-time from resolved forecasts; the
-    identity until an agent has ``min_n`` resolved questions; shrunk toward the identity by
+    identity until an agent has ``min_n`` resolved questions from at least ``min_dates``
+    distinct decision dates; shrunk toward the identity by
     a prior worth ``prior_strength`` forecasts. Forecast records keep the RAW probability.
     The deterministic quant is never calibrated."""
 
     enabled: bool = True
     min_n: int = Field(30, description="Resolved questions an agent needs before its map moves from the identity.")
+    min_dates: int = Field(20, description="Distinct resolved decision dates an agent needs before its map moves from "
+                                           "the identity (one date's questions share one market episode).")
     prior_strength: float = Field(50.0, description="Pseudo-forecasts at the identity that the fit is shrunk toward.")
 
     _RANGES: ClassVar[dict[str, _Range]] = {
         "min_n": _Range(0, 1_000_000),
+        "min_dates": _Range(0, 10_000),
         "prior_strength": _Range(0.0, 1e9),
     }
 
@@ -435,7 +452,7 @@ class EvaluationConfig(_Section):
                                                       "multiplied by each k and the SAME decisions are re-executed.")
     breakeven_cap: float = Field(50.0, description="Largest cost multiplier searched for the breakeven; beyond it the "
                                                    "breakeven is reported as '> cap'.")
-    cutoff_buffer_days: int = Field(31, description="Calendar days after a model's training cutoff that still count as "
+    cutoff_buffer_days: int = Field(DEFAULT_CUTOFF_BUFFER_DAYS, description="Calendar days after a model's training cutoff that still count as "
                                                     "contaminated (vendor cutoffs are unreliable; research 7.2).")
     ic_min_names: int = Field(5, description="Fewest names with a forecast and a realised return for a date's "
                                              "rank IC to count.")
@@ -540,17 +557,76 @@ class FirmConfig(_Section):
             p = (self._source_dir if self._source_dir is not None else Path.cwd()) / p
         return p.resolve()
 
+    def investable_tickers(self) -> list[str]:
+        """Investable tickers in config order: upper-cased, de-duplicated, benchmark excluded
+        (the benchmark is the passive core, never an active name).
+
+        With ``universe.screen`` enabled the list is ``universe.tickers`` followed by the
+        screen's sources: the bundled ``preset``, the tickers in ``file`` (relative to the
+        config file, :meth:`screen_file_path`) and the inline ``tickers``. An unknown preset
+        raises ``KeyError`` and a missing file ``FileNotFoundError`` (fail loudly: a silently
+        empty universe would never trade and never say why)."""
+        bench = self.universe.benchmark.upper()
+        sources = list(self.universe.tickers)
+        scr = self.universe.screen
+        if scr.enabled:
+            if scr.preset.strip():
+                sources += preset_tickers(scr.preset)
+            if scr.file.strip():
+                sources += file_tickers(self.screen_file_path())
+            sources += list(scr.tickers)
+        out: list[str] = []
+        for t in sources:
+            u = t.strip().upper()
+            if u and u != bench and u not in out:
+                out.append(u)
+        return out
+
+    def universe_digest(self) -> str:
+        """Short hash of :meth:`investable_tickers` (what the firm can trade), for the trial
+        ledger; ``"unreadable"`` when the screen's universe file or preset cannot be read."""
+        try:
+            names = self.investable_tickers()
+        except (OSError, KeyError, ValueError):
+            return "unreadable"
+        return hashlib.sha256(json.dumps(names).encode()).hexdigest()[:16]
+
     def fingerprint(self) -> str:
         """Stable hash of the configuration (used to count distinct trials for the deflated Sharpe).
 
         ``runs_dir`` is left out: where results are written is not a strategy choice, and
         the same config must not count as a new trial because its path was resolved or moved.
-        ``evaluation`` is left out too: it changes what a backtest report measures, never a
-        decision, so re-scoring the same strategy with another null or cost grid is not a
-        new trial (and configs written before the section existed keep their fingerprint)."""
+        ``evaluation`` is left out too: it changes what a backtest report measures, so
+        re-scoring the same strategy with another null or cost grid is not a new trial (and
+        configs written before the section existed keep their fingerprint). The one
+        exception is ``evaluation.cutoff_buffer_days`` when it differs from
+        :data:`DEFAULT_CUTOFF_BUFFER_DAYS`: it also sets which real-LLM forecasts are
+        flagged ``pre_cutoff`` and therefore which track record believability, calibration
+        and the overlay bound may use, so it can change a decision.
+
+        With ``universe.screen`` enabled the screen's *sources* (``preset``, ``file``,
+        ``tickers``) are replaced by the resolved universe (:meth:`investable_tickers`): two
+        runs over different tickers listed in one file are different trials, and the same
+        tickers reached through another path, a relative or an absolute file name, or a
+        preset are the same trial. If the universe cannot be read, the raw sources are
+        hashed instead (the run itself then fails loudly). Prompt text is code, not
+        configuration: editing a prompt does not change the fingerprint (change the config's
+        ``name`` to count a prompt edit as a new trial)."""
         dump = self.model_dump(exclude={"runs_dir", "evaluation"})
         if not dump["universe"]["ciks"]:      # added later: an unused pin must not change existing fingerprints
             del dump["universe"]["ciks"]
+        if self.evaluation.cutoff_buffer_days != DEFAULT_CUTOFF_BUFFER_DAYS:
+            dump["cutoff_buffer_days"] = self.evaluation.cutoff_buffer_days
+        scr = dump["universe"]["screen"]
+        if scr["enabled"]:
+            try:
+                resolved = self.investable_tickers()
+            except (OSError, KeyError, ValueError):
+                resolved = None
+            if resolved is not None:
+                for k in ("preset", "file", "tickers"):
+                    scr.pop(k, None)
+                scr["resolved_universe"] = resolved
         blob = json.dumps(dump, sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 

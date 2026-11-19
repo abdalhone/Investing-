@@ -411,3 +411,34 @@ def test_a_book_holding_the_whole_universe_is_flagged_as_a_weak_null():
                        cost_rate=0.0, engine_total_return_pct=0.0)
     assert res.min_distinct_books == 1
     assert any("held 6 of the 6 eligible names, which leaves only 1 distinct book:" in n for n in res.notes)
+
+
+@pytest.mark.parametrize("invested", [0.2, 0.7, 1.0])
+def test_cash_that_earns_nothing_in_the_simulator_is_not_negative_alpha(invested):
+    """Regression: y = r - BIL charged the T-bill rate on uninvested cash that earns 0 in the
+    paper broker, so a book holding x of NAV in SPY and nothing else showed alpha
+    -(1 - x) * BIL with a huge t-stat. With the invested fraction the intercept is ~0 and the
+    cash drag is reported separately."""
+    adj = _proxy_prices()
+    adj["BIL"] = 100 * np.cumprod(np.full(len(adj), 1 + 0.04 / 252))     # a 4% T-bill rate
+    r = adj.pct_change(fill_method=None)
+    strat = (invested * r["SPY"]).iloc[1:]                                # cash earns 0
+    exposure = pd.Series(invested, index=adj.index)
+    naive, _ = factor_attribution(strat, adj)
+    fa, _ = factor_attribution(strat, adj, invested=exposure)
+    assert naive.alpha_annual_pct == pytest.approx(-(1 - invested) * 4.0, abs=0.05)   # the artifact
+    assert fa.alpha_annual_pct == pytest.approx(0.0, abs=1e-6) and fa.loadings["market"] == pytest.approx(invested)
+    assert fa.cash_drag_annual_pct == pytest.approx((1 - invested) * 4.0, abs=0.05)
+    assert fa.mean_invested == pytest.approx(invested)
+    assert naive.cash_drag_annual_pct is None
+
+
+def test_invested_fraction_of_the_previous_close_earns_the_day():
+    adj = _proxy_prices(n=300)
+    r = adj.pct_change(fill_method=None)
+    x = pd.Series(np.where(np.arange(len(adj)) < 150, 0.0, 1.0), index=adj.index)   # buys at the close of day 149
+    strat = (x.shift(1) * r["SPY"]).iloc[1:]
+    fa, _ = factor_attribution(strat, adj, invested=x)
+    days_in_cash = 150                                                  # return days 1..150 were earned by cash
+    assert fa.cash_drag_annual_pct == pytest.approx(0.0001 * days_in_cash / fa.n_obs * 252 * 100, rel=1e-9)
+    assert fa.mean_invested == pytest.approx(1 - days_in_cash / fa.n_obs)

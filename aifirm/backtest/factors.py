@@ -22,7 +22,20 @@ Contract
   ============== ================= ==========================================
 
   Cash is BIL (1-3 month T-bills). Without BIL the cash return is taken as 0 and a note
-  says so. The dependent variable is the strategy's daily net return minus cash.
+  says so.
+* **The dependent variable matches the simulator.** The paper broker pays no interest on
+  cash, so a book that is ``x`` invested earns ``x * R_assets + (1 - x) * 0``. Subtracting
+  the full T-bill return (``r - rf``) would charge ``(1 - x) * rf`` of cash drag to the
+  intercept: a book holding 20% SPY and nothing else would show an alpha of about
+  ``-0.8 * rf`` per year with a huge t-statistic, which is not selection. With
+  ``invested`` (the daily fraction of NAV in positions, ``BacktestResult.exposure``),
+  the dependent variable is ``r_t - x_{t-1} * rf_t``, where ``x_{t-1}`` is the fraction
+  invested at the previous close (the book that earned day t's return); the cash leg is
+  compared with the 0 it actually earned. ``cash_drag_annual_pct`` reports the T-bill
+  return the uninvested cash forwent, ``mean((1 - x_{t-1}) * rf_t) * 252``, separately: a
+  cost of holding cash, never alpha. Without ``invested`` the book is treated as fully
+  invested (``y = r - rf``; ``cash_drag_annual_pct`` and ``mean_invested`` are None). The
+  backtest always passes it.
 * A factor is used only if both its legs have returns on at least
   :data:`MIN_COVERAGE` of the strategy's return days; otherwise it is dropped with a note
   (for example momentum before 2013). Without the market factor nothing is reported.
@@ -74,6 +87,10 @@ class FactorAttribution:
     hac_lags: int
     cash_proxy: str | None              # None: cash return taken as 0
     notes: list[str] = field(default_factory=list)
+    # T-bill return forgone on uninvested cash (annualised %, the simulator pays none); None
+    # when the invested fraction was not given
+    cash_drag_annual_pct: float | None = None
+    mean_invested: float | None = None
 
 
 def _proxy_returns(proxies: PriceData | pd.DataFrame, days: pd.DatetimeIndex) -> pd.DataFrame:
@@ -82,14 +99,18 @@ def _proxy_returns(proxies: PriceData | pd.DataFrame, days: pd.DatetimeIndex) ->
 
 
 def factor_attribution(returns: pd.Series, proxies: PriceData | pd.DataFrame | None,
-                       factors: Sequence[tuple[str, str, str | None]] = FACTORS
-                       ) -> tuple[FactorAttribution | None, list[str]]:
-    """Regress daily strategy ``returns`` minus cash on the available ETF factor proxies.
+                       factors: Sequence[tuple[str, str, str | None]] = FACTORS, *,
+                       invested: pd.Series | None = None) -> tuple[FactorAttribution | None, list[str]]:
+    """Regress daily strategy ``returns`` minus the cash the book actually held at the
+    T-bill rate on the available ETF factor proxies (module docstring).
 
     ``proxies``: prices (or a frame of adjusted closes) holding some of
-    :data:`PROXY_TICKERS`. Returns ``(result, notes)``; ``result`` is None, with notes
-    saying why, when proxies are missing, the market factor is unavailable, or there are
-    too few days for a regression. Never raises for missing data."""
+    :data:`PROXY_TICKERS`. ``invested``: the daily fraction of NAV in positions at each
+    close (``BacktestResult.exposure``); day t's return is charged ``x_{t-1} * rf_t``, with
+    gaps forward-filled and values clipped to [0, 1]; None treats the book as fully
+    invested. Returns ``(result, notes)``; ``result`` is None, with notes saying why, when
+    proxies are missing, the market factor is unavailable, or there are too few days for a
+    regression. Never raises for missing data."""
     notes: list[str] = []
     r = returns.dropna()
     if proxies is None:
@@ -124,8 +145,16 @@ def factor_attribution(returns: pd.Series, proxies: PriceData | pd.DataFrame | N
     if "market" not in cols:
         return None, [*notes, "factor attribution skipped: the market factor (SPY) is unavailable"]
     frame = pd.DataFrame(cols)
-    frame["y"] = r - cash
+    if invested is not None and len(invested.dropna()):
+        prev = invested.astype(float).sort_index().shift(1).reindex(r.index.union(invested.index)).ffill()
+        x_prev = prev.reindex(r.index).fillna(1.0).clip(0.0, 1.0)
+    else:
+        x_prev = None          # treated as fully invested (the documented default)
+    frame["y"] = r - (cash if x_prev is None else x_prev * cash)
+    frame["_drag"] = 0.0 if x_prev is None else (1.0 - x_prev) * cash
+    frame["_x"] = 1.0 if x_prev is None else x_prev
     frame = frame.dropna()
+    drag, xs = frame.pop("_drag"), frame.pop("_x")
     names = [c for c in frame.columns if c != "y"]
     if len(frame) < max(MIN_OBS, len(names) + 10):
         return None, [*notes, f"factor attribution skipped: only {len(frame)} days with every factor"]
@@ -140,4 +169,6 @@ def factor_attribution(returns: pd.Series, proxies: PriceData | pd.DataFrame | N
         loadings={n: float(fit.coef[i + 1]) for i, n in enumerate(names)},
         loading_t={n: float(fit.t[i + 1]) for i, n in enumerate(names)},
         alpha_annual_pct=float(fit.coef[0] * TRADING_DAYS * 100), alpha_t=float(fit.t[0]), r2=fit.r2,
-        n_obs=fit.n, hac_lags=fit.lags, cash_proxy=cash_name, notes=notes), notes
+        n_obs=fit.n, hac_lags=fit.lags, cash_proxy=cash_name, notes=notes,
+        cash_drag_annual_pct=None if x_prev is None else float(drag.mean() * TRADING_DAYS * 100),
+        mean_invested=None if x_prev is None else float(xs.mean())), notes

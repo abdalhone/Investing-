@@ -902,7 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--breakeven-cap", type=float, metavar="X",
                    help="largest cost multiplier searched for the breakeven")
     g.add_argument("--cutoff-buffer-days", type=int, metavar="N", help="days after the model's training cutoff still "
-                                                                       "counted as contaminated")
+                                                                       "counted as contaminated (also which LLM forecasts "
+                                                                       "count as clean track record, so a non-default "
+                                                                       "value changes the fingerprint)")
     g.add_argument("--ic-min-names", type=int, metavar="N", help="fewest names for one date's rank IC to count")
     g.add_argument("--no-factor-proxies", action="store_true", help="skip the ETF factor regression (no download)")
     _strategy_flags(p)

@@ -139,13 +139,16 @@ def test_evaluation_flags_never_change_the_fingerprint_and_strategy_flags_do(env
     cfg = cli._load_config(env.config)
     assert cli._apply_flags(cfg, _ns()) is cfg
     ev = cli._apply_flags(cfg, _ns(random_books=50, seed=7, sector_matched_books=True, cost_multipliers="0,1,3",
-                                   breakeven_cap=20.0, cutoff_buffer_days=10, ic_min_names=4, no_factor_proxies=True,
+                                   breakeven_cap=20.0, cutoff_buffer_days=31, ic_min_names=4, no_factor_proxies=True,
                                    no_shadow=True))
     assert ev.fingerprint() == cfg.fingerprint()
     e = ev.evaluation
     assert (e.n_random_books, e.random_seed, e.random_books_sector_matched, e.cost_multipliers, e.breakeven_cap,
             e.cutoff_buffer_days, e.ic_min_names, e.factor_proxies, e.shadow_book) == \
-        (50, 7, True, [0.0, 1.0, 3.0], 20.0, 10, 4, False, False)
+        (50, 7, True, [0.0, 1.0, 3.0], 20.0, 31, 4, False, False)
+    # a non-default buffer also moves the pre_cutoff flags (which track record counts): a new trial
+    buf = cli._apply_flags(cfg, _ns(cutoff_buffer_days=10))
+    assert buf.evaluation.cutoff_buffer_days == 10 and buf.fingerprint() != cfg.fingerprint()
     for flags, check in ((dict(combination="pool"), lambda c: c.process.combination == "pool"),
                          (dict(max_tilt=0.02), lambda c: c.process.overlay_max_tilt == 0.02),
                          (dict(no_calibration=True), lambda c: not c.calibration.enabled),
@@ -208,7 +211,9 @@ def test_backtest_flags_reach_the_run_and_the_console_states_the_six_lines(env, 
     assert "+5 days: contaminated through" in out and "SURVIVORSHIP" in out
     report = next((env.runs / "backtests").glob("*offline*/report.md")).read_text()
     assert "## Value added by the language models (vs the quant-only baseline, net of LLM cost)" in report
-    assert "30 random books" in report or "Each of 30 random books" in report
+    # every synthetic decision precedes the cutoff: the random books (skill evidence) are not computed on
+    # contaminated decisions, and the report says why
+    assert "Each of 30 random books" not in report and "**Clean decisions only.**" in report
 
 
 # ----------------------------------------------------------------------------- compare and --shadow
@@ -222,7 +227,7 @@ def test_compare_with_no_book_and_shadow_flags(env, prices, capsys):
     capsys.readouterr()
     assert cli.main(["compare", "--config", env.config, "--offline", "--as-of", _day(prices, DAY + 1), "--json"]) == 0
     out = capsys.readouterr().out
-    assert "OFFLINE BOOK" in out and "Cumulative LLM spend since inception: $0.00." in out
+    assert "OFFLINE BOOK" in out and "Cumulative LLM spend since inception: $0.00 on the decisions reflected" in out
     assert "not yet measurable: 0 of " in out
     payload = json.loads(out[out.index("{"):])
     assert payload["nav_date"] == _day(prices, DAY + 1) and payload["live_cycles"] == 2

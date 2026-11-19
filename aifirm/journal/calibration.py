@@ -42,8 +42,13 @@ fitted to that agent's *resolved* forecasts:
   map would move a view across 0.5, and leaves a raw 0.5 at 0.5: calibration can shrink,
   neutralise or mildly sharpen a view, but an LLM's "bullish" never becomes "bearish"
   (or the reverse) by code, and no direction is created where the agent stated none.
-* **Minimum sample.** With fewer than ``min_n`` questions (default 30) the map is the
-  identity.
+* **Minimum sample.** With fewer than ``min_n`` questions (default 30), or questions from
+  fewer than ``min_dates`` distinct decision dates (default 20, the same bar as
+  believability weights), the map is the identity. One decision date resolves many
+  questions that share one market episode: a 12-name deep dive reaches 30 questions after
+  3 dates, and the intercept would then learn those dates' cross-sectional base rate of
+  beating the benchmark (a market effect, not the agent's bias) and neutralise every
+  bullish view. Dates, not questions, are the unit of independent evidence here.
 * **Deterministic.** Records are sorted (decision date, id) before use and the solver is a
   fixed Newton iteration: the same records and ``as_of`` give the same parameters.
 
@@ -76,6 +81,7 @@ from .forecasts import COMMITTEE_AGENT, POOLED_AGENTS, question_key
 PROB_CLIP = 0.01                 # inputs clipped to [0.01, 0.99] before logit (same as pooling)
 OUTPUT_FLOOR = 0.02              # calibrated probabilities stay in [0.02, 0.98] (same floor as sanitize_view)
 DEFAULT_MIN_N = 30
+DEFAULT_MIN_DATES = 20
 DEFAULT_PRIOR_STRENGTH = 50.0
 DEFAULT_A_BOUNDS = (-0.5, 0.5)
 DEFAULT_B_BOUNDS = (0.0, 1.5)
@@ -306,14 +312,17 @@ def fit_calibrators(records: Iterable[ForecastRecord], as_of: str, agents: Itera
                     prior_strength: float = DEFAULT_PRIOR_STRENGTH,
                     a_bounds: tuple[float, float] = DEFAULT_A_BOUNDS,
                     b_bounds: tuple[float, float] = DEFAULT_B_BOUNDS,
-                    models: Iterable[str] | None = None) -> dict[str, Calibrator]:
+                    models: Iterable[str] | None = None, min_dates: int = DEFAULT_MIN_DATES) -> dict[str, Calibrator]:
     """One :class:`Calibrator` per agent in ``agents``, usable for a decision at the close of
     ``as_of`` (module docstring). Agents with fewer than ``min_n`` distinct resolved
-    questions get the identity (``fitted=False``) with their in-sample Brier still
-    reported. ``models``: if given, only records made by these models count (a model
-    change is a new agent, RESEARCH 6.2)."""
+    questions, or whose questions span fewer than ``min_dates`` distinct decision dates,
+    get the identity (``fitted=False``) with their in-sample Brier still reported.
+    ``models``: if given, only records made by these models count (a model change is a new
+    agent, RESEARCH 6.2)."""
     if min_n < 0:
         raise ValueError(f"min_n must be non-negative, got {min_n}")
+    if min_dates < 0:
+        raise ValueError(f"min_dates must be non-negative, got {min_dates}")
     _check_bounds(a_bounds, b_bounds, prior_strength)
     as_of_s = _day(as_of)
     recs_all = list(records)
@@ -333,6 +342,12 @@ def fit_calibrators(records: Iterable[ForecastRecord], as_of: str, agents: Itera
         stats = dict(n=n, n_records=len(recs), brier_raw=brier_raw, **common)
         if n < min_n:
             out[agent] = identity(agent, f"{n} resolved questions < min_n={min_n}: identity",
+                                  brier_calibrated=brier_raw, **stats)
+            continue
+        n_dates = len({_day(r.as_of) for r in recs})
+        if n_dates < min_dates:
+            out[agent] = identity(agent, f"{n} resolved questions from only {n_dates} decision dates < "
+                                         f"min_dates={min_dates}: identity (one date is one market episode)",
                                   brier_calibrated=brier_raw, **stats)
             continue
         a, b, bound = fit_platt(probs, outcomes, weights, prior_strength=prior_strength,
@@ -475,6 +490,7 @@ class PairedIC(NamedTuple):
     n_dates: int        # dates on which both ICs exist
     mean_a: float       # mean IC of agent_a over those dates
     mean_b: float       # mean IC of agent_b over those dates
+    n_thin: int = 0     # dates both agents forecast but on fewer than max(2, min_names) common names (skipped)
 
 
 def paired_rank_ic(records: Iterable[ForecastRecord], as_of: str, agent_a: str, agent_b: str, *,
@@ -489,14 +505,21 @@ def paired_rank_ic(records: Iterable[ForecastRecord], as_of: str, agent_a: str, 
     either ranking is constant is skipped). The per-date difference ``IC_a - IC_b`` is
     averaged over dates, with a t-statistic (Newey-West with ``nw_lags`` when horizons
     overlap). Comparing on common names matters: an agent that only forecasts a hand-picked
-    subset must not be compared with another agent's IC over a different cross-section."""
+    subset must not be compared with another agent's IC over a different cross-section.
+    ``n_thin`` counts the dates skipped because the two agents shared fewer than
+    ``max(2, min_names)`` names, so a caller can say why nothing is measurable (a deep-dive
+    band narrower than ``min_names`` never produces a date)."""
     as_of_s = _day(as_of)
     recs = list(records)
     a = _scores_by_date(recs, as_of_s, agent_a, include_pre_cutoff, models)
     b = _scores_by_date(recs, as_of_s, agent_b, include_pre_cutoff, models)
     diffs, ics_a, ics_b = [], [], []
+    thin = 0
     for d in sorted(set(a) & set(b)):
         common = sorted(set(a[d]) & set(b[d]))
+        if len(common) < max(2, min_names):
+            thin += 1
+            continue
         ia = _date_ic({t: a[d][t] for t in common}, min_names)
         ib = _date_ic({t: b[d][t] for t in common}, min_names)
         if ia is None or ib is None:
@@ -505,6 +528,6 @@ def paired_rank_ic(records: Iterable[ForecastRecord], as_of: str, agent_a: str, 
         ics_a.append(ia)
         ics_b.append(ib)
     if not diffs:
-        return PairedIC(math.nan, math.nan, 0, math.nan, math.nan)
+        return PairedIC(math.nan, math.nan, 0, math.nan, math.nan, thin)
     return PairedIC(float(np.mean(diffs)), _newey_west_t(diffs, max(0, int(nw_lags))), len(diffs),
-                    float(np.mean(ics_a)), float(np.mean(ics_b)))
+                    float(np.mean(ics_a)), float(np.mean(ics_b)), thin)

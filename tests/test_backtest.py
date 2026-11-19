@@ -391,23 +391,52 @@ def test_decision_records_carry_every_signal_for_the_evaluation(offline_result):
 
 def test_every_backtest_is_evaluated(quant_result, offline_result):
     from aifirm.backtest.ic import POOL, QUANT_ONLY
-    for r in (quant_result, offline_result):
-        ev = r.evaluation
-        assert ev is not None and ev.horizon_days == 21 and ev.step_days == 21
-        assert ev.ic[POOL].n_dates > 0 and math.isfinite(ev.ic[POOL].mean) and ev.ic[POOL].method == "iid"
-        assert ev.power is not None and ev.power.n_dates == ev.ic[POOL].n_dates
-        assert ev.random_books is not None and ev.random_books.n_books == 1000
-        assert 0.0 <= ev.random_books.percentile_return <= 100.0 and 0.0 < ev.random_books.p_value_return <= 1.0
-        assert ev.costs is not None and ev.costs.replay_matches_engine
-        assert ev.factors is not None and ev.factors.factors == ["market"]     # synthetic data holds SPY only
-        assert any("size factor skipped" in n for n in ev.notes)
-    assert QUANT_ONLY not in quant_result.evaluation.ic and quant_result.evaluation.costs.quant_total_return_pct is None
+    ev = quant_result.evaluation                       # no model, no contamination: every decision counts
+    assert ev is not None and ev.horizon_days == 21 and ev.step_days == 21 and ev.clean_after is None
+    assert ev.ic[POOL].n_dates > 0 and math.isfinite(ev.ic[POOL].mean) and ev.ic[POOL].method == "iid"
+    assert ev.power is not None and ev.power.n_dates == ev.ic[POOL].n_dates
+    assert ev.random_books is not None and ev.random_books.n_books == 1000
+    assert 0.0 <= ev.random_books.percentile_return <= 100.0 and 0.0 < ev.random_books.p_value_return <= 1.0
+    assert ev.costs is not None and ev.costs.replay_matches_engine
+    assert ev.factors is not None and ev.factors.factors == ["market"]     # synthetic data holds SPY only
+    assert any("size factor skipped" in n for n in ev.notes) and not ev.contaminated_ic
+    assert QUANT_ONLY not in ev.ic and ev.costs.quant_total_return_pct is None
+    # offline on synthetic 2024 data: every decision precedes the configured models' cutoff + buffer, so
+    # no skill evidence is clean; the whole-window IC is kept apart, labelled contaminated
     off = offline_result.evaluation
-    assert QUANT_ONLY in off.ic and any((d.a, d.b) == (POOL, QUANT_ONLY) for d in off.ic_differences)
+    assert off.clean_after == offline_result.contamination_end and off.n_clean_decisions == 0
+    assert not off.ic and not off.ic_differences and off.power is None and off.random_books is None
+    assert off.factors is None and any("no decision was made after" in n for n in off.notes)
+    assert QUANT_ONLY in off.contaminated_ic and any((d.a, d.b) == (POOL, QUANT_ONLY)
+                                                     for d in off.contaminated_ic_differences)
     assert off.costs.quant_total_return_pct is not None and off.costs.vs_quant is not None
-    assert {"agent:technical", "agent:quant"} <= set(off.ic)
+    assert {"agent:technical", "agent:quant"} <= set(off.contaminated_ic)
     # the quant analyst inside the committee and the quant-only baseline forecast identically
-    assert off.ic["agent:quant"].mean == pytest.approx(off.ic[QUANT_ONLY].mean)
+    assert off.contaminated_ic["agent:quant"].mean == pytest.approx(off.contaminated_ic[QUANT_ONLY].mean)
+
+
+def test_skill_evidence_uses_only_decisions_after_the_contaminated_period(prices, tmp_path, monkeypatch):
+    """Regression (P10): IC, paired IC, power, random books and factor alpha were computed over
+    every decision, so a memorising model's pre-cutoff 'skill' reached the verdicts. With the
+    cutoff mid-window they use only the clean decisions; the whole window is kept apart."""
+    from aifirm import config as config_mod
+    from aifirm.backtest.engine import run_models
+    from aifirm.backtest.ic import POOL
+    cfg = _cfg(tmp_path)
+    mid = _day(prices, 440)
+    for m in run_models(cfg, "offline"):
+        monkeypatch.setitem(config_mod.MODEL_TRAINING_CUTOFFS, m, mid)
+    cfg.evaluation.cutoff_buffer_days = 0
+    r = _bt(cfg, prices, mode="offline", start=380, end=540)
+    ev = r.evaluation
+    clean = [d for d in r.decisions if d["as_of"] > mid]
+    assert r.contamination_end == mid and ev.clean_after == mid
+    assert 0 < ev.n_clean_decisions == len(clean) < ev.n_decisions == len(r.decisions)
+    assert ev.ic[POOL].n_dates <= len(clean) < ev.contaminated_ic[POOL].n_dates
+    assert ev.random_books is not None and ev.random_books.n_rebalances <= len(clean)
+    assert ev.factors is not None and ev.factors.n_obs < len(r.returns)
+    md = render_backtest_report(r)
+    assert "**Clean decisions only.**" in md and "contaminated decisions included (for reference only" in md
 
 
 def test_replaying_the_recorded_decisions_reproduces_the_run_and_doubling_costs_lowers_returns(quant_result,
@@ -588,3 +617,19 @@ def test_interpretation_reads_the_evaluation_without_overclaiming(quant_result):
     ev.costs.vs_benchmark = Breakeven("found", 1.5, 50.0, 8, 8.0)
     ev.costs.strategy_total_return_pct[2.0] = ev.costs.benchmark_total_return_pct - 1.0
     assert "The result does not survive 2x costs" in render_backtest_report(r)
+
+
+def test_a_prompt_edit_is_a_new_trial_for_llm_stages_only(tmp_path):
+    """Regression (doc mismatch): prompt edits are code, so they never counted as trials; the
+    trial key of an offline or llm run now carries a digest of the prompt modules."""
+    import json as _json
+    from aifirm.backtest.engine import _count_trials, prompt_digest
+    path = tmp_path / "trials.jsonl"
+    rows = [dict(fingerprint="f", mode="llm", start="2024-01-01", end="2024-06-30", prompts="p1"),
+            dict(fingerprint="f", mode="quant", start="2024-01-01", end="2024-06-30")]
+    path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    assert _count_trials(path, "f", "llm", "2024-01-01", "2024-06-30", "p1") == 2       # same prompts: no new trial
+    assert _count_trials(path, "f", "llm", "2024-01-01", "2024-06-30", "p2") == 3       # edited prompts: a new one
+    assert _count_trials(path, "f", "quant", "2024-01-01", "2024-06-30", "p2") == 2     # quant sends no prompt
+    d = prompt_digest()
+    assert len(d) == 16 and d == prompt_digest()

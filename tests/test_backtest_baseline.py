@@ -78,3 +78,31 @@ def test_quant_mode_has_no_value_added_section(prices, tmp_path):
     r = run_backtest(cfg, _day(prices, 480), _day(prices, 520), "quant", prices=prices, **LOADERS)
     assert r.overlay_value() is None and "quant_only" not in r.baseline_nav
     assert "Value added by the language models" not in render_backtest_report(r)
+
+
+def test_fact_sheets_are_built_once_per_decision_and_shared_with_the_baseline(prices, tmp_path):
+    """Regression (cost): the quant-only baseline rebuilt byte-identical fact sheets, doubling the
+    dominant cost of a screened backtest (SEC fundamentals for every name, every decision). The
+    loaders are now called once per (ticker, date), and both books see the same sheets."""
+    from collections import Counter
+    calls: Counter = Counter()
+
+    def fundamentals(t, d):
+        calls[(t, d)] += 1
+        return LOADERS["fundamentals_loader"](t, d)
+
+    cfg = make_config(str(tmp_path))
+    r = run_backtest(cfg, _day(prices, 480), _day(prices, 520), "offline", prices=prices,
+                     **{**LOADERS, "fundamentals_loader": fundamentals})
+    assert calls and set(calls.values()) == {1}
+    n_dec = len(r.decisions)
+    assert len({d for _, d in calls}) == n_dec and len(r.baseline_nav["quant_only"]) == len(r.nav)
+    def sheets(path):
+        return [{k: v for k, v in e["payload"].items() if k != "run_id"} for e in Ledger(path).entries()
+                if e["event"] == "factsheet"]
+    strategy, baseline = sheets(f"{r.run_dir}/ledger.jsonl"), sheets(f"{r.run_dir}/quant_only/ledger.jsonl")
+    assert strategy and strategy == baseline
+
+
+def test_a_deep_dive_band_too_narrow_for_the_ic_is_warned(screened):
+    assert any("deep_dive_top_n = 2 is below the 5 names" in w for w in screened.warnings)

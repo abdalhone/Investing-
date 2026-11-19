@@ -63,8 +63,8 @@ MAX_PRINT_LAG_ROWS = 5          # a missing close is bridged by the previous one
 Z_T2 = 2.0
 Z_POWER_80 = float(norm.ppf(0.975) + norm.ppf(0.80))     # 2.80: 80% power, 5% two-sided
 
-POOL = "pool"                          # the committee's believability-weighted pool (the strategy's signal)
-POOL_EQUAL = "pool_equal_weight"       # the same pool with unit weights (P7 shadow)
+POOL = "pool"                          # the firm's final probability (the strategy's signal; see probability_tables)
+POOL_EQUAL = "pool_equal_weight"       # the same with the LLM pool's weights equal (P7 shadow)
 QUANT_ONLY = "quant_only"              # the quant-only baseline's pool (its own run)
 AGENT_PREFIX = "agent:"
 
@@ -77,9 +77,9 @@ FORWARD_RETURN_DEFINITION = (
 def label_name(label: str) -> str:
     """Human name of an IC series label."""
     if label == POOL:
-        return "Committee pool (believability-weighted)"
+        return "Firm's final probability (traded)"
     if label == POOL_EQUAL:
-        return "Committee pool (equal weight)"
+        return "Final probability, equal-weight pool"
     if label == QUANT_ONLY:
         return "Quant-only baseline"
     if label.startswith(AGENT_PREFIX):
@@ -142,9 +142,12 @@ def probability_tables(decisions: Sequence[Mapping], quant_decisions: Sequence[M
     """Probability of beating the benchmark per decision date (rows) and ticker (columns),
     one table per signal, from the backtest's decision records:
 
-    * :data:`POOL`: the committee's final pooled probability (believability-weighted, after
-      any challenge round), the probability the strategy traded on;
-    * :data:`POOL_EQUAL`: the equal-weight shadow of the same pool;
+    * :data:`POOL`: the firm's final probability, the one the strategy traded on (after any
+      challenge round). For a deep-dive name it is the committee's aggregate: in overlay
+      mode (the default) the quant core plus the bounded LLM tilt, in pool mode the
+      believability-weighted pool of every member. For a screened name outside the deep
+      dive it is the quant's probability;
+    * :data:`POOL_EQUAL`: the same with the LLM views pooled at equal weights;
     * ``agent:<name>``: each analyst's sealed probability (the mean over its samples);
     * :data:`QUANT_ONLY`: the quant-only baseline's pool, when ``quant_decisions`` is given.
 

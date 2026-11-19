@@ -69,7 +69,7 @@ rules (not AI); it exercises every stage of the committee.
 
 | Requirement | Where it is checked | Status |
 |---|---|---|
-| Planted leaks caught | Unit tests per leak type: future prices scrambled after a cut (`tests/test_backtest.py::test_backtest_has_no_look_ahead`), a filing accepted after the 16:00 close is not known that day, macro prints hidden until released, partial intraday bars dropped, headlines after the close dropped, lessons, forecasts, believability, calibration, the overlay bound and the screen all point-in-time | **Partly.** Several leak types, each with one or a few instances; there is no 4 × 12 planted-leak suite. |
+| Planted leaks caught | Unit tests per leak type: future prices scrambled after a cut (`tests/test_backtest.py::test_backtest_has_no_look_ahead`), a filing accepted after the close (16:00, or 13:00 on a half day) is not known that day, macro prints hidden until released, partial intraday bars dropped, headlines after the close (half days included) dropped, a split after the decision cannot screen a name out, lessons, forecasts, believability, calibration, the overlay bound and the screen all point-in-time | **Partly.** Several leak types, each with one or a few instances; there is no 4 × 12 planted-leak suite. |
 | Future randomised after cuts | `tests/test_backtest.py::test_backtest_has_no_look_ahead` (one cut: NAV and decisions up to the cut unchanged); `tests/test_pipeline_wiring.py::test_backtest_with_a_screen_is_point_in_time_and_records_the_deep_dive` | **Partly.** One cut per test, not a cut on every decision day. |
 | Ledgers replay exactly | `aifirm verify-ledger` (hash chain plus the recorded head); tamper tests in `tests/test_ledger.py`; every backtest re-executes its recorded targets at 1× costs and checks that the NAV matches the engine (`replay_matches_engine`; a mismatch is printed in the report) | **Partly.** No tool re-runs a recorded live cycle from its ledger. |
 | Planted IC recovered | `tests/test_evaluation.py::test_a_planted_ic_of_about_005_is_recovered_with_a_positive_t_stat`: 100 names × 120 dates, planted IC about 0.05, requires a mean IC between 0.03 and 0.08 and t > 3; a pure-noise signal must have \|t\| < 2.5 | **Partly.** The planted IC is larger than the 0.02 to 0.03 the research asks for. |
@@ -148,6 +148,11 @@ a `reid_probe` entry in `<runs_dir>/reid/ledger.jsonl`.
   excluded, never counted as a miss);
 * joint hit rate minus joint chance ≤ 0.01;
 * joint Wilson 95% upper bound minus joint chance ≤ 0.02;
+* for the ticker and the month separately: hit rate minus chance ≤ 0.05, and Wilson 95%
+  lower bound minus chance ≤ 0.02 (a marginal significantly above chance fails even when
+  the joint rate passes: with 100 candidate tickers a model that dates every sheet but
+  never names the stock sits near joint chance, and the month alone is enough to recall
+  what happened next);
 * no payload contains the true ticker, the as-of date or the company name verbatim.
 
 The command exits with status 0 when the gate passes and 1 when it fails. Because the
@@ -157,8 +162,8 @@ chance; joint chance is 1/(candidates × months).
 **Not automated.** The backtest does not check for a passing report before a blind
 pre-cutoff LLM run: you must. **Known weakness:** blind mode keeps the SEC SIC sector
 label (scrubbed of the ticker and name). On real data it can nearly identify a company
-("Electronic Computers"). Expect it to cost re-identification power and check the ticker
-hit rate as well as the joint one.
+("Electronic Computers"). Expect it to cost re-identification power; the gate checks the
+ticker and month hit rates as well as the joint one.
 
 ## S3. Pre-cutoff development
 
@@ -170,15 +175,20 @@ returns.
 
 * Quant and offline backtests need no model and cannot memorise anything.
 * Every backtest appends a row to `<runs_dir>/trials.jsonl`. The number of distinct
-  (fingerprint, mode, start, end) trials raises the DSR bar.
+  (fingerprint, mode, start, end, prompts) trials raises the DSR bar.
 * Strategy flags (`--preset`, `--combination`, `--max-tilt`, `--no-calibration` and so
-  on) change the fingerprint, so each counts as a trial. Evaluation flags do not.
+  on) change the fingerprint, so each counts as a trial. Evaluation flags do not, except a
+  non-default `--cutoff-buffer-days` (it decides which LLM forecasts count as clean track
+  record). The fingerprint covers the resolved screened universe, so editing a universe
+  file is a new trial.
+* Prompts are code, not configuration: they do not change the fingerprint, but an
+  offline or LLM run's trial key carries `prompts`, a digest of the source of the prompt
+  modules (`backtest.engine.PROMPT_MODULES`), so a prompt edit counts as a new trial
+  (any edit to those modules does, comments included).
 
-**Not automated.** Nothing stops you from tuning prompts on pre-cutoff returns. Prompts
-are code, not configuration, so a prompt edit does **not** change the fingerprint and is
-not counted as a trial. If you edit prompts, change the config's `name` (it is part of the
-fingerprint, for example `name = "firm prompts v2"`) so the trial ledger counts the
-variant. Keep `trials.jsonl`: deleting it makes every DSR look better than it is.
+**Not automated.** Nothing stops you from tuning prompts on pre-cutoff returns; the
+ledger only counts the variants. Keep `trials.jsonl`: deleting it makes every DSR look
+better than it is.
 
 ## S4. Architecture selection on a vintage ladder
 
@@ -210,16 +220,23 @@ the six lines):
 | Weighted versus equal-weight pool | Paired table: weighted minus equal-weight pool | t ≥ 2 |
 | IC significance, corrected for trials | IC table, pool row; the interpretation | t ≥ 2, or t ≥ 3 when more than 20 trials are recorded |
 | DSR ≥ 0.95 | Line 5 of the six lines; "Statistical significance" | DSR ≥ 0.95 (not computed with a single trial: PSR is shown instead) |
-| Factor alpha t ≥ 2 | "Factor attribution (ETF proxies)": alpha and its HAC t-stat | t ≥ 2 |
+| Factor alpha t ≥ 2 | "Factor attribution (ETF proxies)": alpha and its HAC t-stat (the T-bill rate is charged only on the invested fraction, because the simulator pays no interest on cash; the cash drag is shown on its own line) | t ≥ 2 |
 | 95th percentile against random books | Line 6 of the six lines; random-books table | percentile ≥ 95 ("its stock selection beat random picks") |
 | Value of the LLM stages net of their cost | "Value added by the language models" | above zero (no significance test; use the paired IC) |
 | Power | "Power: how long until we would know" | "Anecdotal" unless the sample has the dates needed for 80% power |
 
-In overlay mode the "Committee pool" signal is the firm's final probability (the quant
-core plus the bounded LLM tilt), not a pure LLM pool, although the report labels it
-"believability-weighted" in both modes. Names outside the deep dive carry the quant's
-probability in both runs, so the paired test against the quant-only baseline measures
-what the LLM stages changed in the ranking.
+The report's "Firm's final probability (traded)" signal is the probability the firm sized
+from: in overlay mode (the default) the quant core plus the bounded LLM tilt, in pool mode
+the believability-weighted pool of every member. Names outside the deep dive carry the
+quant's probability in both runs, so the paired test against the quant-only baseline
+measures what the LLM stages changed in the ranking.
+
+When the run's models have a training cutoff (llm and offline modes), the IC, the paired
+differences, the power, the random books and the factor alpha use only the decisions made
+after `contamination_end` (training cutoff plus `evaluation.cutoff_buffer_days`). The
+whole-window IC is shown separately, labelled contaminated, and no verdict reads it; with
+no clean decision the report says so instead of quoting a number. The cost sensitivity
+still re-executes every recorded decision and says so.
 
 **Not automated.**
 

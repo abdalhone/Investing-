@@ -206,3 +206,24 @@ def test_screen_is_deterministic_whatever_the_input_order():
     assert set(a.to_dict()) >= {"ranking", "deep_dive", "n_universe", "n_eligible", "top_band"}
     with pytest.raises(ValueError):
         _screen(probs, top_n=0)
+
+
+def test_min_price_uses_the_as_traded_level_not_a_later_split_adjusted_close():
+    """Regression (look-ahead through splits): ``close`` is back-adjusted for every split up to
+    the download date. A stock that later split 40:1 shows 1.18 on the decision date although
+    it traded at 47.01, and the screen excluded it on a corporate action that had not happened
+    yet. The rule now reads the as-traded level, like the risk engine's price fact."""
+    idx = pd.bdate_range(end=AS_OF, periods=60)
+    adjusted = pd.DataFrame({"NV": np.full(60, 47.01 / 40), "OK": np.full(60, 50.0)}, index=idx)
+    raw = pd.DataFrame({"NV": np.full(60, 47.01), "OK": np.full(60, 50.0)}, index=idx)
+    vol = pd.DataFrame({"NV": np.full(60, 4e7), "OK": np.full(60, 1e6)}, index=idx)
+    splits = pd.DataFrame({"NV": [4.0, 10.0], "OK": [1.0, 1.0]},
+                          index=pd.to_datetime(["2025-07-20", "2028-06-10"]))     # both after the decision
+    prices = from_frames(adjusted, volume=vol, raw_close=raw, splits=splits)
+    res = _screen({"NV": 0.6, "OK": 0.55}, prices=prices)
+    nv = next(e for e in res.entries if e.ticker == "NV")
+    assert nv.eligible and nv.last_price == pytest.approx(47.01) and "NV" in res.deep_dive
+    assert nv.adv_usd == pytest.approx(47.01 / 40 * 4e7)              # dollar volume: close x volume, unchanged
+    low = from_frames(adjusted, volume=vol)                            # no separate as-traded series: close is it
+    res_low = _screen({"NV": 0.6, "OK": 0.55}, prices=low)
+    assert not next(e for e in res_low.entries if e.ticker == "NV").eligible

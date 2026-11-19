@@ -330,3 +330,37 @@ def test_the_factsheet_command_builds_one_sheet_even_with_a_screen(tmp_path, pri
     monkeypatch.setattr(cli, "last_completed_session", lambda now=None: _day(prices, DAY))
     assert cli.main(["factsheet", "AAA", "--config", str(tmp_path / "firm.toml"), "--as-of", _day(prices, DAY)]) == 0
     assert seen == [["AAA"]] and "FACT SHEET: AAA" in capsys.readouterr().out
+
+
+def test_the_live_headline_feed_honours_news_max_headlines(tmp_path, prices, monkeypatch):
+    """Regression: gather_data called recent_headlines with its own default of 12 items, so
+    process.news_max_headlines (20) never bound with the Yahoo feed."""
+    from aifirm import pipeline
+    seen = []
+
+    def feed(t, d, max_items=12, max_age_days=14, close_time=None):
+        seen.append(max_items)
+        return []
+
+    monkeypatch.setattr(pipeline, "recent_headlines", feed)
+    cfg = _cfg(tmp_path)
+    cfg.process.news_max_headlines = 17
+    gather_data(cfg, _day(prices, DAY), live=True, prices=prices, **LOADERS)
+    assert seen and set(seen) == {17}
+
+
+def test_a_failed_cycle_logs_the_llm_spend_it_already_made(tmp_path, prices, books, monkeypatch):
+    """Regression: cycle_error carried no usage, so the cost of a live attempt that called the
+    committee and then failed was dropped from the value-added arithmetic."""
+    from aifirm import pipeline
+
+    def broken(*a, **k):
+        raise RuntimeError("construct failed")
+
+    monkeypatch.setattr(pipeline, "construct_portfolio", broken)
+    book = books("failed")
+    with pytest.raises(RuntimeError, match="construct failed"):
+        _decide(_cfg(tmp_path), make_offline_llm(), prices, book)
+    err = book.events("cycle_error")
+    assert len(err) == 1 and err[0]["error"].startswith("RuntimeError: construct failed")
+    assert err[0]["usage"]["calls"] > 0 and "cost_usd" in err[0]["usage"]

@@ -10,8 +10,8 @@ records, never the text (see :meth:`aifirm.data.factsheet.FactSheet.attach_news_
 
 Contract of :func:`read_headlines`
 ----------------------------------
-1. **Point-in-time.** Only headlines whose parsed publish time is at or before the 16:00
-   New York close of ``as_of`` are read (:func:`aifirm.data.news.headlines_as_of`); a
+1. **Point-in-time.** Only headlines whose parsed publish time is at or before the New
+   York close of ``as_of`` (16:00, or 13:00 on a scheduled half day) are read (:func:`aifirm.data.news.headlines_as_of`); a
    headline without a parseable time is dropped. At most ``max_headlines`` (newest first).
 2. **Tier by code, first.** Each headline's tier comes from
    :func:`aifirm.data.news.source_tier` (publisher name + link host + maintained table)
@@ -47,7 +47,8 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from ..data.news import DECISION_CLOSE_TIME, Headline, TierAssignment, headlines_as_of, published_utc, source_tier
+from ..data.calendar import session_close_time
+from ..data.news import Headline, TierAssignment, headlines_as_of, published_utc, source_tier
 from ..llm.client import LLM, CallRecord
 from ..schemas import NEWS_EVENT_TYPES, NewsEvent, NewsReading, ReaderEvent
 
@@ -84,13 +85,39 @@ _URL = re.compile(r"(?:\b(?:https?|ftp)://|\bwww\.)\S+|\b[\w.+-]+@[\w-]+\.[\w.]+
                   r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|biz|info|co|ru|xyz|ly|me|app|ai|gov|news)\b(?:/\S*)?", re.I)
 _CLAUSE_SPLIT = re.compile(r"(?<=[.;!?:])\s+|\s*\n+\s*")
 _ROLE_WORD = re.compile(r"^\W*(?:system|assistant|user|developer|human)\W*$", re.I)
-_INVISIBLE = re.compile(r"[\u0000-\u001f\u007f-\u009f​-‏ -‮⁠-⁤﻿]")
 _SUMMARY_ALLOWED = re.compile(r"[^\w\s.,;'&()/-]", re.UNICODE)
+# Default-ignorable characters that are not format characters (category Cf): they render as
+# nothing, so they can hide text from a reader of the log while a model still reads around them.
+_IGNORABLE_EXTRA = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F, 0x3164, 0xFFA0})
+_DELETED_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cn", "Cs"})
+_SPACE_CONTROLS = frozenset("\t\n\r\x0b\x0c\x1c\x1d\x1e\x1f\x85")
+
+
+def _invisible(ch: str) -> bool:
+    cp = ord(ch)
+    return (unicodedata.category(ch) in _DELETED_CATEGORIES or cp in _IGNORABLE_EXTRA
+            or 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF)      # variation selectors
 
 
 def _plain(text: str) -> str:
-    """NFKC-normalised text without control or invisible formatting characters."""
-    return _INVISIBLE.sub(" ", unicodedata.normalize("NFKC", text or ""))
+    """NFKC-normalised text with every invisible character *deleted*.
+
+    Deleted: control characters (Cc), format characters (Cf: zero-width spaces and joiners,
+    bidi controls, the soft hyphen, word joiners, interlinear annotation marks, and the
+    Unicode tag characters U+E0000-E007F used for "ASCII smuggling"), private-use (Co),
+    unassigned (Cn) and surrogate (Cs) code points, and the other default-ignorable
+    characters (U+034F, Hangul fillers, variation selectors, ...). Deleting rather than
+    replacing them with a space matters: "dis<ZWSP>regard prev<ZWSP>ious instruc<ZWSP>tions"
+    becomes "disregard previous instructions", which the injection detector recognises,
+    instead of "dis regard prev ious ..." which it would miss although a model reads it.
+    Line breaks, tabs and the Unicode line and paragraph separators become a plain space."""
+    out: list[str] = []
+    for ch in unicodedata.normalize("NFKC", text or ""):
+        if ch in _SPACE_CONTROLS or unicodedata.category(ch) in ("Zl", "Zp"):
+            out.append(" ")
+        elif not _invisible(ch):
+            out.append(ch)
+    return "".join(out)
 
 
 def looks_like_instruction(text: str) -> bool:
@@ -168,7 +195,8 @@ def reader_user_prompt(ticker: str, as_of: str, numbered: list[tuple[int, Headli
     (title and feed summary only; publisher and link are withheld because code, not the
     reader, judges the source)."""
     lines = [f"COMPANY TICKER: {ticker}",
-             f"DECISION DATE: {as_of} (every headline below was published at or before the 16:00 New York close)",
+             f"DECISION DATE: {as_of} (every headline below was published at or before the {session_close_time(as_of)} "
+             "New York close)",
              f"HEADLINES ({len(numbered)} untrusted data block{'s' if len(numbered) != 1 else ''}):", ""]
     for idx, h in numbered:
         lines.append(f'<headline index="{idx}">')
@@ -264,14 +292,15 @@ def read_headlines(llm: LLM, ticker: str, headlines: list[Headline], as_of: str,
                    model: str = DEFAULT_READER_MODEL, effort: str = "low", max_tokens: int = 4000,
                    issuer_domains: tuple[str, ...] | list[str] = (), max_headlines: int = MAX_HEADLINES,
                    max_events_per_headline: int = MAX_EVENTS_PER_HEADLINE,
-                   isolate_untrusted: bool = True, close_time: str = DECISION_CLOSE_TIME) -> NewsReadResult:
+                   isolate_untrusted: bool = True, close_time: str | None = None) -> NewsReadResult:
     """Read one ticker's headlines as of the close of ``as_of`` (module docstring).
 
     Returns a :class:`NewsReadResult` whose ``events`` are validated, sanitized and tiered
     by code, in headline order (newest first). On any reader failure ``events`` is empty,
     ``failed`` is True and ``gaps`` explains that news could not be read (fail closed).
-    No model call is made when there is nothing to read. ``close_time``: the session's New
-    York close (pass "13:00" on an early-close day)."""
+    No model call is made when there is nothing to read. ``close_time``: the New York close
+    of the session; None (the default) is the exchange's own close for ``as_of``, 13:00 on a
+    scheduled half day and 16:00 otherwise (:mod:`aifirm.data.calendar`)."""
     ticker = ticker.upper()
     as_of_s = str(as_of)[:10]
     result = NewsReadResult(ticker=ticker, as_of=as_of_s, n_headlines_in=len(headlines))

@@ -37,9 +37,11 @@ import os
 from dataclasses import dataclass, field
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from .cache import DiskCache, default_cache
+from .calendar import session_close_hours
 from .http import sec_get_json
 
 FLOW_CONCEPTS: dict[str, list[str]] = {
@@ -208,12 +210,15 @@ def _submissions_page(page: dict, cache: DiskCache | None = None) -> dict:
                             ttl_seconds=None, kind="json")
 
 
-DECISION_CUTOFF = pd.Timedelta(hours=16)   # decisions are taken at the 16:00 ET close
+DECISION_CUTOFF = pd.Timedelta(hours=16)   # the regular 16:00 ET close (13:00 on a half day: decision_cutoff)
 
 
 def decision_cutoff(as_of: date | str | pd.Timestamp) -> pd.Timestamp:
-    """The moment (naive US/Eastern) at which a decision dated ``as_of`` is taken."""
-    return pd.Timestamp(as_of).normalize() + DECISION_CUTOFF
+    """The moment (naive US/Eastern) at which a decision dated ``as_of`` is taken: the
+    session's close, 16:00, or 13:00 on a scheduled half day (:mod:`aifirm.data.calendar`),
+    so a filing accepted after a 13:00 close is not known at that close."""
+    day = pd.Timestamp(as_of).normalize()
+    return day + pd.Timedelta(hours=session_close_hours(day))
 
 
 def _accepted_et(values: list) -> pd.Series:
@@ -350,30 +355,53 @@ def _choose_concept(facts: dict, candidates: list[str], as_of: pd.Timestamp, uni
     return best
 
 
+_NS_PER_DAY = 86_400 * 10**9
+
+
 def quarterly_series(df: pd.DataFrame) -> pd.Series:
-    """Rebuild 3-month values (indexed by period end) from 10-Q/10-K duration facts."""
+    """Rebuild 3-month values (indexed by period end) from 10-Q/10-K duration facts.
+
+    * A duration of 80-100 days is a quarter; the last such row per period end wins (rows
+      in ``df`` order).
+    * A missing quarter is derived from year-to-date differences: for each longer duration
+      (> 100 days, in ``df`` order) whose end has no quarter yet, subtract the latest
+      shorter YTD value with the same start (within 3 days) that is 80-100 days shorter
+      (most importantly Q4 = FY - 9M); failing that, a 6-month YTD minus the earliest
+      3-month first quarter with the same start.
+
+    Vectorised with NumPy (the hot path of every fact sheet: it runs for each candidate XBRL
+    concept of each name at each decision); the result is identical to the row-by-row
+    pandas version it replaced, ties included (the same quicksort order on the same
+    subsets), which ``tests/test_data_layer.py`` checks against a reference copy."""
     if df is None or df.empty or "start" not in df.columns:
         return pd.Series(dtype=float)
-    df = df.dropna(subset=["start"]).copy()
-    df["days"] = (df["end"] - df["start"]).dt.days
-    q = {row.end: float(row.val) for row in df[(df.days >= 80) & (df.days <= 100)].itertuples()}
-    ytd = df[(df.days > 100)]
-    # derive missing quarters from YTD differences (most importantly Q4 = FY - 9M)
-    for row in ytd.itertuples():
-        if row.end in q:
+    df = df.dropna(subset=["start"])
+    start = df["start"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    end = df["end"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    val = df["val"].to_numpy(dtype=float)
+    days = (end - start) // _NS_PER_DAY          # floor, like Timedelta.days
+    is_q = (days >= 80) & (days <= 100)
+    q: dict[int, float] = {}
+    for i in np.flatnonzero(is_q):
+        q[int(end[i])] = float(val[i])
+    yi = np.flatnonzero(days > 100)
+    ys, ye, yd, yv = start[yi], end[yi], days[yi], val[yi]
+    for k in range(len(yi)):
+        e = int(ye[k])
+        if e in q:
             continue
-        shorter = ytd[(abs((ytd.start - row.start).dt.days) <= 3) & (ytd.end < row.end)]
-        shorter = shorter[(row.days - shorter.days).between(80, 100)]
-        if not shorter.empty:
-            s = shorter.sort_values("end").iloc[-1]
-            q[row.end] = float(row.val) - float(s.val)
+        cand = np.flatnonzero((np.abs((ys - ys[k]) // _NS_PER_DAY) <= 3) & (ye < ye[k]))
+        gap = yd[k] - yd[cand]
+        cand = cand[(gap >= 80) & (gap <= 100)]
+        if cand.size:
+            latest = cand[np.argsort(ye[cand], kind="quicksort")[-1]]
+            q[e] = float(yv[k]) - float(yv[latest])
             continue
-        if 80 <= row.days - 91 <= 100:  # 6M YTD with only a 3M first quarter
-            first = df[(abs((df.start - row.start).dt.days) <= 3) & df.days.between(80, 100)]
-            if not first.empty:
-                q[row.end] = float(row.val) - float(first.sort_values("end").iloc[0].val)
-    s = pd.Series(q, dtype=float).sort_index()
-    return s
+        if 80 <= yd[k] - 91 <= 100:  # 6M YTD with only a 3M first quarter
+            first = np.flatnonzero((np.abs((start - ys[k]) // _NS_PER_DAY) <= 3) & is_q)
+            if first.size:
+                q[e] = float(yv[k]) - float(val[first[np.argsort(end[first], kind="quicksort")[0]]])
+    return pd.Series({pd.Timestamp(k): v for k, v in q.items()}, dtype=float).sort_index()
 
 
 def ttm_from_quarters(q: pd.Series, offset: int = 0) -> tuple[float, pd.Timestamp] | None:

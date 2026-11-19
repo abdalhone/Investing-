@@ -140,6 +140,9 @@ class ViewRecord(BaseModel):
     weight: float = 1.0           # believability weight used in aggregation
     revised_prob: float | None = None
     revised_excess_pct: float | None = None
+    # The fact IDs an accepted revision cited as new evidence (resolved, unblinded). The tier
+    # gate checks a revision that raises the view against these, not against the sealed evidence.
+    revision_fact_ids: list[str] = []
 
 
 class AggregatedView(BaseModel):
@@ -147,8 +150,9 @@ class AggregatedView(BaseModel):
 
     ``combination="pool"``: the believability-weighted, trimmed log-odds pool of every
     member (the quant included). ``combination="overlay"`` (RESEARCH 6.6): the quant core
-    tilted by the pooled LLM analysts, ``prob_outperform = prob_quant + clip(prob_llm -
-    prob_quant, +/- max_tilt)``; ``overlay_tilt`` is the tilt applied. ``prob_quant`` and
+    tilted by the pooled LLM analysts' own edge, ``prob_outperform = clip(prob_quant +
+    clip(prob_llm - 0.5, +/- max_tilt), 0, 1)`` (an LLM pool at 0.5 is no information and
+    leaves the quant core unchanged); ``overlay_tilt`` is the tilt applied. ``prob_quant`` and
     ``prob_llm`` are recorded in both modes when they exist (``prob_llm`` is the pool of the
     LLM analysts' calibrated, tier-gated probabilities; None when every LLM analyst abstained
     or none sits on the committee). ``combination=""`` marks a view built outside the
@@ -171,12 +175,18 @@ class AggregatedView(BaseModel):
 
 
 class TargetPosition(BaseModel):
+    """One leg of a target book. ``ideal_weight`` is the weight construction aimed for before
+    the trade path (no-trade band, partial rebalancing, turnover cap): the un-derisked plan
+    the risk engine's drawdown de-risk caps at one half. None when the target was not built
+    by :func:`aifirm.portfolio.construct.construct_portfolio` (a hold, a replay, a test)."""
+
     ticker: str
     weight: float
     prob_outperform: float
     expected_excess_return_pct: float
     rationale: str
     constraints_hit: list[str] = []
+    ideal_weight: float | None = None
 
 
 class TargetPortfolio(BaseModel):

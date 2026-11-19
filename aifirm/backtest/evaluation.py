@@ -201,7 +201,19 @@ def cost_sensitivity(replay_strategy: Callable[[float], float], benchmark_total_
 @dataclass
 class Evaluation:
     """Everything that answers "is there skill, and would we know?" for one backtest.
-    A part is None when it could not be computed; ``notes`` says why."""
+    A part is None when it could not be computed; ``notes`` says why.
+
+    Contamination (P10). When the run's language models have a training cutoff
+    (``clean_after`` is the backtest's ``contamination_end``), the skill evidence is
+    computed on clean decisions only, those made after ``clean_after``: ``ic``,
+    ``ic_differences`` and ``power`` from the clean decision dates, ``random_books`` from the
+    clean rebalances, ``factors`` from the returns earned under clean decisions. A model
+    that remembers pre-cutoff outcomes would otherwise show "skill" there. The whole-window
+    IC, contaminated decisions included, is kept apart in ``contaminated_ic`` /
+    ``contaminated_ic_differences`` for reference only and is never read as evidence. With
+    no clean decision those parts are empty or None and a note says so. ``costs`` (the
+    breakeven) re-executes every recorded decision, contaminated ones included; a note
+    says so. Without a cutoff (quant mode) ``clean_after`` is None and every decision counts."""
 
     horizon_days: int
     step_days: int                                   # rebalance_every_days
@@ -213,3 +225,8 @@ class Evaluation:
     costs: CostSensitivity | None = None
     factors: FactorAttribution | None = None
     notes: list[str] = field(default_factory=list)
+    clean_after: str | None = None                   # contamination_end: only later decisions are evidence
+    n_decisions: int = 0
+    n_clean_decisions: int = 0
+    contaminated_ic: dict[str, ICStats] = field(default_factory=dict)
+    contaminated_ic_differences: list[ICDifference] = field(default_factory=list)

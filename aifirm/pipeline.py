@@ -81,10 +81,10 @@ from .data.prices import PriceData, load_prices
 from .journal import (COMMITTEE_AGENT, Calibrator, ForecastStore, Ledger, LessonStore, believability_weights,
                       fit_calibrators, make_forecast_records)
 from .llm.client import LLM, CallRecord, OfflineLLM
+from .portfolio.overlay import IC_MIN_NAMES
 from .portfolio import (OverlayBound, RiskState, adaptive_bound, apply_risk_limits, construct_portfolio,
                         orders_from_target, update_risk_state)
 from .quant import QUANT_AGENT, ScreenResult, quant_views, screen_universe
-from .universes import file_tickers, preset_tickers
 from .schemas import (AggregatedView, ForecastRecord, Lesson, Order, RiskReview, TargetPortfolio, TargetPosition,
                       ViewRecord)
 
@@ -120,29 +120,11 @@ def _short(exc: BaseException) -> str:
 
 
 def universe(cfg: FirmConfig) -> list[str]:
-    """Investable tickers in config order: upper-cased, de-duplicated, benchmark excluded
-    (the benchmark is the passive core, never an active name).
-
-    With ``universe.screen`` enabled the list is ``universe.tickers`` followed by the
-    screen's sources: the bundled ``preset``, the tickers in ``file`` (relative to the
-    config file, :meth:`FirmConfig.screen_file_path`) and the inline ``tickers``. An
-    unknown preset raises ``KeyError`` and a missing file ``FileNotFoundError`` (fail
-    loudly: a silently empty universe would never trade and never say why)."""
-    bench = cfg.universe.benchmark.upper()
-    sources = list(cfg.universe.tickers)
-    scr = cfg.universe.screen
-    if scr.enabled:
-        if scr.preset.strip():
-            sources += preset_tickers(scr.preset)
-        if scr.file.strip():
-            sources += file_tickers(cfg.screen_file_path())
-        sources += list(scr.tickers)
-    out: list[str] = []
-    for t in sources:
-        u = t.strip().upper()
-        if u and u != bench and u not in out:
-            out.append(u)
-    return out
+    """Investable tickers in config order (:meth:`FirmConfig.investable_tickers`): upper-cased,
+    de-duplicated, benchmark excluded, with the screen's preset, file and inline tickers when
+    ``universe.screen`` is enabled. An unknown preset raises ``KeyError`` and a missing file
+    ``FileNotFoundError``."""
+    return cfg.investable_tickers()
 
 
 def quant_only_config(cfg: FirmConfig) -> FirmConfig:
@@ -218,7 +200,8 @@ def gather_data(cfg: FirmConfig, as_of: str, live: bool, prices: PriceData | Non
     fund_fn = fundamentals_loader or (lambda t, d: load_fundamentals(t, d, cik=pins.get(t)))
     filings_fn = filings_loader or (lambda t, d: recent_filings(t, d, FILINGS_LOOKBACK_DAYS, cik=pins.get(t)))
     macro_fn = macro_loader or macro_snapshot
-    news_fn = headlines_loader or recent_headlines
+    # the feed's own cap must not undercut process.news_max_headlines (the reader caps again)
+    news_fn = headlines_loader or (lambda t, d: recent_headlines(t, d, max_items=cfg.process.news_max_headlines))
     want_news = live and cfg.process.news_enabled
 
     shared_gaps: list[str] = []
@@ -732,8 +715,12 @@ def decide(cfg: FirmConfig, llm: LLM | None, as_of: str, prices: PriceData, fact
                        current_weights=current_weights, nav=nav, prev_nav=prev_nav, risk_state=risk_state,
                        forecast_store=forecast_store, lesson_store=lesson_store, ledger=ledger, run_id=run_id,
                        positions=positions, runs_dir=runs_dir or str(cfg.runs_path()), nav_marks=nav_marks)
-    except Exception as exc:
-        log("cycle_error", {"error": _short(exc)})
+    except Exception as exc:     # the spend of a failed attempt is real money: log it with the error
+        try:
+            usage: dict | None = _usage_summary(model.usage.calls[calls_before:])
+        except Exception:  # noqa: BLE001 - never let the accounting hide the original error
+            usage = None
+        log("cycle_error", {"error": _short(exc), "usage": usage})
         raise
 
 
@@ -754,8 +741,13 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
         warnings.append("process.combination is 'overlay' but the quant analyst is not enabled: every name's core is "
                         "0.5, so the LLM pool can move probabilities by at most the overlay bound")
 
-    # 2a. the quant over the whole cross-section; the screen picks the deep-dive set (code, no LLM)
     screen_on = cfg.universe.screen.enabled
+    if overlay and screen_on and cfg.universe.screen.deep_dive_top_n < IC_MIN_NAMES:
+        warnings.append(f"universe.screen.deep_dive_top_n = {cfg.universe.screen.deep_dive_top_n} is below the "
+                        f"{IC_MIN_NAMES} names a date's paired IC needs: unless enough names are held, the adaptive "
+                        "overlay bound and the shadow-book ranking test can never be measured")
+
+    # 2a. the quant over the whole cross-section; the screen picks the deep-dive set (code, no LLM)
     want_quant = (QUANT_AGENT in cfg.analysts.enabled or screen_on) and bool(tickers)
     qviews = quant_views([factsheets[t] for t in tickers], cfg.process.horizon_days) if want_quant else {}
     screen: ScreenResult | None = None
@@ -802,7 +794,7 @@ def _decide(cfg: FirmConfig, llm: LLM | None, model: LLM, mode: str, as_of: str,
     if cfg.calibration.enabled and llm_analysts(cfg):
         calibrators = fit_calibrators(records, as_of, llm_analysts(cfg), include_pre_cutoff=include_pre,
                                       min_n=cfg.calibration.min_n, prior_strength=cfg.calibration.prior_strength,
-                                      models=cfg.models.analyst_models)
+                                      models=cfg.models.analyst_models, min_dates=cfg.calibration.min_dates)
     log("calibration", {"enabled": cfg.calibration.enabled,
                         "calibrators": {a: c.to_dict() for a, c in calibrators.items()}})
     bound: OverlayBound | None = None

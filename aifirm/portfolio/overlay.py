@@ -7,17 +7,27 @@ In Track-or-Follow, text features added no rank information at a weekly horizon 
 -0.016, interval excluding zero), and bounding the text signal is what made that harmless:
 text could reorder names inside the top band but never promote a low-ranked one.
 
-The rule
---------
+The rule (a residual, not a level comparison)
+---------------------------------------------
 ::
 
-    p_final = p_quant + clip(p_llm - p_quant, -max_tilt, +max_tilt)
+    p_final = clip(p_quant + clip(p_llm - 0.5, -max_tilt, +max_tilt), 0, 1)
 
 * ``p_quant`` is the deterministic quant's probability (the core). When the quant has no
   view on a name (it abstained), the core is 0.5 ("no view"), so the LLM pool can still
   move a held name by at most ``max_tilt`` but never further.
 * ``p_llm`` is the trimmed log-odds pool of the LLM analysts' calibrated, tier-gated
   probabilities. When every LLM analyst abstains, ``p_final = p_quant`` exactly.
+* The tilt is the LLM pool's own signed edge, ``p_llm - 0.5``, not its distance from the
+  quant. An LLM pool at 0.5 says "no information": a view the tier gate capped at 0.5, an
+  analyst whose calibration map shrank it to 0.5 because it has shown no skill, or an
+  analyst that states no edge. Such a pool tilts by 0 and leaves the quant core exactly
+  where it is; it is never read as a vote that the stock will lag. (Comparing levels,
+  ``p_llm - p_quant``, would turn every neutralised LLM pool into a cut of every quant
+  pick toward 0.5, so the tier gate and calibration, which exist to stop unverified or
+  unskilled views from adding exposure, would instead sell the quant core.) A bullish
+  pool can only raise the core and a bearish one only lower it, each by at most
+  ``max_tilt``.
 * The expected excess return that sizing uses is derived from ``p_final`` on the quant's
   own scale, ``sigma_h * Phi^-1(p_final)``, so the LLM's own (unbounded) expected-excess
   numbers never reach sizing; they are logged with the views.
@@ -67,11 +77,14 @@ def _finite_prob(p: object) -> float | None:
 
 
 def combine(p_quant: float | None, p_llm: float | None, max_tilt: float) -> tuple[float, float]:
-    """``(p_final, tilt)`` with ``p_final = core + clip(p_llm - core, -max_tilt, max_tilt)``.
+    """``(p_final, tilt)`` with ``p_final = clip(core + clip(p_llm - 0.5, -max_tilt, max_tilt), 0, 1)``
+    and ``tilt = p_final - core`` (module docstring: the LLM pool's signed edge is the
+    residual added to the quant core).
 
     ``core`` is ``p_quant``, or 0.5 when it is missing or not a valid probability. With no
-    valid ``p_llm`` the tilt is 0 and ``p_final`` is the core. ``max_tilt`` must be in
-    [0, 0.5]."""
+    valid ``p_llm``, or ``p_llm == 0.5`` (no information), the tilt is 0 and ``p_final``
+    is the core exactly. ``|tilt| <= max_tilt``; the tilt has the sign of ``p_llm - 0.5``
+    (never against the LLM pool's own direction). ``max_tilt`` must be in [0, 0.5]."""
     if not (isinstance(max_tilt, (int, float)) and 0.0 <= float(max_tilt) <= 0.5):
         raise ValueError(f"max_tilt must be in [0, 0.5], got {max_tilt!r}")
     core = _finite_prob(p_quant)
@@ -79,8 +92,9 @@ def combine(p_quant: float | None, p_llm: float | None, max_tilt: float) -> tupl
     llm = _finite_prob(p_llm)
     if llm is None:
         return core, 0.0
-    tilt = max(-float(max_tilt), min(float(max_tilt), llm - core))
-    return min(1.0, max(0.0, core + tilt)), tilt
+    edge = max(-float(max_tilt), min(float(max_tilt), llm - NEUTRAL))
+    p_final = min(1.0, max(0.0, core + edge))
+    return p_final, p_final - core
 
 
 def overlay_aggregate(ticker: str, quant: ViewRecord | None, llm_views: Sequence[ViewRecord], *, trim: float,
@@ -142,6 +156,7 @@ class OverlayBound:
     mean_ic_quant: float | None = None
     lags: int = 0
     min_dates: int = 0
+    n_thin_dates: int = 0        # resolved dates skipped: fewer than IC_MIN_NAMES names with both forecasts
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -170,10 +185,14 @@ def adaptive_bound(records: Iterable[ForecastRecord], as_of: str, cfg: FirmConfi
                          min_names=min_names, nw_lags=lags)
     stats = dict(n_dates=res.n_dates, mean_diff=_nan_none(res.mean_diff), t_stat=_nan_none(res.t_stat),
                  mean_ic_llm=_nan_none(res.mean_a), mean_ic_quant=_nan_none(res.mean_b), lags=lags,
-                 min_dates=min_dates)
+                 min_dates=min_dates, n_thin_dates=res.n_thin)
     if res.n_dates < min_dates:
+        thin = (f"; {res.n_thin} resolved date(s) skipped because fewer than {min_names} names had both forecasts "
+                f"(a deep-dive band narrower than {min_names} names can never measure this: widen "
+                "universe.screen.deep_dive_top_n)" if res.n_thin else "")
         return OverlayBound(configured, configured, f"{res.n_dates} resolved dates with both an LLM-pool and a quant "
-                                                    f"forecast < {min_dates}: the configured bound applies", **stats)
+                                                    f"forecast on at least {min_names} common names < {min_dates}"
+                                                    f"{thin}: the configured bound applies", **stats)
     t = res.t_stat
     if not math.isfinite(t):
         return OverlayBound(configured, configured, "the IC difference has no variation: the configured bound applies",

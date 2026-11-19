@@ -325,3 +325,80 @@ def test_float_rounding_above_the_position_cap_is_clipped_silently(tmp_path):
     assert _w(out) == {"AAA": 0.10, "BBB": 0.10}
     assert not any(m.startswith("AAA") for m in msgs)
     assert any(m.startswith("BBB") and "exceeds the position cap" in m for m in msgs)
+
+
+# ----------------------------------------------------------------------------- de-risk is idempotent
+
+
+def _construct_sheets(names):
+    out = {}
+    for t in names:
+        fs = FactSheet(ticker=t, as_of=AS_OF, sector=f"S{t}")
+        fs.add(Fact(f"{t}.vol_60d", "vol", 25.0, "%", AS_OF, "t"))
+        fs.add(Fact(f"{t}.price", "price", 100.0, "USD", AS_OF, "t"))
+        out[t] = fs
+    return out
+
+
+@pytest.mark.parametrize("fraction", [1.0, 0.5])
+def test_derisk_does_not_compound_with_partial_rebalancing(tmp_path, fraction):
+    """Regression: the de-risk halved whatever construction proposed, and with partial
+    rebalancing that target is a step from a book already halved last cycle, so the episode
+    sold every cycle (0.24 -> 0.18 -> 0.165 -> ... -> 0.16, a third of the ideal). The cap
+    is now half of construction's ideal weight: the book sits at 0.24 every cycle."""
+    from aifirm.portfolio.construct import construct_portfolio
+    from aifirm.schemas import AggregatedView
+    names = [f"N{i}" for i in range(6)]
+    aggs = {t: AggregatedView(ticker=t, prob_outperform=0.6, prob_equal_weight=0.6, expected_excess_return_pct=3.0,
+                              dispersion=0.0, n_views=3, n_abstained=0) for t in names}
+    sheets = _construct_sheets(names)
+    cfg = _cfg(tmp_path, rebalance_fraction=fraction)
+    cur = {t: 0.08 for t in names}
+    state = RiskState(peak_nav=100.0, trough_nav=88.0)
+    path = []
+    for _ in range(6):
+        tgt = construct_portfolio(aggs, {}, sheets, cur, cfg, AS_OF, {})
+        assert all(p.ideal_weight == pytest.approx(0.08) for p in tgt.positions)
+        final, _ = apply_risk_limits(tgt, state, 88.0, None, cur, cfg, sheets, str(tmp_path))
+        assert all(abs(p.weight) <= abs(q.weight) + 1e-12 for p, q in zip(final.positions, tgt.positions))
+        cur = {p.ticker: p.weight for p in final.positions if p.weight}
+        path.append(round(sum(cur.values()), 6))
+    assert path == [pytest.approx(0.24)] * 6
+
+
+def test_derisk_halves_a_deliberate_hold_once_and_never_again(tmp_path):
+    """Regression: during a de-risk episode an LLM-outage cycle proposes 'hold the current book'
+    and the engine halved it again every cycle (0.12 -> 0.06 -> 0.03), so an LLM outage forced
+    sales. A hold is halved only on the cycle the de-risk triggers."""
+    from aifirm.pipeline import _hold_target
+    cfg = _cfg(tmp_path)
+    fss = _fss({t: 100.0 for t in "ABC"})
+    state = RiskState(peak_nav=100.0)
+    for nav in (95.0, 89.0):
+        state = update_risk_state(state, nav)
+    cur = {t: 0.08 for t in "ABC"}
+    tgt = _hold_target(cur, "SPY", AS_OF, "LLM OUTAGE")          # the cycle the de-risk triggers: halved once
+    out, msgs = apply_risk_limits(tgt, state, 89.0, None, cur, cfg, fss, str(tmp_path))
+    assert state.derisked and _w(out) == pytest.approx({t: 0.04 for t in "ABC"})
+    cur = _w(out)
+    state = update_risk_state(state, 91.0)                            # still de-risked (needs 94.5)
+    for _ in range(3):
+        tgt = _hold_target(cur, "SPY", AS_OF, "LLM OUTAGE")
+        out, msgs = apply_risk_limits(tgt, state, 91.0, None, cur, cfg, fss, str(tmp_path))
+        assert _w(out) == pytest.approx(cur) and any("kept at the current weight" in m for m in msgs)
+        assert any("still in force" in m for m in msgs)
+    for label in ("unreviewed_hold", "no_view_hold", "risk_review_halt"):
+        held = TargetPortfolio(as_of=AS_OF, core_weight=0.0, cash_weight=0.88, positions=[TargetPosition(
+            ticker="A", weight=0.04, prob_outperform=0.5, expected_excess_return_pct=0.0, rationale="",
+            constraints_hit=[label], ideal_weight=0.0)])
+        out, _ = apply_risk_limits(held, state, 91.0, None, {"A": 0.04}, cfg, fss, str(tmp_path))
+        assert _w(out) == {"A": pytest.approx(0.04)}, label
+
+
+def test_derisk_without_an_ideal_weight_still_halves(tmp_path):
+    out, _, _ = _apply(tmp_path, _target({"AAA": 0.10}), nav=89.0)
+    assert _w(out) == pytest.approx({"AAA": 0.05})
+    ideal = _target({"AAA": 0.06})
+    ideal.positions[0].ideal_weight = 0.08                            # a partial step toward 0.08: cap 0.04
+    out, _, _ = _apply(tmp_path, ideal, nav=89.0)
+    assert _w(out) == pytest.approx({"AAA": 0.04})

@@ -177,3 +177,44 @@ def test_blind_factsheet_scrubs_the_sector_label():
     """Regression: the sector label was passed through unscrubbed in blind mode."""
     fs = FactSheet(ticker="AAA", as_of="2024-05-01", name="Alpha Widgets Inc", sector="AAA / Alpha Widgets division")
     assert "AAA" not in blind_factsheet(fs).sector and "Alpha Widgets" not in blind_factsheet(fs).sector
+
+
+class Dater(LLM):
+    """Dates every payload exactly (as frontier models date macro snapshots) but guesses the ticker."""
+
+    def __init__(self, sheets: list[FactSheet], ticker_too: bool = False):
+        self.usage = Usage(budget_usd=float("inf"))
+        self.truth = {probe_payload(fs): (fs.ticker, fs.as_of[:7]) for fs in sheets}
+        self.ticker_too = ticker_too
+        self.k = 0
+
+    def structured(self, *, role, model, system, user, schema, effort="medium", max_tokens=16000):
+        payload = user.split("<fact_sheet>\n", 1)[1].split("\n</fact_sheet>", 1)[0]
+        t, m = self.truth[payload]
+        cands = user.split("CANDIDATE TICKERS: ", 1)[1].split("\n", 1)[0].split(", ")
+        self.k += 1
+        guess = t if self.ticker_too else cands[(self.k * 7) % len(cands)]
+        return ReidGuess(ticker_guess=guess, month_guess=m, confidence=0.9, clues="macro level"), \
+            CallRecord(role=role, model=model, prompt_hash="x")
+
+
+def test_a_payload_that_reveals_the_month_fails_even_when_the_joint_rate_passes():
+    """Regression: the gate read only the joint hit rate. With 100 candidate tickers, a model
+    that dates every sheet but never names the ticker sits near joint chance and passed."""
+    sheets = toy_sheets(1200)
+    many = [f"C{k:03d}" for k in range(90)] + TICKERS                  # a closed-world list like sp100
+    rep = run_reid_probe(Dater(sheets), sheets, candidate_tickers=many)
+    assert rep.month.rate == 1.0 and rep.joint.excess <= 0.01 and rep.joint.hi - rep.joint.chance <= 0.02
+    assert not rep.gate_passed
+    assert any(n.startswith("month hit rate") and "reveals the month" in n for n in rep.gate_notes)
+    assert not any(n.startswith("ticker hit rate") for n in rep.gate_notes)
+
+
+def test_a_small_but_significant_marginal_leak_fails():
+    """A month leak under the 5-point excess cap still fails when it is significantly (95%
+    lower bound) more than 2 points above chance."""
+    hr = reid_mod.HitRate.of(hits=int(0.125 * 4000), n=4000, chance=1 / 12)       # +4.2 points, very tight CI
+    assert hr.excess < reid_mod.GATE_MAX_MARGINAL_EXCESS and hr.lo - hr.chance > reid_mod.GATE_MAX_MARGINAL_LOWER
+    sheets = toy_sheets(400)
+    rep = run_reid_probe(make_offline_llm(), sheets, max_marginal_lower=-1.0)      # any significance fails now
+    assert not rep.gate_passed and any("significantly above chance" in n for n in rep.gate_notes)

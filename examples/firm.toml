@@ -48,10 +48,13 @@ benchmark = "SPY"
 
 # Broad-universe screen (research 7.3, 9.3 item 1: breadth is what gives statistical power).
 # When enabled, the universe is the tickers above plus the preset, file and inline lists
-# below. Every cycle the deterministic quant ranks the whole universe (cheap fact sheets:
-# prices and SEC data, no news, no LLM), names pass point-in-time price and liquidity
-# filters, and only the top `deep_dive_top_n` by quant probability (above 0.5) plus every
-# held name go to the LLM committee. Other names get no new position.
+# below. Every cycle the deterministic quant ranks the whole universe (fact sheets from
+# prices and SEC data, no LLM; a live run also fetches every name's headline feed, but only
+# the deep-dive names' headlines are read and the rest are withheld unread), names pass
+# point-in-time price and liquidity filters (the as-traded price), and only the top
+# `deep_dive_top_n` by quant probability (above 0.5) plus every held name go to the LLM
+# committee. Other names get no new position. Keep `deep_dive_top_n` at 5 or more: a date's
+# paired IC needs 5 names, so a narrower band never measures the adaptive overlay bound.
 # SURVIVORSHIP: the bundled "sp100" lists TODAY's members, so backtests on it are biased
 # upward (dropped and delisted names are missing); reports say so.
 [universe.screen]
@@ -156,6 +159,7 @@ initial_cash = 100000.0
 # resolved forecasts (forecasts keep the raw probability). The quant is never calibrated.
 enabled = true
 min_n = 30                       # identity map until an agent has this many resolved questions
+min_dates = 20                   # ... from at least this many distinct decision dates (one date = one market episode)
 prior_strength = 50.0            # shrink toward the identity as if 50 calibrated forecasts agreed
 
 [evaluation]

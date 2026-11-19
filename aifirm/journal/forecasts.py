@@ -67,7 +67,7 @@ from pathlib import Path
 import pandas as pd
 from pandas.tseries.offsets import BDay
 
-from ..config import FirmConfig, model_cutoff
+from ..config import DEFAULT_CUTOFF_BUFFER_DAYS, FirmConfig, model_cutoff
 from ..data.prices import PriceData
 from ..schemas import AggregatedView, ForecastRecord, ViewRecord
 
@@ -128,18 +128,27 @@ def resolve_date(as_of: str | date | pd.Timestamp, horizon_days: int,
     return _day(d + BDay(horizon_days))
 
 
-def is_pre_cutoff(model: str, as_of: str | date | pd.Timestamp) -> bool:
+def is_pre_cutoff(model: str, as_of: str | date | pd.Timestamp,
+                  buffer_days: int = DEFAULT_CUTOFF_BUFFER_DAYS) -> bool:
     """True if ``model`` may have seen the period after ``as_of`` in training (P10).
 
     Deterministic code is never contaminated. An LLM with an unknown cutoff is assumed
-    contaminated (fail closed: unproven skill is not counted as skill). A forecast made
-    on or before the cutoff date is contaminated because the model may know what
-    happened next.
+    contaminated (fail closed: unproven skill is not counted as skill). A forecast made on
+    or before the cutoff date plus ``buffer_days`` calendar days is contaminated: the model
+    may know what happened next, and vendor cutoff dates are unreliable, so the same buffer
+    the backtest uses (:func:`aifirm.backtest.engine.contamination_cutoff`,
+    ``evaluation.cutoff_buffer_days``) applies here. Without it, forecasts the backtest
+    reports as contaminated would be stored as clean and would feed believability weights,
+    calibration maps and the overlay bound of the decisions judged as clean.
     """
     if model in DETERMINISTIC_MODELS:
         return False
+    if buffer_days < 0:
+        raise ValueError(f"buffer_days must be >= 0, got {buffer_days}")
     cutoff = model_cutoff(model)
-    return cutoff is None or _day(as_of) <= _day(cutoff)
+    if cutoff is None:
+        return True
+    return _day(as_of) <= _day(pd.Timestamp(cutoff) + pd.Timedelta(days=int(buffer_days)))
 
 
 def make_forecast_records(run_id: str, as_of: str, views: list[ViewRecord], agg: AggregatedView,
@@ -171,7 +180,7 @@ def make_forecast_records(run_id: str, as_of: str, views: list[ViewRecord], agg:
         ForecastRecord(id=f"{run_id}|{as_of_s}|{agg.ticker}|{v.agent}|s{v.sample}", agent=v.agent, model=v.model,
                        prob_outperform=v.view.prob_outperform,
                        expected_excess_return_pct=v.view.expected_excess_return_pct,
-                       pre_cutoff=is_pre_cutoff(v.model, as_of_s), **common)
+                       pre_cutoff=is_pre_cutoff(v.model, as_of_s, cfg.evaluation.cutoff_buffer_days), **common)
         for v in members
     ]
     if members:

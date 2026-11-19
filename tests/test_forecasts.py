@@ -119,7 +119,7 @@ def test_pre_cutoff_flags():
     assert {r.agent: r.pre_cutoff for r in before} == {"technical": True, "quant": False, COMMITTEE_AGENT: True}
     after = make_forecast_records("r", "2026-08-03", views, _agg(), _cfg(), None)
     assert not any(r.pre_cutoff for r in after)
-    assert is_pre_cutoff(LLM_MODEL, "2026-06-30") and not is_pre_cutoff(LLM_MODEL, "2026-07-01")
+    assert is_pre_cutoff(LLM_MODEL, "2026-06-30", 0) and not is_pre_cutoff(LLM_MODEL, "2026-07-01", 0)
     assert is_pre_cutoff("some-unknown-model", "2030-01-01")      # unknown cutoff: assume contaminated
     assert not is_pre_cutoff("deterministic", "2001-01-01")
 
@@ -421,3 +421,22 @@ def test_lessons_are_short_and_skip_damaged_lines(tmp_path):
         fh.write(json.dumps({"resolved_on": "2026-01-12", "lesson": {"agent": "technical"}}) + "\n")
     got = LessonStore(path).retrieve("technical", "2026-02-01")
     assert len(got) == 1 and len(got[0]) == MAX_LESSON_CHARS and got[0].endswith("...")
+
+
+def test_pre_cutoff_flag_uses_the_same_buffer_as_the_backtest(tmp_path):
+    """Regression: the backtest treats decisions up to cutoff + evaluation.cutoff_buffer_days as
+    contaminated, but ForecastRecord.pre_cutoff used the raw cutoff, so forecasts from inside
+    the buffer were stored as clean and fed believability, calibration and the overlay bound."""
+    from aifirm.backtest.engine import contamination_cutoff
+    cfg = _cfg()
+    end = contamination_cutoff(cfg, "llm")
+    assert end == "2026-07-31"
+    for d, contaminated in (("2026-06-30", True), ("2026-07-01", True), ("2026-07-15", True), (end, True),
+                            ("2026-08-03", False)):
+        assert is_pre_cutoff(LLM_MODEL, d) is contaminated, d
+        recs = make_forecast_records("r", d, _committee_views(), _agg(), cfg, None)
+        assert {r.agent: r.pre_cutoff for r in recs}["technical"] is contaminated
+    cfg.evaluation.cutoff_buffer_days = 0                              # the config's buffer is the one used
+    recs = make_forecast_records("r", "2026-07-15", _committee_views(), _agg(), cfg, None)
+    assert not any(r.pre_cutoff for r in recs)
+    assert is_pre_cutoff(LLM_MODEL, "2026-07-15", buffer_days=0) is False

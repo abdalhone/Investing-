@@ -26,7 +26,10 @@ from aifirm.schemas import AnalystView, EvidenceItem, ForecastRecord, NewsEvent,
 @pytest.mark.parametrize("p_quant,p_llm,tilt,expected", [
     (0.53, 0.70, 0.05, 0.58),          # bullish LLM: capped at +tilt
     (0.53, 0.30, 0.05, 0.48),          # bearish LLM: capped at -tilt
-    (0.53, 0.55, 0.05, 0.55),          # inside the bound: the LLM pool itself
+    (0.53, 0.55, 0.05, 0.58),          # the LLM pool's own edge (+0.05) is added to the core
+    (0.53, 0.52, 0.05, 0.55),          # a mildly bullish pool raises the core, never pulls it toward 0.5
+    (0.53, 0.50, 0.05, 0.53),          # a neutral pool (gated, calibrated to no skill) is no information
+    (0.53, 0.48, 0.05, 0.51),          # a mildly bearish pool lowers the core by its edge only
     (0.53, None, 0.05, 0.53),          # every LLM analyst abstained: the quant exactly
     (None, 0.70, 0.05, 0.55),          # no quant view: the core is 0.5
     (0.53, 0.90, 0.0, 0.53),           # bound switched off
@@ -37,6 +40,19 @@ def test_combine_bounds_the_llm_tilt_around_the_quant(p_quant, p_llm, tilt, expe
     assert p == pytest.approx(expected)
     core = 0.5 if p_quant is None else p_quant
     assert t == pytest.approx(p - core) and abs(t) <= tilt + 1e-12
+
+
+def test_combine_neutral_llm_pool_never_cuts_the_quant_core():
+    """Regression: the overlay used ``p_llm - p_quant``, so an LLM pool the tier gate capped at
+    0.5, or that calibration shrank toward 0.5 (no measured skill), pulled every quant pick
+    toward 0.5 and below ``min_prob_to_hold``: the live book sold what the quant-only shadow
+    held. The tilt is now the LLM pool's own edge, so 'no information' tilts by exactly 0."""
+    for p_quant in (0.505, 0.53, 0.545, 0.56, 0.45):
+        assert combine(p_quant, 0.5, 0.05) == (p_quant, 0.0)
+    p, t = combine(0.545, 0.5112, 0.05)                 # bullish but calibrated as no-skill (b = 0.10)
+    assert p == pytest.approx(0.5562) and t == pytest.approx(0.0112)
+    for p_llm in (0.51, 0.6, 0.9):                       # bullish never lowers, bearish never raises
+        assert combine(0.545, p_llm, 0.05)[1] > 0 and combine(0.545, 1 - p_llm, 0.05)[1] < 0
 
 
 def test_combine_rejects_a_bound_outside_zero_to_one_half():
@@ -181,7 +197,10 @@ def test_tier_gate_caps_llm_views_resting_on_unverified_news_but_never_the_quant
     assert all(v.view.prob_outperform == 0.8 for v in res.views if v.agent in BULL)      # raw views untouched
     assert all(v.view.prob_outperform == 0.5 for v in res.pool_views if v.agent in BULL)  # capped for pooling
     assert next(v for v in res.pool_views if v.agent == "quant").view.prob_outperform == 0.53   # not gated
-    assert len(res.tier_gate_notes) == 4 and res.aggregate.prob_outperform == pytest.approx(0.5)
+    # the gated LLM pool is "no information": the quant core stands exactly (it used to be cut to 0.5,
+    # below min_prob_to_hold, so unverified bullish news sold what the quant alone would hold)
+    assert len(res.tier_gate_notes) == 4 and res.aggregate.prob_outperform == pytest.approx(0.53)
+    assert res.aggregate.overlay_tilt == pytest.approx(0.0)
     trusted = _run(llm, _cfg(), quant=quiet_quant, fs=_news_sheet("A"))                  # tier A supports it
     assert not trusted.tier_gate_notes and trusted.aggregate.prob_outperform == pytest.approx(0.58)
     off = _run(llm, _cfg(tier_gate_enabled=False), quant=quiet_quant, fs=_news_sheet("C"))
@@ -253,3 +272,43 @@ def test_horizon_sigma_matches_the_quants_scale():
     assert horizon_sigma_pct(fs, 21) == pytest.approx(30.0 * math.sqrt(21 / 252))     # the 30% fallback
     with pytest.raises(ValueError):
         horizon_sigma_pct(fs, 0)
+
+
+def test_committee_caps_a_revision_raised_on_tier_c_news_from_the_challenge():
+    """Regression (revision hole): the sealed technical view is supported by a price fact, the
+    challenger cites a tier-C news event and the reviser raises to 0.9 citing that event. The
+    accepted revision's new evidence is stored on the record and the gate caps the raise."""
+    from test_committee import challenge_obj
+    from aifirm.schemas import Revision
+    rumor_challenge = challenge_obj()
+    rumor_challenge.evidence = [EvidenceItem(point="A launch was reported.", fact_ids=["AAA.news_1"],
+                                             direction="positive")]
+    revisions = {"technical": Revision(ticker="AAA", prob_outperform=0.9, expected_excess_return_pct=8.0,
+                                       changed=True, reason="The launch.", new_evidence_fact_ids=["AAA.news_1"])}
+    probs = {"fundamental": 0.85, "technical": 0.62, "macro": 0.60, "events": 0.42}
+    llm = ScriptedLLM(probs, revisions=revisions)
+    llm.register("challenge", lambda role, s, u, schema: rumor_challenge)
+    cfg = _cfg(challenge_enabled=True, challenge_dispersion_threshold=0.0)
+    for tier, capped in (("C", True), ("A", False)):
+        res = _run(llm, cfg, fs=_news_sheet(tier))
+        tech = next(v for v in res.views if v.agent == "technical")
+        assert tech.revised_prob == pytest.approx(0.9) and tech.revision_fact_ids == ["AAA.news_1"]
+        pooled = next(v for v in res.pool_views if v.agent == "technical")
+        assert pooled.revised_prob == pytest.approx(0.62 if capped else 0.9)
+        assert any(n.startswith("tier gate: technical") and "revision capped" in n
+                   for n in res.tier_gate_notes) is capped
+
+
+def test_a_deep_dive_narrower_than_the_ic_minimum_is_reported_not_awaited():
+    """Regression: with 2-3 deep-dive names per date every date was skipped and the bound said
+    '0 resolved dates < 12' for ever, as if waiting would help. The skipped dates are now
+    counted and the reason names the cause."""
+    cfg = FirmConfig()
+    thin = adaptive_bound(_records(20, -0.9, 0.9, names=3), "2026-01-01", cfg)
+    assert thin.n_dates == 0 and thin.n_thin_dates == 20 and thin.max_tilt == 0.05
+    assert "20 resolved date(s) skipped because fewer than 5 names" in thin.reason
+    assert "deep_dive_top_n" in thin.reason and thin.to_dict()["n_thin_dates"] == 20
+    wide = adaptive_bound(_records(20, -0.6, 0.6, names=8), "2026-01-01", cfg)
+    assert wide.n_thin_dates == 0 and wide.max_tilt == 0.0
+    res = paired_rank_ic(_records(4, 0.5, 0.5, names=3), "2026-01-01", LLM_POOL_AGENT, "quant", min_names=5)
+    assert res.n_dates == 0 and res.n_thin == 4

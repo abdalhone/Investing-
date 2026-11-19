@@ -25,7 +25,9 @@ from aifirm.config import (
 )
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "firm.toml"
-DEFAULT_FINGERPRINT = "dfd68b7f37ba982f"     # FirmConfig().fingerprint(): a change of any default is a new strategy
+# FirmConfig().fingerprint(): a change of any default is a new strategy. (Changed deliberately when
+# calibration.min_dates was added: the default calibration now waits for 20 resolved dates.)
+DEFAULT_FINGERPRINT = "2e5f0d6108e79f5f"
 
 
 def _write(tmp_path: Path, text: str, name: str = "firm.toml") -> Path:
@@ -268,8 +270,52 @@ def test_evaluation_settings_are_not_part_of_the_fingerprint():
     is not a new trial, and adding the [evaluation] section must not change the fingerprint
     of any existing configuration (that would silently reset every trial ledger count)."""
     changed = FirmConfig(evaluation=EvaluationConfig(n_random_books=7, random_seed=1, cost_multipliers=[3.0],
-                                                     cutoff_buffer_days=0, factor_proxies=False))
+                                                     factor_proxies=False))
     assert changed.fingerprint() == FirmConfig().fingerprint()
+    # ... except a non-default cutoff buffer: it also decides which LLM forecasts are flagged
+    # pre_cutoff, i.e. which track record believability, calibration and the overlay bound use
+    buffered = FirmConfig(evaluation=EvaluationConfig(cutoff_buffer_days=0))
+    assert buffered.fingerprint() != FirmConfig().fingerprint()
+    assert FirmConfig(evaluation=EvaluationConfig(cutoff_buffer_days=31)).fingerprint() == FirmConfig().fingerprint()
     # Pinned: evaluation settings never move it. (The value changed once, deliberately, when the
     # research defaults, the screen, the overlay and calibration settings were added: a new strategy.)
     assert FirmConfig().fingerprint() == DEFAULT_FINGERPRINT
+
+
+def _screen_config(directory, tickers, file_value="universe.txt"):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "universe.txt").write_text("\n".join(tickers) + "\n", encoding="utf-8")
+    (directory / "firm.toml").write_text(
+        f'[universe]\ntickers = []\n[universe.screen]\nenabled = true\nfile = "{file_value}"\n', encoding="utf-8")
+    return FirmConfig.load(directory / "firm.toml")
+
+
+def test_fingerprint_covers_the_screened_universe_contents(tmp_path):
+    """Regression: the fingerprint hashed only the path ``universe.screen.file``, so editing the
+    file and re-running counted as the same trial and the deflated Sharpe never saw the
+    universe selection; the same file given by an absolute path counted as a new trial."""
+    a = _screen_config(tmp_path / "a", ["AAPL", "MSFT"])
+    b = _screen_config(tmp_path / "b", ["NVDA", "XOM", "KO", "JPM"])
+    assert a.fingerprint() != b.fingerprint()
+    assert a.universe_digest() != b.universe_digest()
+    same = _screen_config(tmp_path / "c", ["AAPL", "MSFT"])                     # another directory, same names
+    absolute = _screen_config(tmp_path / "d", ["AAPL", "MSFT"], file_value=str(tmp_path / "a" / "universe.txt"))
+    assert same.fingerprint() == a.fingerprint() == absolute.fingerprint()
+    (tmp_path / "a" / "universe.txt").write_text("AAPL\nMSFT\nGOOGL\n", encoding="utf-8")   # edited in place
+    assert a.fingerprint() != same.fingerprint()
+    preset = FirmConfig()
+    preset.universe.tickers = []
+    preset.universe.screen.enabled, preset.universe.screen.preset = True, "sp100"
+    inline = FirmConfig()
+    inline.universe.tickers = []
+    inline.universe.screen.enabled, inline.universe.screen.tickers = True, preset.investable_tickers()
+    assert preset.fingerprint() == inline.fingerprint()                         # same names, same trial
+
+
+def test_trial_ledger_rows_record_the_universe_digest(tmp_path):
+    from aifirm.backtest.engine import _count_trials
+    a = _screen_config(tmp_path / "a", ["AAPL", "MSFT"])
+    assert a.universe_digest() == FirmConfig.load(tmp_path / "a" / "firm.toml").universe_digest()
+    (tmp_path / "a" / "universe.txt").unlink()
+    assert a.universe_digest() == "unreadable" and a.fingerprint()              # never raises
+    assert _count_trials(tmp_path / "none.jsonl", "f", "quant", "2024-01-01", "2024-06-30") == 1

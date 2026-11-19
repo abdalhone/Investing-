@@ -30,6 +30,14 @@ Protocol
   over chance* (otherwise a pure random guesser would fail). A payload that literally
   contains the true ticker, as-of date or company name fails the gate outright (a
   blinding bug, not memory).
+* **Each marginal is gated too.** With a large candidate list the joint chance is tiny, so a
+  model that dates every sheet exactly but never names the ticker has a joint rate near
+  chance and would pass on the joint alone; yet knowing the month (and the unscrubbed
+  sector) is enough to recall how the sector did next, the look-ahead blind mode exists
+  to stop. The ticker and the month hit rates therefore fail the gate when either is more
+  than ``max_marginal_excess`` (5 points) above its chance, or when its Wilson 95% *lower*
+  bound is more than ``max_marginal_lower`` (2 points) above chance (significantly above
+  chance by a margin). A pure guesser passes both with high probability.
 """
 
 from __future__ import annotations
@@ -56,6 +64,8 @@ Z_95 = 1.959963984540054
 GATE_MIN_PROBES = 400
 GATE_MAX_EXCESS = 0.01
 GATE_MAX_UPPER = 0.02
+GATE_MAX_MARGINAL_EXCESS = 0.05
+GATE_MAX_MARGINAL_LOWER = 0.02
 
 REID_SYSTEM = """\
 You are auditing an anonymisation procedure. You will see an anonymised fact sheet for one stock on one day (day T): the ticker is replaced by an alias, the company name and dollar amounts are removed, and dates are shown relative to day T.
@@ -200,7 +210,9 @@ def run_reid_probe(llm: LLM, factsheets: Sequence[FactSheet], *, model: str = DE
                    effort: str = "low", max_tokens: int = 2000, role: str | None = None,
                    candidate_tickers: Sequence[str] | None = None, month_window: tuple[str, str] | None = None,
                    min_probes: int = GATE_MIN_PROBES, max_excess: float = GATE_MAX_EXCESS,
-                   max_upper: float = GATE_MAX_UPPER, max_parallel: int = 1) -> ReidReport:
+                   max_upper: float = GATE_MAX_UPPER, max_parallel: int = 1,
+                   max_marginal_excess: float = GATE_MAX_MARGINAL_EXCESS,
+                   max_marginal_lower: float = GATE_MAX_MARGINAL_LOWER) -> ReidReport:
     """Run the probe over ``factsheets`` (real, un-blinded sheets; see the module docstring).
 
     ``candidate_tickers`` defaults to the sorted distinct tickers of the probes (every true
@@ -257,6 +269,13 @@ def run_reid_probe(llm: LLM, factsheets: Sequence[FactSheet], *, model: str = DE
     if joint.hi - joint.chance > max_upper:
         notes.append(f"joint 95% upper bound {joint.hi:.2%} is {joint.hi - joint.chance:.2%} above chance "
                      f"(max {max_upper:.2%})")
+    for what, hr in (("ticker", ticker), ("month", month)):
+        if n and hr.excess > max_marginal_excess:
+            notes.append(f"{what} hit rate {hr.rate:.2%} is {hr.excess:.2%} above chance {hr.chance:.2%} "
+                         f"(max {max_marginal_excess:.2%}): the sheet reveals the {what}")
+        elif n and hr.lo - hr.chance > max_marginal_lower:
+            notes.append(f"{what} hit rate is significantly above chance: 95% lower bound {hr.lo:.2%} is "
+                         f"{hr.lo - hr.chance:.2%} above chance {hr.chance:.2%} (max {max_marginal_lower:.2%})")
     return ReidReport(n_probes=len(probes), n_answered=n, n_failed=len(probes) - n, ticker=ticker, month=month,
                       joint=joint, candidates=cands, month_window=window, gate_passed=not notes, gate_notes=notes,
                       model=model, payload=f"{role} slice" if role else "full blind sheet", probes=probes)

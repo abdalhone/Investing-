@@ -115,9 +115,32 @@ def test_small_samples_are_identity_and_shrinkage_grows_with_the_prior():
     assert c.is_identity and not c.fitted and c.n == 25 and "min_n=30" in c.reason
     assert c.brier_raw is not None and c.brier_calibrated == c.brier_raw
     recs = make_records("over", 60, OVERCONFIDENT, 7)
-    slopes = [fit_calibrators(recs, AS_OF_END, ["over"], prior_strength=k)["over"].b for k in (0, 50, 500)]
+    slopes = [fit_calibrators(recs, AS_OF_END, ["over"], prior_strength=k, min_dates=0)["over"].b for k in (0, 50, 500)]
     assert abs(slopes[0] - 1) > abs(slopes[1] - 1) > abs(slopes[2] - 1)
     assert abs(slopes[2] - 1) < 0.15
+
+
+def test_questions_from_too_few_dates_are_identity():
+    """Regression: min_n counted questions, so 36 questions from 3 decision dates (one market
+    episode each) fitted a = -0.46 and neutralised every bullish view below ~0.62, while
+    believability treated the same sample as too thin. Dates are now gated too."""
+    rows, k = [], 0
+    for d in ("2025-01-02", "2025-02-03", "2025-03-03"):
+        for j in range(12):
+            p = 0.62 if j % 2 == 0 else 0.40
+            y = 1 if j in (0, 3, 7) else 0                    # 3 of 12 beat the benchmark, unrelated to the view
+            rows.append(ForecastRecord(id=f"r|{d}|T{j}|technical|s0", run_id="r", agent="technical", model="m",
+                                       ticker=f"T{j}", benchmark="SPY", as_of=d, horizon_days=21,
+                                       resolve_on=str((pd.Timestamp(d) + pd.Timedelta(days=30)).date()),
+                                       prob_outperform=p, expected_excess_return_pct=0.0, resolved=True, outcome=y))
+            k += 1
+    as_of = "2025-06-30"
+    old = fit_calibrators(rows, as_of, ["technical"], min_dates=0)["technical"]
+    assert old.fitted and old.a < -0.3 and old.apply(0.6) == 0.5                 # the reported failure
+    c = fit_calibrators(rows, as_of, ["technical"])["technical"]
+    assert c.is_identity and not c.fitted and c.n == 36 and "min_dates=20" in c.reason and c.apply(0.6) == 0.6
+    with pytest.raises(ValueError):
+        fit_calibrators(rows, as_of, ["technical"], min_dates=-1)
 
 
 def test_prior_worth_50_moves_a_30_question_fit_about_n_over_n_plus_prior_of_the_way():

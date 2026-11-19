@@ -250,9 +250,10 @@ def render_decision_report(decision: Decision, *, shadow: ShadowOutcome | None =
     if overlay:
         b = d.overlay_bound
         bound = (f"The bound in force is {b.max_tilt:.3f} (configured {b.configured:.3f}): {b.reason}." if b else "")
-        lines += ["Overlay mode (research 6.6): the final P is the quant core plus the LLM analysts' pooled "
-                  "probability, clipped to at most the bound either way; LLM P pools the analysts' calibrated, "
-                  "tier-gated probabilities (believability-weighted, trimmed log-odds mean). " + bound, ""]
+        lines += ["Overlay mode (research 6.6): the final P is the quant core plus the LLM pool's own edge "
+                  "(LLM P minus 0.5), clipped to at most the bound either way, so an LLM P of 0.5 (no information) "
+                  "leaves the quant unchanged; LLM P pools the analysts' calibrated, tier-gated probabilities "
+                  "(believability-weighted, trimmed log-odds mean). " + bound, ""]
     else:
         lines += ["Pooled P is the believability-weighted, trimmed log-odds mean; equal-weight P is the same pool with "
                   "unit weights, shown so you can see what the weights changed.", ""]
@@ -539,6 +540,12 @@ def _skill_section(r: BacktestResult) -> list[str]:
     out += ["### Signal: rank information coefficient (IC)", "",
             f"On each decision date, the Spearman rank correlation between a signal's P(beat the benchmark) and the "
             f"realised {ev.forward_return_definition}. {lags_note} The date is the unit of replication.", ""]
+    if ev.clean_after is not None:
+        out += [f"**Clean decisions only.** The IC, the paired differences, the power, the random books and the "
+                f"factor alpha below use the {ev.n_clean_decisions} of {ev.n_decisions} decisions made after "
+                f"{ev.clean_after} (training cutoff plus buffer). Earlier decisions may rest on memorised outcomes "
+                "and are never evidence of skill (P10)" + ("." if ev.n_clean_decisions else
+                                                           ": there are none, so these parts are empty."), ""]
     if ev.ic:
         out += [*_table(["Signal", "Dates", "Mean IC", "IC std", "t-stat", "Hit rate", "Names per date", "Reading"],
                         [(label_name(k), s.n_dates, _num(s.mean, 3), _num(s.std, 3), _num(s.t_stat, 2),
@@ -553,6 +560,16 @@ def _skill_section(r: BacktestResult) -> list[str]:
                 *_table(["A minus B", "Dates", "Mean difference", "t-stat", "Reading"],
                         [(f"{label_name(d.a)} minus {label_name(d.b)}", d.n_dates, _num(d.mean_diff, 3),
                           _num(d.t_stat, 2), _ic_reading(d.t_stat, d.mean_diff)) for d in ev.ic_differences]), ""]
+
+    if ev.contaminated_ic:
+        out += ["Whole window, contaminated decisions included (for reference only: NOT evidence of skill):", "",
+                *_table(["Signal", "Dates", "Mean IC", "t-stat"],
+                        [(label_name(k), s.n_dates, _num(s.mean, 3), _num(s.t_stat, 2))
+                         for k, s in ev.contaminated_ic.items()]),
+                *(["", *_table(["A minus B (contaminated)", "Dates", "Mean difference", "t-stat"],
+                               [(f"{label_name(d.a)} minus {label_name(d.b)}", d.n_dates, _num(d.mean_diff, 3),
+                                 _num(d.t_stat, 2)) for d in ev.contaminated_ic_differences])]
+                  if ev.contaminated_ic_differences else []), ""]
 
     out += ["### Power: how long until we would know", ""]
     p = ev.power
@@ -626,12 +643,22 @@ def _skill_section(r: BacktestResult) -> list[str]:
     if f is None:
         out += ["Not computed: no usable factor proxy prices (see the notes below).", ""]
     else:
-        out += [f"Daily strategy return minus cash ({f.cash_proxy or 'taken as 0'}) regressed on factor returns, "
+        if f.mean_invested is not None:
+            dep = (f"Daily strategy return minus the T-bill return ({f.cash_proxy or 'taken as 0'}) on the invested "
+                   f"fraction only (on average {_pct(f.mean_invested, 0)} of NAV; the simulator pays no interest "
+                   f"on cash, so the cash leg is compared with the 0 it earned)")
+        else:
+            dep = f"Daily strategy return minus cash ({f.cash_proxy or 'taken as 0'})"
+        out += [f"{dep} regressed on factor returns, "
                 f"{f.n_obs} days, Newey-West standard errors ({f.hac_lags} lags), R-squared {_num(f.r2, 2)}.", "",
                 *_table(["Term", "Proxy", "Estimate", "t-stat (HAC)"],
                         [("Alpha (annual)", "-", _pp(f.alpha_annual_pct, 2, sign=True), _num(f.alpha_t, 2)),
                          *((name, f.proxies[name], _num(f.loadings[name], 3), _num(f.loading_t[name], 2))
                            for name in f.factors)]), ""]
+        if f.cash_drag_annual_pct is not None:
+            out += [f"Cash drag (not alpha): uninvested cash forwent {_pp(f.cash_drag_annual_pct, 2)} a year of "
+                    "T-bill return. It is a cost of holding cash, reported here and not charged to the alpha above.",
+                    ""]
     if ev.notes:
         out += ["Evaluation notes:", *_bullets(ev.notes), ""]
     return out
@@ -660,8 +687,13 @@ def _overlay_value_section(r: BacktestResult) -> list[str]:
                      "starting NAV)**")]), ""]
     diff = next((d for d in (r.evaluation.ic_differences if r.evaluation is not None else [])
                  if d.a == POOL and d.b == QUANT_ONLY), None)
+    ev = r.evaluation
+    if diff is None and ev is not None and ev.clean_after is not None:
+        out.append(f"- Ranking: no paired IC on clean dates (decisions after {ev.clean_after}); the whole-window "
+                   "difference includes contaminated decisions and is not a test.")
     if diff is not None:
-        out.append(f"- Ranking: the committee pool's per-date IC minus the quant-only baseline's is "
+        out.append(f"- Ranking{' (clean dates only)' if ev is not None and ev.clean_after else ''}: the committee "
+                   f"pool's per-date IC minus the quant-only baseline's is "
                    f"{_num(diff.mean_diff, 3)} on average over {diff.n_dates} dates (t = {_num(diff.t_stat, 2)}, "
                    f"{diff.method}): {_ic_reading(diff.t_stat, diff.mean_diff)}.")
     who = "the offline rules standing in for the language models" if ov.offline else "the language models"
@@ -670,7 +702,7 @@ def _overlay_value_section(r: BacktestResult) -> list[str]:
     caveat = (" Offline rules stood in for the model, so this is a plumbing check, not a measurement of an LLM."
               if ov.offline else
               " A NAV difference from one path is noisy and pre-cutoff decisions may be contaminated; the paired IC "
-              "and the post-cutoff split are the tests.")
+              "on clean dates and the post-cutoff split are the tests.")
     out += [f"- Reading: {verdict}.{caveat}", ""]
     return out
 
@@ -685,21 +717,30 @@ def _evaluation_interpretation(r: BacktestResult) -> list[str]:
     out: list[str] = []
     pool = ev.ic.get(POOL)
     bar = 3.0 if r.n_trials > 20 else 2.0      # research 7.4 S4: t >= 3 for a pick from more than 20 trials
-    if pool is None or pool.n_dates == 0:
-        out.append("No signal IC could be computed, so the ranking skill of the forecasts is unmeasured.")
+    if ev.clean_after is not None and ev.n_clean_decisions == 0:
+        out.append(f"No decision was made after {ev.clean_after} (the models' training cutoff plus buffer), so no "
+                   "clean evidence of ranking skill exists in this backtest; the whole-window IC, random books and "
+                   "factor alpha would include memorised outcomes and are not used as evidence.")
+    elif pool is None or pool.n_dates == 0:
+        out.append("No signal IC could be computed" + (f" on the clean decisions after {ev.clean_after}"
+                                                       if ev.clean_after is not None else "")
+                   + ", so the ranking skill of the forecasts is unmeasured.")
     elif _finite(pool.t_stat) and pool.t_stat >= bar:
-        out.append(f"The committee's ranking had a mean IC of {pool.mean:+.3f} over {pool.n_dates} dates (t = "
+        out.append(f"The committee's ranking had a mean IC of {pool.mean:+.3f} over {pool.n_dates} "
+                   f"{'clean ' if ev.clean_after is not None else ''}dates (t = "
                    f"{pool.t_stat:.2f}, {pool.method}), above the t >= {bar:g} bar for {r.n_trials} recorded "
                    "configuration(s).")
     else:
-        out.append(f"The committee's ranking had a mean IC of {_num(pool.mean, 3)} over {pool.n_dates} dates (t = "
+        out.append(f"The committee's ranking had a mean IC of {_num(pool.mean, 3)} over {pool.n_dates} "
+                   f"{'clean ' if ev.clean_after is not None else ''}dates (t = "
                    f"{_num(pool.t_stat, 2)}, {pool.method}): not distinguishable from no skill (bar: t >= {bar:g}).")
     for d in ev.ic_differences:
         if d.a == POOL and d.b == QUANT_ONLY:
             if _finite(d.t_stat) and abs(d.t_stat) >= 2:
                 better = "better" if d.mean_diff > 0 else "worse"
                 out.append(f"The LLM committee ranked stocks {better} than the quant-only model (mean IC difference "
-                           f"{d.mean_diff:+.3f}, t = {d.t_stat:.2f} over {d.n_dates} dates).")
+                           f"{d.mean_diff:+.3f}, t = {d.t_stat:.2f} over {d.n_dates} "
+                           f"{'clean ' if ev.clean_after is not None else ''}dates).")
             else:
                 out.append(f"The LLM committee's ranking is not distinguishable from the quant-only model's (mean IC "
                            f"difference {_num(d.mean_diff, 3)}, t = {_num(d.t_stat, 2)}); by research 7.4 default to "

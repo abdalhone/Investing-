@@ -55,7 +55,7 @@ language models add, net of what they cost, is measured forward.
        LLM views: tier gate (cap unsupported bullish views at 0.5) → calibration map per analyst
                                                                                          ▼
        LLM pool: believability-weighted trimmed log-odds mean (+ equal-weight pool logged)
-       overlay: P_final = P_quant + clip(P_llm − P_quant, ±max_tilt)      (or "pool": quant is one member)
+       overlay: P_final = P_quant + clip(P_llm − 0.5, ±max_tilt)          (or "pool": quant is one member)
                     │ member dispersion > threshold? ── yes ──► challenge ──► private revisions ──► re-pool
                     ▼
        IC memo by the chair (can only shrink the edge)
@@ -263,8 +263,9 @@ def blind_factsheet(fs, alias="STOCK") -> FactSheet
 
 * Prompts use neutral framing, give calibration guidance (honest one-month probabilities
   usually sit between 0.35 and 0.65), require fact-ID citations, forbid numbers from
-  memory, allow abstention, and state the tier rule: a forecast above 0.50 must rest on a
-  positive evidence point citing a non-news fact, a filing event or a tier A/B news event.
+  memory, allow abstention, and say that tier-C news is an unconfirmed claim that must not
+  raise a forecast. They do not spell out what the tier gate accepts (a prompt that teaches
+  the model how to pass the gate invites it to cite an unrelated fact beside a rumor).
 * `run_analyst` turns `LLMCallFailed` or `BudgetExceeded` into an abstaining view with
   `grounding_issues=["llm failure: ..."]`. It applies `sanitize_view`, resolves citations,
   runs the grounding check and sets `grounding_ok`. `ViewRecord.model` is the model that
@@ -415,11 +416,18 @@ At each decision:
 3. A name is **eligible** if the quant has a view, its last close on or before the decision
    is at least `risk.min_price` and at most 5 calendar days old, and its 20-day average
    dollar volume (with at least 5 valid days) is at least `min_dollar_volume` (default
-   10 million USD). Prices are cut at the decision close inside the screen.
+   10 million USD). Prices are cut at the decision close inside the screen. The minimum
+   price is tested on the **as-traded** close (`PriceData.price_level`), like the risk
+   engine's price fact: Yahoo's `close` is back-adjusted for every split up to the
+   download date, so it would screen out a name on a split that had not happened yet.
+   Dollar volume uses `close × volume`, which splits do not change.
 4. Eligible names are ranked by quant probability (ties by ticker).
 5. The **deep-dive set** is the top `deep_dive_top_n` eligible names (default 12) whose
    probability is above 0.5, then every held name, whatever its rank. Held names are
-   always included (not configurable): leaving one out would force a sale.
+   always included (not configurable): leaving one out would force a sale. Keep
+   `deep_dive_top_n` at 5 or more: a date's paired IC needs 5 common names, so a narrower
+   band can never measure the adaptive overlay bound or the shadow-book ranking test (the
+   decision warns, and both say how many dates were skipped for too few names).
 
 Only deep-dive names get LLM calls, news reading and new positions. The quant still writes
 a forecast for every screened name, which gives the IC statistics their breadth. The full
@@ -446,13 +454,21 @@ active member the result is 0.5 and an excess of 0.
 **Bounded overlay** (RESEARCH 6.6):
 
 ```
-p_final = p_quant + clip(p_llm − p_quant, −max_tilt, +max_tilt)
+p_final = clip(p_quant + clip(p_llm − 0.5, −max_tilt, +max_tilt), 0, 1)
 expected excess used for sizing = σ_h · Φ⁻¹(p_final)
 ```
 
 * `p_quant` is the quant's probability; when the quant abstains the core is 0.5.
 * `p_llm` is the pool of the LLM analysts' tier-gated, calibrated probabilities. When every
   LLM analyst abstains, `p_final = p_quant` exactly.
+* The tilt is the LLM pool's **own edge** (`p_llm − 0.5`), a residual added to the core, not
+  its distance from the quant. An LLM pool at 0.5 is "no information" and leaves the core
+  exactly where it is: a view the tier gate capped at 0.5, an analyst whose calibration map
+  shrank it to 0.5 for lack of skill, an analyst stating no edge. (The earlier rule,
+  `clip(p_llm − p_quant)`, read such a pool as a vote that the stock would lag and cut every
+  quant pick toward 0.5, below `min_prob_to_hold`, so the gate and calibration sold what
+  the quant-only shadow held.) A bullish pool can only raise the core, a bearish one only
+  lower it.
 * `σ_h` is `horizon_sigma_pct` (the quant's own volatility scale).
 * With the quant in [0.44, 0.56] and the default bound 0.05, the final probability stays in
   [0.39, 0.61].
@@ -501,7 +517,10 @@ w       = sign(kelly) · min(max_position, |kelly|) · m · d,   kelly = kelly_f
   between the two is not force-traded.
 * **Trade path.** A no-trade band (`no_trade_band`, 0.5% of NAV); **partial rebalancing**:
   each trade moves `rebalance_fraction` (0.5) of the way to the target, unless the gap left
-  would be smaller than the band, in which case the trade completes; and a turnover cap.
+  would be smaller than the band, or than `MIN_RESIDUAL_GAP` (0.25% of NAV) when the band
+  is smaller (with a band of 0 an exit would otherwise halve for ever), in which case the
+  trade completes; and a turnover cap. Each position records `ideal_weight`, the target
+  before this trade path, which the risk engine's de-risk caps at one half.
   Turnover is **one-way**: `0.5 · Σ|w_target − w_current|` over every leg, core included.
 * **Forced exits.** A held name absent from `aggs` (no longer covered) is sold in full: it
   skips the band, partial rebalancing and the turnover cap, and its turnover is spent first.
@@ -548,7 +567,15 @@ Rules, in order:
 5. **De-risk with hysteresis.** A drawdown of `drawdown_derisk` (10%) or more halves the
    active weights and sets `derisked`. The book stays halved until
    `nav ≥ trough + 0.5 · (peak − trough)` or a new peak (RESEARCH 6.4: re-risk after
-   recovering half the drawdown).
+   recovering half the drawdown). "Halved" is relative to the un-derisked plan and does
+   not compound: a leg built by construction carries `TargetPosition.ideal_weight` (its
+   target before the band, partial rebalancing and turnover cap) and is capped at
+   `0.5 × |ideal_weight|`; halving the incoming target instead compounded with partial
+   rebalancing (a step from a book already halved last cycle) and sold every cycle toward
+   a third of the ideal. A deliberate hold (`pipeline:hold` on an LLM outage,
+   `unreviewed_hold`, `no_view_hold`, `risk_review_halt`) is halved once, on the cycle the
+   de-risk triggers, and kept on every later cycle of the episode: an LLM outage never
+   forces a sale. A hand-built target without `ideal_weight` is halved.
 6. Restricted tickers and prices below `min_price` go to 0. A name without a verifiable
    price may not grow.
 7. **Daily-loss halt.** If any one-day NAV loss since the previous cycle
@@ -603,10 +630,11 @@ def scorecard(records, as_of=None, include_pre_cutoff=True) -> dict[str, dict]
 def believability_weights(records, as_of, agents, min_n=20, prior_n=30, floor=0.25, cap=2.0,
                           include_pre_cutoff=False, min_dates=20) -> dict[str, float]
 def fit_calibrators(records, as_of, agents, *, include_pre_cutoff=False, min_n=30, prior_strength=50.0,
-                    a_bounds=(-0.5, 0.5), b_bounds=(0.0, 1.5), models=None) -> dict[str, Calibrator]
+                    a_bounds=(-0.5, 0.5), b_bounds=(0.0, 1.5), models=None, min_dates=20) -> dict[str, Calibrator]
 def calibrate_view(v, cal) -> ViewRecord
 def resolved_rank_ic(records, as_of, agent="committee", *, include_pre_cutoff=False, min_names=3, nw_lags=0)
 def paired_rank_ic(records, as_of, agent_a, agent_b, *, include_pre_cutoff=False, min_names=3, nw_lags=0)
+    # -> PairedIC(mean_diff, t_stat, n_dates, mean_a, mean_b, n_thin): n_thin = dates skipped for too few names
 class LessonStore:            # lessons.py (JSONL)
     def retrieve(self, agent, as_of, k=5) -> list[str]   # only lessons resolved on or before as_of
 ```
@@ -634,7 +662,9 @@ and `unresolvable` says why.
 **One forecast per question.** A question is (decision date, ticker, agent, sample)
 (`question_key`). `add` keeps the first forecast of a question, so a forced re-decision
 cannot count twice. `pre_cutoff` is set when the model may have seen the period in
-training (deterministic code never; an unknown cutoff always).
+training: on or before its cutoff plus `evaluation.cutoff_buffer_days` (31), the same rule
+as the backtest's `contamination_end` (deterministic code never; an unknown cutoff always).
+A non-default buffer therefore changes which track record counts, and the fingerprint.
 
 **Believability** (P7). The Brier score is the mean squared error of a probability
 forecast against the 0/1 outcome; always saying 0.5 scores 0.25.
@@ -664,7 +694,10 @@ logit(p_cal) = a + b · logit(p_raw)
   fit (37.5% at n = 30).
 * **Bounds.** `b ∈ [0, 1.5]` (shrink or mildly sharpen, never invert the order) and
   `a ∈ [−0.5, 0.5]`.
-* **Minimum sample.** Below `min_n` (30) questions the map is the identity.
+* **Minimum sample.** Below `min_n` (30) questions, or with questions from fewer than
+  `calibration.min_dates` (20) distinct decision dates, the map is the identity: one date's
+  questions share one market episode, and the intercept would learn that episode's base
+  rate of beating the benchmark rather than the agent's bias.
 * **No new direction.** `apply()` leaves a raw 0.5 at 0.5 and returns 0.5 when the map
   would cross 0.5; output is clipped to [0.02, 0.98].
 * `calibrate_view` calibrates a *copy* for pooling and scales its expected excess return by
@@ -724,9 +757,15 @@ book every day at closes that are not adjusted for dividends and credits each ex
 cash dividend, inferred from adjusted versus unadjusted closes
 (`pipeline.implied_dividends`). Baselines run through the same engine: benchmark buy-and-hold
 (same total-return accounting, no costs), an equal-weight universe (same dates and costs)
-and, except in quant mode, the quant-only configuration. Each run appends to
-`<runs_dir>/trials.jsonl`; the number of distinct (fingerprint, mode, start, end) trials
-feeds the deflated Sharpe. Returns are split at `contamination_end` (training cutoff plus
+and, except in quant mode, the quant-only configuration. Fact sheets are built once per
+decision date and shared by the strategy and the quant-only baseline (in a backtest they
+depend only on the date, the prices, the loaders and `cfg.universe`; each policy gets a
+deep copy). Each run appends to `<runs_dir>/trials.jsonl` (with `universe_digest` and, for
+offline and llm runs, the `prompts` digest); the number of distinct (fingerprint, mode,
+start, end, prompts) trials feeds the deflated Sharpe. The fingerprint covers the
+*resolved* screened universe (`FirmConfig.investable_tickers`), not the path of the
+universe file: editing the file is a new trial, and the same tickers reached through
+another path are the same trial. Returns are split at `contamination_end` (training cutoff plus
 `evaluation.cutoff_buffer_days`). After the run, `result.evaluation` is computed from the
 recorded decisions with no new decision and no LLM call (section 3.17).
 `BacktestResult` also records daily `exposure`, `baseline_nav`, `universe_note`
@@ -750,8 +789,9 @@ scorecard, honest interpretation, warnings). `six_lines(result)` returns the six
   `--min-dollar-volume`, `--combination`, `--max-tilt`, `--no-calibration`,
   `--no-news-reader`, `--no-tier-gate`, `--rebalance-fraction`) change the fingerprint.
   Evaluation flags on `backtest` (`--random-books`, `--seed`, `--sector-matched-books`,
-  `--cost-multipliers`, `--breakeven-cap`, `--cutoff-buffer-days`, `--ic-min-names`,
-  `--no-factor-proxies`) do not. Every flag is validated like the config file.
+  `--cost-multipliers`, `--breakeven-cap`, `--ic-min-names`, `--no-factor-proxies`) do
+  not; `--cutoff-buffer-days` does only when it differs from the default 31 (it also sets
+  which LLM forecasts are flagged `pre_cutoff`). Every flag is validated like the config file.
 * `runs_dir` is relative to the config file, so a scheduled run from another directory
   finds the same book and kill switch.
 
@@ -760,7 +800,7 @@ scorecard, honest interpretation, warnings). `six_lines(result)` returns the six
 **Data flow.**
 
 ```
-recent_headlines (live only, published ≤ 16:00 New York close)
+recent_headlines (live only, published ≤ the session's New York close: 16:00, 13:00 on a half day)
   └─► read_headlines (deep-dive names only; news reader enabled; an LLM present)
         1. drop late or undated headlines; keep the newest news_max_headlines (20)
         2. tier each headline by code: source_tier(publisher, link, issuer_domains)
@@ -780,6 +820,16 @@ Every other sheet with headlines (outside the deep dive, reader disabled, no LLM
 * The reader never sees the publisher or the link; code judges the source.
 * The instruction detector is a set of regular expressions. It will miss adaptive attacks;
   the guarantees come from code-set tiers, the separate calls, sanitisation and the gate.
+* **Invisible characters are deleted** before detection and before any text goes into a
+  reader block: control (Cc), format (Cf: zero-width characters, bidi controls, the soft
+  hyphen, the Unicode tag characters used for "ASCII smuggling"), private-use, unassigned
+  and the other default-ignorable code points (U+034F, variation selectors, Hangul
+  fillers). Deleting rather than spacing them keeps "dis​regard" detectable as
+  "disregard".
+* **Point-in-time close.** The cutoff is the session's real close
+  (`aifirm.data.calendar.session_close_time`): 13:00 on the scheduled half days (the day
+  after Thanksgiving, Christmas Eve and 3 July from Monday to Thursday), else 16:00. The
+  same close bounds SEC filings (`fundamentals.decision_cutoff`).
 * Blind mode withholds news-event facts.
 
 **Tier table** (`aifirm.data.news.NEWS_SOURCES`; the tier is set by code, never by a model):
@@ -800,30 +850,49 @@ Matching trusts the **link host** over the free-text publisher name:
    `reuters-markets.biz` is a spoof).
 4. No http(s) link: tier C.
 
+The link host is the one a browser would load (`link_host`): a backslash is a path
+separator in an http(s) URL, as in the WHATWG URL standard (so
+`https://evil.example\@www.reuters.com/x` is on `evil.example`, not Reuters, although
+`urllib.parse.urlsplit` alone reads `reuters.com`), userinfo is not the host, and a host
+that is not a plain DNS name after IDNA encoding is tier C.
+
 This simplifies the research's rule (RESEARCH 5.5): there, tier B needs two
 upstream-independent outlets, and newswires carry a known hoax risk. Here one established
 outlet is tier B and newswires are tier A. There is no corroboration and no tier-C hold.
 
 **Tier gate** (`agents/tier_gate.py`). It applies only to sheets with news content. A view
-is *bullish* if its sealed probability or its revised probability is above 0.5. A bullish
-LLM view passes only if at least one **positive** evidence item cites a fact on the sheet
-that is admissible:
+is *bullish* if its probability is above 0.5 **or its expected excess return is above 0**
+(a 0.5 view with a large positive excess feeds the pooled excess and so the size). The
+question is what the view would be without the unverified news. A bullish sealed LLM view
+passes only if at least one **positive** evidence item
 
-* a non-event fact (price, fundamentals, macro and market facts), or
-* a filing fact `TICKER.filing_N`, or
-* a news fact `TICKER.news_N` whose code-assigned tier is A or B (a news fact without
-  metadata counts as tier C).
+* cites no inadmissible event: no tier-C news fact, no news fact without metadata, no
+  event-like ID that is not on the sheet (an item mixing a rumor with another fact rests
+  partly on the rumor and does not count), and
+* cites at least one admissible fact on the sheet: a filing fact `TICKER.filing_N`, a news
+  fact `TICKER.news_N` of tier A or B, or (every role except `events`) a directional
+  non-event fact. Context levels are not directional and never count: the share price,
+  `vol_20d`, `vol_60d`, `adv_20d`, `shares_out`, `market_cap`, `MACRO.VIXCLS` and
+  `MKT.<benchmark>_vol_20d`. The `events` analyst's only non-event facts are the price, the
+  1-month return and the 20-day volatility, which any rumor-based view could cite, so its
+  bullish view needs a filing or a tier A/B news event.
 
-Otherwise a capped copy is pooled: probabilities `min(p, 0.5)` and expected excess returns
-`min(x, 0)`, sealed and revised. The gate never raises a probability. Support is judged
-from the sealed view's evidence only, so a revision that becomes bullish is capped unless
-the sealed evidence already had admissible support. The quant is never gated.
+A **revision** that raises the probability or the excess above the gated sealed values,
+and is bullish, passes only if the IDs the reviser cited as new evidence
+(`ViewRecord.revision_fact_ids`, stored when the committee accepts the revision) contain
+admissible support and no inadmissible event; otherwise the revised values are capped at
+`max(gated sealed p, 0.5)` and `max(gated sealed excess, 0)`. Otherwise a capped copy is
+pooled: probabilities `min(p, 0.5)` and expected excess returns `min(x, 0)`. The gate never
+raises a probability, and in the overlay a capped view at 0.5 tilts the quant core by 0.
+The prompts tell the analysts that tier-C news is an unconfirmed claim but do not spell out
+what the gate accepts. The quant is never gated.
 
 ### 3.15 Re-identification harness (`agents/reid.py`, `aifirm reid-probe`)
 
 Blind mode only helps if the model cannot tell which stock and month a blind sheet is.
 `run_reid_probe(llm, factsheets, *, model, role=None, candidate_tickers, month_window,
-min_probes=400, max_excess=0.01, max_upper=0.02)` measures it on the exact payload:
+min_probes=400, max_excess=0.01, max_upper=0.02, max_marginal_excess=0.05,
+max_marginal_lower=0.02)` measures it on the exact payload:
 
 * Each real sheet is blinded with `blind_factsheet` and rendered as the full blind sheet
   (default; a superset of every slice) or one analyst's slice (`role`).
@@ -833,8 +902,12 @@ min_probes=400, max_excess=0.01, max_upper=0.02)` measures it on the exact paylo
   the month, and their product for both ("joint").
 * Hit rates carry Wilson 95% intervals. A failed call is excluded, not counted as a miss.
 * **Gate:** at least 400 answered probes; joint hit rate at most 1 percentage point above
-  joint chance; joint upper bound at most 2 points above joint chance; and no payload
-  contains the true ticker, the as-of date or the company name verbatim.
+  joint chance; joint upper bound at most 2 points above joint chance; neither marginal
+  (ticker, month) more than 5 points above its chance, nor with a Wilson lower bound more
+  than 2 points above it; and no payload contains the true ticker, the as-of date or the
+  company name verbatim. The marginals matter with a large candidate list: a model that
+  dates every sheet but never names the ticker sits near joint chance, yet knowing the
+  month is the look-ahead blind mode exists to stop.
 
 `aifirm reid-probe --config F --start D --end D [--n 400] [--role R] [--model M]` samples
 (date, ticker) pairs reproducibly (`--seed`) from the rebalance dates and the whole
@@ -887,10 +960,29 @@ from forecasts resolved by that date. The verdict is "not yet measurable" until 
 t ≤ −2, else "no difference" (default to the simpler design). NAVs come from the ledgers'
 `cycle_start` entries; a NAV gap over a short window is mostly noise.
 
+* A session counts as decided only if its cycle completed (`cycle_end`). A cycle that
+  started and failed (`cycle_error`, for example an exception inside the decision) is a
+  missed session, for the shadow and the live book alike, and the notes say so.
+* The NAV at the compared close is the NAV *before* that session's decision (its orders fill
+  at the next open), so the LLM spend charged is that of the cycles strictly before it,
+  failed attempts included (`cycle_error` logs the spend of the calls made before the
+  failure). The latest decision's spend is shown as pending until its fills reach a NAV.
+* Dates skipped because fewer than `evaluation.ic_min_names` names had both forecasts are
+  counted and reported: a deep-dive band that narrow can never make the comparison
+  measurable.
+
 ### 3.17 Backtest evaluation (`backtest/ic.py`, `random_books.py`, `evaluation.py`, `factors.py`)
 
 Every part is computed after the run from the recorded decisions, independently. A part
 that fails is reported as missing with a note, never as a result.
+
+**Clean decisions only (P10).** When the run's models have a training cutoff (llm and
+offline modes), the IC, the paired IC tests, the power, the random books and the factor
+alpha use only the decisions made after `contamination_end` (and the returns earned under
+them). The whole-window IC is kept apart (`Evaluation.contaminated_ic`), shown in a table
+labelled "not evidence of skill", and no verdict sentence reads it; with no clean decision
+the report says that no clean evidence exists. The cost sensitivity re-executes every
+recorded decision and says so.
 
 * **Forward excess return.** Ticker total return minus benchmark total return from the open
   of the execution day (the trading day after the decision) to the close of the
@@ -899,8 +991,8 @@ that fails is reported as missing with a note, never as a result.
   so the two windows differ by the overnight gap.)
 * **Signal IC.** Per decision date, the Spearman rank correlation between a signal's
   probabilities and forward excess returns (at least `ic_min_names`, default 5, names).
-  Signals: `pool` (the firm's final probability: the overlay or pool probability for
-  committee names, the quant's for screened names outside the deep dive), the
+  Signals: `pool`, labelled "Firm's final probability (traded)" (the overlay or pool
+  probability for committee names, the quant's for screened names outside the deep dive), the
   equal-weight variant, each analyst's sealed probability, and the quant-only baseline.
   Reported: mean, std, t-stat, hit rate, names per date. The t-stat is plain when
   `rebalance_every_days ≥ horizon_days`; otherwise Newey-West with `ceil(h/r) − 1` lags.
@@ -930,8 +1022,12 @@ that fails is reported as missing with a note, never as a result.
 * **Cutoff buffer.** `contamination_cutoff = training cutoff + cutoff_buffer_days` (31).
   Decisions on or before it are contaminated. `BacktestResult.model_cutoff` stays the raw
   vendor cutoff.
-* **Factor attribution.** OLS of daily strategy return minus cash (BIL) on ETF factor
-  proxies with Newey-West errors: market (SPY − cash), size (IWM − SPY), value (IWD − IWF),
+* **Factor attribution.** OLS of the daily strategy return minus the T-bill return (BIL) on
+  the *invested* fraction of NAV at the previous close (`BacktestResult.exposure`), on ETF
+  factor proxies with Newey-West errors. The paper broker pays no interest on cash, so
+  charging the full T-bill rate would book `(1 − invested) × rf` of cash drag as negative
+  alpha (a book 20% in SPY would show about −0.8·rf a year with a huge t-stat); the cash
+  drag is reported on its own line instead. Factors: market (SPY − cash), size (IWM − SPY), value (IWD − IWF),
   momentum (MTUM − SPY), quality (QUAL − SPY), low volatility (USMV − SPY). A factor whose
   data cover less than 95% of the days is dropped with a note. Alpha is annualised with
   its t-stat. Proxies are downloaded only when `run_backtest` downloaded its own prices.
@@ -961,7 +1057,7 @@ These are engineering defaults from the research, not optimised values.
 | `process.overlay_max_tilt` | 0.05 | 6.6 asks for a bound; the value is an engineering choice |
 | `process.overlay_min_dates` | 12 | engineering choice |
 | `process.believability_min_dates` | 20 | 6.2: "after at least about 20 graded dates" |
-| `calibration.min_n`, `prior_strength` | 30, 50 | 4 and 6.1 (overconfidence; calibrate); values are engineering choices |
+| `calibration.min_n`, `min_dates`, `prior_strength` | 30, 20, 50 | 4 and 6.1 (overconfidence; calibrate); 6.2 item 3 (about 20 graded dates); values are engineering choices |
 | `universe.screen.deep_dive_top_n` | 12 (screen off by default) | 9.2 and 9.3 item 1 |
 | `evaluation.n_random_books` | 1000 | 9.3 item 6 |
 | `evaluation.cost_multipliers` | 0, 1, 2 | 7.4 S0: results must survive 2× costs |
@@ -989,19 +1085,25 @@ The research recommends several controls the code does not implement yet:
   fast path, no stop-triggered re-review (RESEARCH 6.4, 5.5). Drawdown thresholds are fixed,
   not scaled to expected volatility.
 * **News:** tier B needs one established outlet, not two independent ones; no tier-C hold;
-  no historical (point-in-time) news archive, so news is never backtested; early-close
-  sessions need `close_time="13:00"` from a calendar the repository does not have.
+  no historical (point-in-time) news archive, so news is never backtested. The close-time
+  calendar knows the scheduled half days (13:00) but no ad-hoc closures. In a live run the
+  headline feed is fetched for every universe name, although only the deep-dive names'
+  headlines are read.
 * **Aggregation:** no per-agent cross-sectional de-biasing (median/MAD standardisation,
-  RESEARCH 6.2 item 1). The overlay compares probability levels, so an LLM pool whose
-  probabilities sit closer to 0.5 than the quant's pulls every final probability toward
-  0.5 rather than reordering names. Calibration corrects level bias only after 30 resolved
-  questions per agent. No extremising; no market-implied prior. Believability does
-  not reset when an analyst's model changes (calibration does).
-* **Contamination:** cutoffs are vendor dates plus a buffer, not measured cutoffs. The
-  `pre_cutoff` flag on forecast records uses the raw cutoff without the 31-day buffer, so
-  the scorecard's "pre-cutoff" column and believability's exclusion end 31 days earlier
-  than the backtest's split. Prompt edits in code do not change the config fingerprint, so
-  they are not counted as trials.
+  RESEARCH 6.2 item 1). The overlay adds the LLM pool's own edge (`p_llm − 0.5`) to the
+  quant, so an LLM pool with a persistent optimistic bias tilts every name up until
+  calibration (after 30 resolved questions from 20 dates per agent) removes the bias, and
+  an LLM that agrees with the quant adds to it (bounded by `max_tilt` and the adaptive
+  bound). No extremising; no market-implied prior. Believability does not reset when an
+  analyst's model changes (calibration does).
+* **Contamination:** cutoffs are vendor dates plus a buffer, not measured cutoffs (the
+  forecast store's `pre_cutoff` flag and the backtest use the same buffer). Prompt edits do
+  not change the config fingerprint; the trial ledger counts them through a digest of the
+  prompt modules' source (`backtest.engine.prompt_digest`), any edit to those modules
+  included. The backtest does not refuse a pre-cutoff LLM run without blind mode and a
+  passing re-identification report (its skill evidence uses only clean decisions, and its
+  contaminated returns are reported apart). Blind mode keeps the SEC SIC sector label,
+  which can nearly name a company on real data.
 * **Evaluation:** no probability of backtest overfitting (PBO), no vintage ladder across
   several models, no one-use holdout enforcement, no regime breakdown
   (see [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md)).

@@ -3,7 +3,7 @@ name = "aifirm"
 version = "0.1.0"
 description = "A research-grade multi-agent AI investment firm: verified data desk, independent analyst agents, adversarial review, deterministic portfolio construction and risk, decision journal with calibration scoring."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "anthropic>=2.9",
   "pandas>=2.2",

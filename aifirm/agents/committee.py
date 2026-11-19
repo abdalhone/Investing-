@@ -39,7 +39,7 @@ Why the process looks like this (see docs/ARCHITECTURE.md):
   never told it said something it did not. The quant is neither gated nor calibrated.
 * **Quant core plus a bounded LLM overlay (RESEARCH 6.6).** With
   ``process.combination = "overlay"`` (the default) the final probability is the quant's,
-  tilted by the pooled LLM analysts by at most ``max_tilt``
+  tilted by the pooled LLM analysts' own edge (pooled P minus 0.5) by at most ``max_tilt``
   (:mod:`aifirm.portfolio.overlay`); with ``"pool"`` every analyst, quant included, is one
   member of the trimmed log-odds pool. Either way the challenge round is triggered by the
   dispersion of all members and the challenger is the most opposed LLM analyst.
@@ -456,8 +456,8 @@ def memo_user_prompt(fs: FactSheet, cfg: FirmConfig, views: list[ViewRecord], ag
         core = f"{agg.prob_quant:.3f}" if agg.prob_quant is not None else "none (the quant abstained; core 0.500)"
         llm_p = f"{agg.prob_llm:.3f}" if agg.prob_llm is not None else "none (every language-model analyst abstained)"
         lines += ["How the pooled probability was formed: the deterministic factor model is the core; the "
-                  "language-model analysts' pooled probability may tilt it by at most "
-                  f"{agg.max_tilt or 0.0:.3f} either way.",
+                  "language-model analysts' pooled edge (their pooled probability minus 0.50) is added to it, "
+                  f"limited to {agg.max_tilt or 0.0:.3f} either way.",
                   f"Factor-model core: {core}; analysts' pool (calibrated): {llm_p}; tilt applied: "
                   f"{agg.overlay_tilt or 0.0:+.3f}"]
     lines += ["", "ANALYST VIEWS (anonymised; letters are random labels in a random order, not ranks; probabilities "
@@ -563,6 +563,7 @@ def _apply_revision(v: ViewRecord, rev: Revision, valid_ids: set[str], ticker: s
         status = "accepted"
         v.revised_prob = clamp(rev.prob_outperform, PROB_FLOOR, 1 - PROB_FLOOR)
         v.revised_excess_pct = clamp(rev.expected_excess_return_pct, -100.0, 300.0)
+        v.revision_fact_ids = list(grounded)     # what the tier gate checks a raised revision against
     return {"ticker": ticker, "agent": v.agent, "sample": v.sample, "model": v.model, "status": status,
             "prob_before": before_p, "prob_after": v.revised_prob, "excess_before": before_x,
             "excess_after": v.revised_excess_pct, "claimed_change": rev.changed, "reason": rev.reason,
@@ -577,6 +578,7 @@ def _run_revisions(llm: LLM, fs: FactSheet, cfg: FirmConfig, views: list[ViewRec
     active = [v for v in views if not v.view.abstain]
     for v in active:                      # default: everyone keeps the sealed view (challenger and quant included)
         v.revised_prob, v.revised_excess_pct = v.view.prob_outperform, v.view.expected_excess_return_pct
+        v.revision_fact_ids = []
     revisers = [v for v in active if v.agent in ROLES and v.agent != challenger.agent]
     challenge_ids = {i for e in challenge.evidence for i in e.fact_ids}
 

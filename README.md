@@ -17,7 +17,8 @@ Data desk (Yahoo prices, SEC filings as filed, FRED macro; every number has an I
    -> raw headlines -> quarantined news reader -> typed events, source tier A/B/C set by code
    -> analysts: fundamental | technical | macro | events (Claude) + quant model (code), sealed views
    -> tier gate (unverified news cannot lift a view) -> calibration per analyst
-   -> LLM pool tilts the quant probability by at most 0.05 (bounded overlay)
+   -> the LLM pool's own edge (P_llm - 0.5) tilts the quant probability by at most 0.05 (bounded overlay;
+      a pool at 0.5, e.g. gated or calibrated to no skill, leaves the quant unchanged)
    -> challenge round only if members disagree -> private revisions
    -> IC memo by the chair (can only shrink the edge)
    -> portfolio engine (code): quarter Kelly, 8% cap, sectors, volatility target, half-way rebalancing
@@ -152,8 +153,9 @@ and windows you have tried raises the bar of the deflated Sharpe ratio, so keep 
 Strategy flags (`--combination`, `--max-tilt`, `--no-calibration`, `--no-news-reader`,
 `--no-tier-gate`, `--rebalance-fraction`, the screen flags) count as new configurations.
 Evaluation flags (`--random-books`, `--seed`, `--sector-matched-books`,
-`--cost-multipliers`, `--breakeven-cap`, `--cutoff-buffer-days`, `--ic-min-names`,
-`--no-factor-proxies`) do not.
+`--cost-multipliers`, `--breakeven-cap`, `--ic-min-names`, `--no-factor-proxies`) do
+not. `--cutoff-buffer-days` counts as a new configuration only when it differs from the
+default 31: it also decides which LLM forecasts are clean track record.
 
 ### 5. Test blind mode before any pre-cutoff LLM backtest
 
@@ -165,7 +167,9 @@ aifirm reid-probe --config my.toml --start 2024-01-02 --end 2026-05-29 --n 400 -
 The probe shows the model 400 blind fact sheets and asks it to name the stock and month.
 The gate passes only with at least 400 answered probes, a joint hit rate (stock and month)
 no more than 1 percentage point above chance, a 95% upper bound no more than 2 points above
-chance, and no sheet that contains the ticker, date or company name. The command exits
+chance, neither the stock nor the month guessed more than 5 points above its own chance (or
+significantly more than 2 points above it), and no sheet that contains the ticker, date or
+company name. The command exits
 with status 1 when the gate fails. An LLM backtest with decisions on or before the model's
 cutoff plus 31 days needs `process.blind_mode = true` and a passing probe on the same
 universe and window; the backtest does not check this for you. See
@@ -244,7 +248,7 @@ report fields and thresholds, and marks what the code does not check for you.
 | S0 | Validate the machinery without an LLM: tests, quant and offline backtests, ledger checks, results that survive 2× costs. |
 | S1 | For each model, know the contaminated period: training cutoff plus a 31-day buffer (vendor dates; measuring the real cutoff is up to you). |
 | S2 | Before any backtest on pre-cutoff data, pass the re-identification gate (`aifirm reid-probe`) with blind mode on. |
-| S3 | On pre-cutoff data, tune only plumbing, risk and costs, never prompts. The trial ledger counts configurations; prompt edits are not counted unless you change the config's `name`. |
+| S3 | On pre-cutoff data, tune only plumbing, risk and costs, never prompts. The trial ledger counts configurations and, for offline and LLM runs, prompt edits (a digest of the prompt modules' source). |
 | S4 | Choose a design by paired per-date IC tests on several models' clean windows; require DSR ≥ 0.95, factor alpha t ≥ 2 and the 95th percentile against random books. Each backtest report computes these; the multi-model ladder is manual. |
 | S5 | One untouched holdout on the production model's clean window. Not enforced. |
 | S6 | Forward paper trading of one frozen configuration with the shadow book; `aifirm compare` gives a verdict after about two years of monthly decisions. Pilot capital and scaling are human decisions. |
@@ -311,7 +315,9 @@ first.
   `examples/runs/KILL`) and no orders are generated, for the live, offline and shadow
   books, until you delete it.
 - **Drawdown rules.** At a 10% drawdown from the peak the active positions are halved
-  until half of the drawdown is recovered. At 20% the active positions go to cash (the
+  (half of what construction would otherwise hold, not half again every cycle; a position
+  kept because of an LLM outage or a failed memo is halved once, never sold again for the
+  outage) until half of the drawdown is recovered. At 20% the active positions go to cash (the
   passive core is kept) and the book stays frozen until a human resets it. After a one-day
   loss of 5% or more since the previous cycle, no position may grow that cycle.
 - **Unfreeze.** Review what happened, then run
@@ -331,8 +337,10 @@ first.
 - **Config mistakes stop the run.** An unknown key is an error, and fractions are
   range-checked: `max_position = 10` is refused with "use 0.10 for 10%".
 - **Untrusted text.** Headlines are read only by a tool-less reader whose output code
-  validates; source tiers are set by code; a bullish view resting only on unverified news
-  is capped at 0.5.
+  validates; source tiers are set by code (from the host a browser would load); invisible
+  Unicode characters are deleted before anything is read; a bullish view resting only on
+  unverified news is capped at 0.5 (citing an unrelated fact beside the rumor does not
+  count), and a capped view leaves the quant's probability unchanged.
 
 ## Not investment advice
 

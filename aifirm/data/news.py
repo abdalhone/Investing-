@@ -9,12 +9,14 @@ with :func:`headlines_as_of`.
 
 Point-in-time rule (P3)
 -----------------------
-A decision is made at the close of ``as_of``: 16:00 America/New_York on that date
-(:func:`decision_close_utc`, daylight saving handled by the time-zone database). Only a
-headline whose parsed publish time is at or before that instant may be read. A headline
-with a missing or unparseable time is dropped (fail closed): its age cannot be proven.
-Early-close sessions (13:00 on some holiday eves) are not known to this module; a caller
-with an exchange calendar passes ``close_time="13:00"`` for them.
+A decision is made at the close of ``as_of``: 16:00 America/New_York on that date, or
+13:00 on the exchange's scheduled half days (:func:`aifirm.data.calendar.session_close_time`:
+the day after Thanksgiving, and Christmas Eve and 3 July on Monday to Thursday), see
+:func:`decision_close_utc` (daylight saving handled by the time-zone database). Only a
+headline whose parsed publish time is at or before that instant may be read: a 14:30
+headline on a 13:00 half day came after the close the forecast is scored from. A headline
+with a missing or unparseable time is dropped (fail closed): its age cannot be proven. A
+caller may still pass an explicit ``close_time``.
 
 Source tiers (RESEARCH 5.5, 9.3 item 3)
 ---------------------------------------
@@ -59,6 +61,8 @@ from urllib.parse import urlsplit
 
 import pandas as pd
 
+from .calendar import session_close_time
+
 DECISION_CLOSE_TZ = "America/New_York"
 DECISION_CLOSE_TIME = "16:00"
 
@@ -75,10 +79,12 @@ class Headline:
 # --------------------------------------------------------------------------- point-in-time cutoff
 
 
-def decision_close_utc(as_of: date | str | pd.Timestamp, close_time: str = DECISION_CLOSE_TIME) -> pd.Timestamp:
-    """The decision instant for ``as_of``: ``close_time`` (default 16:00) New York time on
-    that calendar date, in UTC."""
+def decision_close_utc(as_of: date | str | pd.Timestamp, close_time: str | None = None) -> pd.Timestamp:
+    """The decision instant for ``as_of``: ``close_time`` New York time on that calendar
+    date, in UTC. ``close_time=None`` (the default) is the session's own close: 13:00 on a
+    scheduled half day, else 16:00 (:func:`aifirm.data.calendar.session_close_time`)."""
     day = pd.Timestamp(as_of).date()
+    close_time = close_time or session_close_time(day)
     return pd.Timestamp(f"{day.isoformat()} {close_time}").tz_localize(DECISION_CLOSE_TZ).tz_convert("UTC")
 
 
@@ -98,7 +104,7 @@ def published_utc(h: Headline) -> pd.Timestamp | None:
 
 def headlines_as_of(headlines: list[Headline], as_of: date | str | pd.Timestamp,
                     max_age_days: int | None = None,
-                    close_time: str = DECISION_CLOSE_TIME) -> tuple[list[Headline], int]:
+                    close_time: str | None = None) -> tuple[list[Headline], int]:
     """Headlines readable at the close of ``as_of`` (point-in-time, see the module docstring).
 
     Keeps a headline only if its publish time parses and is at or before
@@ -144,10 +150,10 @@ def _parse_item(item: dict) -> Headline | None:
 
 
 def recent_headlines(ticker: str, as_of: date | str, max_items: int = 12, max_age_days: int = 14,
-                     close_time: str = DECISION_CLOSE_TIME) -> list[Headline]:
-    """Headlines published at or before the ``close_time`` (16:00) New York close of ``as_of``
-    and at most ``max_age_days`` before it, newest first. Live use only (the feed cannot be
-    replayed)."""
+                     close_time: str | None = None) -> list[Headline]:
+    """Headlines published at or before the New York close of ``as_of`` (the session's own
+    close unless ``close_time`` is given: 13:00 on a half day, else 16:00) and at most
+    ``max_age_days`` before it, newest first. Live use only (the feed cannot be replayed)."""
     import yfinance as yf
 
     try:
@@ -221,19 +227,37 @@ def normalize_publisher(name: str) -> str:
     return text.strip()
 
 
+_HOST_CHARS = re.compile(r"[a-z0-9.-]+")
+
+
 def link_host(link: str) -> str:
     """Lower-case host of an http(s) link without "www." or a trailing dot; "" for anything
-    else (no link, another scheme, unparseable). ``https://reuters.com@evil.io/x`` -> "evil.io"."""
+    else (no link, another scheme, unparseable, or a host that is not a plain DNS name).
+
+    The host must be the one a browser would load, or a story could borrow a trusted
+    outlet's tier. Parsing follows the WHATWG URL rules where they differ from
+    :func:`urllib.parse.urlsplit`: a backslash in an http(s) URL is a path separator, so
+    ``https://evil.example\\@www.reuters.com/x`` is on ``evil.example`` (urlsplit alone reads
+    ``reuters.com``) and ``https://evil.io\\.reuters.com/x`` is on ``evil.io``; userinfo is
+    not the host (``https://reuters.com@evil.io/x`` -> "evil.io"). After IDNA encoding the
+    host may contain only ``[a-z0-9.-]``; anything else returns "" (tier C: unverifiable)."""
     if not link or not isinstance(link, str):
         return ""
+    text = link.strip().replace("\\", "/")
     try:
-        parts = urlsplit(link.strip())
+        parts = urlsplit(text)
         host = parts.hostname or ""
     except ValueError:
         return ""
     if parts.scheme.lower() not in ("http", "https"):
         return ""
-    host = host.strip().rstrip(".").lower()
+    host = host.strip().rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii").lower() if host else ""
+    except (UnicodeError, ValueError):
+        return ""
+    if not host or not _HOST_CHARS.fullmatch(host) or ".." in host or host.startswith((".", "-")):
+        return ""
     return host[4:] if host.startswith("www.") else host
 
 

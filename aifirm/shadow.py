@@ -338,8 +338,16 @@ class BookComparison:
 
     NAVs are the books' values at the close of the latest session both decided
     (``nav_date``); returns run from the shadow's inception NAV (both books started from
-    it). ``llm_spend_usd`` sums the live book's LLM cost over its cycles from inception
-    through ``nav_date``; ``value_added_usd = difference_usd - llm_spend_usd``. The IC fields
+    it). A session counts as *decided* only when its cycle completed (a ``cycle_end`` entry);
+    a cycle that started and then failed (``cycle_error``) is a missed session, for the live
+    book and the shadow alike. The NAV at ``nav_date`` is the NAV *before* that session's
+    decision (its orders fill at the next open), so ``llm_spend_usd`` sums the live book's
+    LLM cost over the cycles from inception up to but excluding ``nav_date``, failed
+    attempts included (their spend is logged on ``cycle_error``): exactly the decisions
+    whose effect the compared NAVs contain. The latest decision's spend is
+    ``llm_spend_pending_usd``, charged once its fills reach a later NAV.
+    ``value_added_usd = difference_usd - llm_spend_usd``. ``live_failed`` lists sessions
+    whose live cycle failed and was not decided. The IC fields
     come from :func:`aifirm.journal.paired_rank_ic` of the live final probability
     (``committee``) against the shadow's, on the names both forecast, with forecasts
     resolved on or before ``as_of``; ``min_dates`` is the forward record needed before a
@@ -359,10 +367,12 @@ class BookComparison:
     difference_usd: float | None = None
     difference_pp: float | None = None
     llm_spend_usd: float = 0.0
+    llm_spend_pending_usd: float = 0.0
     value_added_usd: float | None = None
     value_added_pct: float | None = None
     live_cycles: int = 0
     shadow_missed: list[str] = field(default_factory=list)
+    live_failed: list[str] = field(default_factory=list)
     ic_dates: int = 0
     ic_mean_diff: float | None = None
     ic_t_stat: float | None = None
@@ -395,7 +405,9 @@ class BookComparison:
                f"{_usd(self.shadow_nav)} ({_pp(self.shadow_return_pct)}); difference "
                f"{_usd_signed(self.difference_usd)} "
                f"({_pp(self.difference_pp)} points).",
-               f"Cumulative LLM spend since inception: {_usd(self.llm_spend_usd)}.",
+               f"Cumulative LLM spend since inception: {_usd(self.llm_spend_usd)} on the decisions reflected in these "
+               f"NAVs" + (f" (plus {_usd(self.llm_spend_pending_usd)} on the {self.nav_date} decision, charged once its "
+                          "fills reach a NAV)." if self.llm_spend_pending_usd else "."),
                self.value_sentence(),
                f"Ranking (paired per-date rank IC, live final P minus shadow P on common names): {self.verdict}"]
         return [*out, *self.notes]
@@ -487,15 +499,19 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     inc_day = _day(inc_p["as_of"])
     inc_nav = float(inc_p["nav"])
 
-    def navs(path: Path) -> dict[str, float]:
-        out: dict[str, float] = {}
+    def navs(path: Path) -> tuple[dict[str, float], list[str]]:
+        """(decided session -> NAV before its decision, sessions that started and only failed)."""
+        starts: dict[str, float] = {}
         for e in ledger_events(path, "cycle_start"):
             p = e.get("payload") or {}
             if p.get("as_of") and _finite(p.get("nav")):
-                out[_day(p["as_of"])] = float(p["nav"])     # a forced re-decision repeats the date: same NAV
-        return out
+                starts[_day(p["as_of"])] = float(p["nav"])  # a forced re-decision repeats the date: same NAV
+        ended = {_day(p["as_of"]) for e in ledger_events(path, "cycle_end") if (p := e.get("payload") or {}).get("as_of")}
+        errored = {_day(p["as_of"]) for e in ledger_events(path, "cycle_error")
+                   if (p := e.get("payload") or {}).get("as_of")}
+        return {d: v for d, v in starts.items() if d in ended}, sorted(d for d in errored if d not in ended)
 
-    live_nav, shadow_nav = navs(Path(book) / LEDGER_FILE), navs(sdir / LEDGER_FILE)
+    (live_nav, live_failed), (shadow_nav, shadow_failed) = navs(Path(book) / LEDGER_FILE), navs(sdir / LEDGER_FILE)
     in_window = [d for d in sorted(live_nav) if d >= inc_day and (as_of_s is None or d <= as_of_s)]
     common = [d for d in in_window if d in shadow_nav]
     step = decision_step_days(live_nav, cfg.process.rebalance_every_days)
@@ -512,12 +528,17 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out.shadow_return_pct = (out.shadow_nav / inc_nav - 1.0) * 100.0
     out.difference_usd = out.live_nav - out.shadow_nav
     out.difference_pp = out.live_return_pct - out.shadow_return_pct
-    for e in ledger_events(Path(book) / LEDGER_FILE, "cycle_end"):
-        p = e.get("payload") or {}
-        d = _day(p["as_of"]) if p.get("as_of") else None
-        cost = (p.get("usage") or {}).get("cost_usd", 0.0)
-        if d is not None and inc_day <= d <= last and _finite(cost):
-            out.llm_spend_usd += float(cost)               # every cycle's spend, a forced re-decision's too
+    for event in ("cycle_end", "cycle_error"):              # a failed attempt spent money too
+        for e in ledger_events(Path(book) / LEDGER_FILE, event):
+            p = e.get("payload") or {}
+            d = _day(p["as_of"]) if p.get("as_of") else None
+            cost = (p.get("usage") or {}).get("cost_usd", 0.0)
+            if d is None or not _finite(cost) or d < inc_day:
+                continue
+            if d < last:
+                out.llm_spend_usd += float(cost)           # every cycle's spend, a forced re-decision's too
+            elif d == last:
+                out.llm_spend_pending_usd += float(cost)   # its fills are not in the NAV at `last` yet
     out.value_added_usd = out.difference_usd - out.llm_spend_usd
     out.value_added_pct = out.value_added_usd / inc_nav * 100.0 if inc_nav > 0 else None
     upto = [d for d in in_window if d <= last]
@@ -525,9 +546,16 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out.shadow_missed = [d for d in upto if d not in shadow_nav]
     if out.shadow_missed:
         shown = ", ".join(out.shadow_missed[:5]) + (", ..." if len(out.shadow_missed) > 5 else "")
+        failed_inside = [d for d in out.shadow_missed if d in shadow_failed]
+        inside = (f"; {len(failed_inside)} of them failed inside the decision (cycle_error in the shadow ledger)"
+                  if failed_inside else "")
         out.notes.append(f"The shadow did not decide on {len(out.shadow_missed)} of the {len(upto)} live sessions "
-                         f"since inception ({shown}): see the 'shadow' entries in the live ledger; the NAV comparison "
-                         "includes those gaps.")
+                         f"since inception ({shown}){inside}: see the 'shadow' entries in the live ledger; the NAV "
+                         "comparison includes those gaps.")
+    out.live_failed = [d for d in live_failed if d >= inc_day and d <= last]
+    if out.live_failed:
+        out.notes.append(f"The live cycle failed and was not decided on {len(out.live_failed)} session(s) "
+                         f"({', '.join(out.live_failed[:5])}); any LLM spend of the failed attempts is counted.")
 
     res = paired_rank_ic(list(records), as_of_s or last, COMMITTEE_AGENT, SHADOW_AGENT,
                          include_pre_cutoff=include_pre_cutoff, min_names=cfg.evaluation.ic_min_names, nw_lags=lags)
@@ -535,6 +563,11 @@ def compare_books(cfg: FirmConfig, book: Path, records: Iterable[ForecastRecord]
     out.ic_mean_diff, out.ic_t_stat = _nan_none(res.mean_diff), _nan_none(res.t_stat)
     out.ic_live, out.ic_shadow = _nan_none(res.mean_a), _nan_none(res.mean_b)
     out.status, out.verdict = ic_verdict(res.n_dates, min_dates, out.ic_mean_diff, out.ic_t_stat, h)
+    if res.n_thin:
+        out.notes.append(f"{res.n_thin} resolved decision date(s) were skipped because fewer than "
+                         f"{cfg.evaluation.ic_min_names} names had both a live and a shadow forecast: with a deep-dive "
+                         "band that narrow (universe.screen.deep_dive_top_n) the comparison can never become "
+                         "measurable, however long you wait.")
     if out.status == "not_measurable":
         out.notes.append("A NAV gap over a short window is mostly noise; the ranking comparison is the test, and it "
                          f"needs about {FORWARD_MIN_YEARS:g} years of decisions at this cadence ({min_dates} dates "

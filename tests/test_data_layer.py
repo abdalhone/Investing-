@@ -214,3 +214,52 @@ def test_default_cache_dir_does_not_depend_on_the_working_directory(tmp_path, mo
     assert default_dir() == Path.home() / ".cache" / "aifirm"
     monkeypatch.setenv("AIFIRM_CACHE_DIR", str(tmp_path / "pinned"))
     assert DiskCache().root == tmp_path / "pinned"
+
+
+def _quarterly_series_reference(df):
+    """The row-by-row pandas version the vectorised quarterly_series replaced (kept to pin equality)."""
+    if df is None or df.empty or "start" not in df.columns:
+        return pd.Series(dtype=float)
+    df = df.dropna(subset=["start"]).copy()
+    df["days"] = (df["end"] - df["start"]).dt.days
+    q = {row.end: float(row.val) for row in df[(df.days >= 80) & (df.days <= 100)].itertuples()}
+    ytd = df[(df.days > 100)]
+    for row in ytd.itertuples():
+        if row.end in q:
+            continue
+        shorter = ytd[(abs((ytd.start - row.start).dt.days) <= 3) & (ytd.end < row.end)]
+        shorter = shorter[(row.days - shorter.days).between(80, 100)]
+        if not shorter.empty:
+            s = shorter.sort_values("end").iloc[-1]
+            q[row.end] = float(row.val) - float(s.val)
+            continue
+        if 80 <= row.days - 91 <= 100:
+            first = df[(abs((df.start - row.start).dt.days) <= 3) & df.days.between(80, 100)]
+            if not first.empty:
+                q[row.end] = float(row.val) - float(first.sort_values("end").iloc[0].val)
+    return pd.Series(q, dtype=float).sort_index()
+
+
+def test_vectorised_quarterly_series_matches_the_reference():
+    """Performance fix (quarterly_series dominated every screened decision): the NumPy version
+    must give exactly the reference result, Q4 = FY - 9M, 6M - Q1 and duplicates included."""
+    import numpy as np
+    from aifirm.data.fundamentals import quarterly_series
+    rng = np.random.default_rng(3)
+    rows = []
+    for fy in range(2018, 2025):
+        s = pd.Timestamp(f"{fy}-01-01")
+        ends = [pd.Timestamp(f"{fy}-03-31"), pd.Timestamp(f"{fy}-06-30"), pd.Timestamp(f"{fy}-09-30"),
+                pd.Timestamp(f"{fy}-12-31")]
+        for i, e in enumerate(ends):
+            if i in (0, 1) or rng.random() < 0.5:     # some quarters only appear as YTD
+                rows.append((e - pd.Timedelta(days=90 if i else 89), e, float(rng.integers(50, 150))))
+            if i:
+                rows.append((s + pd.Timedelta(days=int(rng.integers(0, 3))), e, float(rng.integers(200, 600))))
+        rows.append((s, ends[3], float(rng.integers(400, 700))))                     # duplicate FY value
+    df = pd.DataFrame(rows, columns=["start", "end", "val"])
+    df.loc[len(df)] = [pd.NaT, pd.Timestamp("2025-03-31"), 1.0]                   # instant row, no start
+    for frame in (df, df.sample(frac=1.0, random_state=1), df.iloc[:7], df.iloc[:0]):
+        got, ref = quarterly_series(frame), _quarterly_series_reference(frame)
+        assert got.index.equals(ref.index) and np.array_equal(got.to_numpy(), ref.to_numpy())
+    assert quarterly_series(df.drop(columns=["start"])).empty

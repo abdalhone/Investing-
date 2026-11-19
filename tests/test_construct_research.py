@@ -214,3 +214,26 @@ def test_believability_stays_equal_until_enough_resolved_dates_however_many_name
     assert believability_weights(long[:-3], "2027-01-01", ["a"]) == {"a": 1.0}             # 19 dates
     with pytest.raises(ValueError):
         believability_weights(long, "2027-01-01", ["a"], min_dates=-1)
+
+
+def test_an_exit_completes_even_with_a_zero_no_trade_band():
+    """Regression: with no_trade_band = 0 (allowed) and partial rebalancing, an exit halved for
+    ever (37 cycles for an 8% position, a sell order and a deep dive every cycle). A step that
+    would leave less than MIN_RESIDUAL_GAP to trade is completed."""
+    from aifirm.data.factsheet import Fact, FactSheet
+    from aifirm.portfolio.construct import MIN_RESIDUAL_GAP, construct_portfolio
+    from aifirm.schemas import AggregatedView
+    as_of = "2026-01-30"
+    fs = FactSheet(ticker="AAA", as_of=as_of, sector="S")
+    fs.add(Fact("AAA.vol_60d", "vol", 25.0, "%", as_of, "t"))
+    fs.add(Fact("AAA.price", "price", 100.0, "USD", as_of, "t"))
+    bear = AggregatedView(ticker="AAA", prob_outperform=0.45, prob_equal_weight=0.45, expected_excess_return_pct=-1.0,
+                          dispersion=0.0, n_views=3, n_abstained=0)
+    cfg = FirmConfig()
+    cfg.portfolio.no_trade_band = 0.0
+    w, path = 0.08, []
+    while w and len(path) < 60:
+        tp = construct_portfolio({"AAA": bear}, {}, {"AAA": fs}, {"AAA": w}, cfg, as_of, {})
+        w = {p.ticker: p.weight for p in tp.positions}.get("AAA", 0.0)
+        path.append(w)
+    assert path == pytest.approx([0.04, 0.02, 0.01, 0.005, 0.0025, 0.0]) and MIN_RESIDUAL_GAP == 0.0025
